@@ -143,8 +143,9 @@ Two modes (`uv run … 05_firecrawl_rt_extraction.py [search|scrape]`):
   anomaly the Phase 5 Judge should catch, not a bug.
 
 ### Wiring gotchas (for later phases)
-- **LangSmith:** `.env` ships `LANGSMITH_TRACING=true` but an empty `LANGSMITH_API_KEY` →
-  noisy `401 Unauthorized` on every LLM call. Set the key (intended; tracing ON from Phase 1)
-  or `LANGSMITH_TRACING=false` to silence.
+- **LangSmith:** with a real `LANGSMITH_API_KEY` set, auth + ingestion work (confirmed —
+  traces land; APAC has some ingestion lag on read-back). The `401 Unauthorized` noise seen
+  in early spike runs was purely an **empty** `LANGSMITH_API_KEY` while `LANGSMITH_TRACING=true`
+  — fill the key (intended; tracing ON from Phase 1) or set `LANGSMITH_TRACING=false`.
 - **Slack:** the bot must be invited to the target channel (`/invite @bot`) or
   `chat.postMessage` returns `not_in_channel` even with a valid token.
