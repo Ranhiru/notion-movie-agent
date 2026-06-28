@@ -95,10 +95,14 @@ Goal: de-risk the recent/uncertain APIs before they block a feature phase. Throw
 - [x] **Firecrawl → RT extraction spike:** scrape 3–4 known titles' rottentomatoes.com pages;
       eyeball markdown; confirm an LLM can extract Tomatometer + Popcornmeter.
       → `spikes/05_firecrawl_rt_extraction.py` **PROVEN live, 4/4** (Dune 92/95, Godfather 97/98,
-      Parasite 99/90, Last of Us 94/62). **Learnings:** (1) RT scores can sit ~15k chars into the
-      markdown — blind `[:8000]` truncation dropped them; Phase 4 must slice smartly / watch the
-      local model's context. (2) RT *TV* pages carry per-season scores → a critic/audience gap
-      like 94 vs 62 is the kind of anomaly the Phase 5 Judge catches.
+      Parasite 99/90, Last of Us 94/62). Two modes: `search` (default — the ADR-0003 path:
+      title → Firecrawl `/search` → pick canonical RT URL → scrape inline → extract) and `scrape`
+      (known URL, isolates extraction). **`search` proven 4/4**: each title resolved to the right
+      canonical page (`/m/` vs `/tv/`, year suffix `parasite_2019`) from the title alone. Uses
+      `maxAge`=1 week so repeat runs hit Firecrawl's cache. **Learnings:** (1) RT scores can sit
+      ~15k chars into the markdown — blind `[:8000]` truncation dropped them; Phase 4 must slice
+      smartly / watch the local model's context. (2) RT *TV* pages carry per-season scores → a
+      critic/audience gap like 94 vs 62 is the kind of anomaly the Phase 5 Judge catches.
 - [x] **Slack Socket Mode spike** (parallelizable): Bolt app posts a Block Kit button, logs the
       click payload. Confirms `xoxb-` + `xapp-`/`connections:write` + Interactivity wiring.
       → `spikes/06_slack_socket_mode.py` **PROVEN live**: bot posted picker, click delivered over

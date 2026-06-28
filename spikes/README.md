@@ -124,8 +124,18 @@ ChatOpenAI(base_url=..., api_key=..., model=..., temperature=0).with_structured_
   **no OpenRouter fallback needed** (ADR 0011 stays dormant).
 
 ### Firecrawl → RT extraction (CONFIRMED live, 4/4 — spike 05)
-- Scrape `POST https://api.firecrawl.dev/v2/scrape` (v1 fallback), `{"formats":["markdown"],
-  "onlyMainContent":true}` → markdown contains the scores.
+Two modes (`uv run … 05_firecrawl_rt_extraction.py [search|scrape]`):
+- **`search` (default — the ADR-0003 primary path):** `POST /v2/search` with
+  `{"query":"<title> <year> site:rottentomatoes.com", "sources":["web"],
+  "scrapeOptions":{"formats":["markdown"],"maxAge":604800000}}` → results come back WITH
+  markdown inline (one call). Pick the canonical RT hit (`/m/<slug>` or `/tv/<slug>`, 2 path
+  segments), then extract. **Proven 4/4** — each title resolved to the correct page from the
+  title alone (incl. `/tv/` for TV and the `parasite_2019` year suffix). This is how you find
+  the RT URL: you *don't* construct it, you search for it (RT slugs aren't derivable).
+- **`scrape`:** `POST /v2/scrape` (v1 fallback) with a known URL — isolates the extraction step.
+- **`maxAge`** (ms; SDK `max_age=`) = 1 week here → repeat runs hit Firecrawl's cache, ~faster.
+- **IMDb side, for contrast:** no URL at all — OMDb `?s=<title>` returns candidates with an
+  `imdbID`, then `?i=<imdbID>` gives rating/plot/genre. The imdbID *is* the identifier.
 - **Gotcha (cost us 2/4 on first run):** RT scores can sit **~15k chars** into the markdown
   (Dune @ ~10.4k, Last of Us @ ~14.8k). Blind `markdown[:8000]` dropped them. Phase 4 should
   slice to the score region, not a magic char count — and mind the local model's context.
