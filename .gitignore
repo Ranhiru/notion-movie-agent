@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Spike scratch artifacts
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+spikes/_out/

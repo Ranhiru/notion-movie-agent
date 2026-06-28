@@ -1,0 +1,44 @@
+# HITL title disambiguation: non-blocking interrupt + out-of-band Slack resume
+
+When OMDb search returns multiple candidates for a Title (e.g. *Dune* 1984/2000/2021),
+an LLM disambiguation pre-filter attempts the pick first; a conditional edge escalates to
+the human **only when the LLM is not confident** (see
+[0008](./0008-llm-node-architecture.md)). On escalation the graph calls LangGraph
+`interrupt()` at the disambiguation node. The checkpointer
+persists the graph state (keyed by `thread_id = page_id`), the Title is set to a new
+status **`awaiting_input`**, a Slack prompt with the candidates is posted, and the
+reconcile **moves on to the next Title**. When the human clicks in Slack, Slack POSTs to
+a callback endpoint that resumes the graph:
+`graph.invoke(Command(resume=<chosen imdbID>), thread_id=page_id)` — **outside** the
+reconcile sweep.
+
+## How this coexists with the single-flight lock
+
+The resume **does not take the single-flight lock**. Three orthogonal mechanisms:
+
+- **Single-flight lock** — serializes reconcile *sweeps* only (sweep-vs-sweep).
+- **`enrichment_status`** — partitions rows by owning path: the sweep queries `pending`;
+  a row awaiting/under resume is `awaiting_input`. A row is in exactly one status, so the
+  sweep and a resume can never touch the same row (sweep-vs-resume).
+- **Per-API rate limiters** (process-global) — the only thing the two paths share is
+  external-API budget; a resume's calls queue behind a sweep's through the same limiter.
+
+Because `interrupt()` makes `graph.invoke()` *return* (it doesn't block), the reconcile
+loop naturally regains control and proceeds — "move on" is idiomatic, not a workaround.
+Because `thread_id = page_id`, resuming an already-finished thread is a no-op, so Slack
+double-clicks are safe.
+
+## Consequences
+
+- **The checkpointer becomes load-bearing, not a stretch goal**: graph state must survive
+  a multi-hour human wait *and* a process restart → a durable checkpointer (SQLite on a
+  volume, or Postgres), never `MemorySaver`.
+- Detecting ambiguity requires OMDb **search** (`?s=`) to get the candidate list, not
+  `?t=` (single best match).
+- **Stale `awaiting_input`**: if the human never clicks within **7 days**, the hourly
+  cron auto-resolves it using the disambiguation pre-filter's stored best-guess Candidate
+  and marks it `done` with `confidence: low` (flagged for review). The best guess is
+  stashed in the interrupt payload so the resume needs no recomputation. No Title is ever
+  stuck, and none is lost.
+- Adds one status (`awaiting_input`) and one endpoint (Slack callback); everything else
+  (graph, checkpointer, limiters, lock) is reused.
