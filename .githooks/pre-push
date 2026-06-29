@@ -1,0 +1,6 @@
+#!/bin/sh
+# Pre-push: run the static checks (ruff format + lint + basedpyright) via the Makefile.
+# Blocks the push on any failure. Static only — no live/credentialed enrichment runs.
+# Install once with: make hooks   (sets core.hooksPath to .githooks)
+
+exec make check
