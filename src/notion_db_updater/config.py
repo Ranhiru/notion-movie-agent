@@ -47,8 +47,9 @@ class Settings(BaseSettings):
 
     # --- reconcile sweep (ADR 0001 / 0004 — Phase 3) ---
     # How many entries run through the enrichment graph at once (per-entry `ainvoke`).
-    # Capped low so an N-row backfill can't fan out into an API 429-storm.
-    RECONCILE_CONCURRENCY: int = 4
+    # Capped low so an N-row backfill can't fan out into an API 429-storm; 1 = fully
+    # sequential for now (raise via env once per-API limiters land in Phase 7).
+    RECONCILE_CONCURRENCY: int = 1
     # In-process cron period; shorten via env for testing the scheduler.
     RECONCILE_INTERVAL_SECONDS: int = 3600
 
