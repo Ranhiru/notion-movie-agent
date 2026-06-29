@@ -79,9 +79,11 @@ class NotionClient:
             resp.raise_for_status()
             data = resp.json()
             titles.extend(Title.from_page(p) for p in data.get("results", []))
-            if not data.get("has_more"):
-                return titles
+            # Guard against an infinite loop: stop if Notion claims more pages but
+            # omits the cursor to fetch them.
             cursor = data.get("next_cursor")
+            if not data.get("has_more") or not cursor:
+                return titles
 
     async def get_title(self, page_id: str) -> Title:
         """Fetch and parse a single Title by its Notion page id."""
