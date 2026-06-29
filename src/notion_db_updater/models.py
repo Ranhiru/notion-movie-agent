@@ -1,11 +1,11 @@
 """Domain models for reading the Watchlist.
 
 `Entry` is the parsed, agent-facing view of one Notion page (one Watchlist entry — a movie
-or TV show), mapping the §8 properties off the raw Notion JSON. Its `.name` is the value of
-the Notion "Title" property (the entry's name); the entity itself is an `Entry`, never a
-"Title", since "Title" reads as the name, not the whole row. Field names follow the
-ubiquitous language in CONTEXT.md ("Entry", "Enrichment Status", …) and the §8 "Maps to"
-column.
+or TV show), mapping the §8 properties off the raw Notion JSON. Its `.title` holds the value
+of the Notion "Title" property. The entity is an `Entry`, so its variables are named `entry`
+— never `title`, which would collide with `.title` (the original `title.title` problem).
+Field names follow the ubiquitous language in CONTEXT.md ("Entry", "Enrichment Status", …)
+and the §8 "Maps to" column.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class Entry:
     """One Watchlist entry (a movie or TV show), parsed from a Notion page (§8 projection)."""
 
     page_id: str
-    name: str | None  # the entry's name; None for a blank row (matches the is_empty filter)
+    title: str | None  # the entry's title; None for a blank row (matches the is_empty filter)
     media_type: str | None  # "Movie" | "TV Show" | None
     imdb_rating: float | None
     rt_critic: float | None
@@ -103,7 +103,7 @@ class Entry:
         props = page.get("properties", {})
         return cls(
             page_id=page["id"],
-            name=_title_text(props),
+            title=_title_text(props),
             media_type=_select_name(props, PROP_TYPE),
             imdb_rating=_number(props, PROP_IMDB_RATING),
             rt_critic=_number(props, PROP_RT_CRITIC),

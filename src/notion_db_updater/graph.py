@@ -45,7 +45,7 @@ class EnrichmentState(TypedDict):
 async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
     """Fetch the Entry; a blank entry is a definitive skip (don't search OMDb for "")."""
     entry = await notion.get_entry(state["page_id"])
-    if not entry.name:
+    if not entry.title:
         return {"entry": entry, "status": "failed", "note": "blank Entry — skipped"}
     return {"entry": entry}
 
@@ -56,8 +56,8 @@ async def omdb(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
         return {}  # read_page already resolved this (blank Entry)
 
     entry = state.get("entry")
-    assert entry is not None and entry.name is not None  # guaranteed by read_page
-    candidates = await omdb.search(entry.name, entry.media_type)
+    assert entry is not None and entry.title is not None  # guaranteed by read_page
+    candidates = await omdb.search(entry.title, entry.media_type)
 
     if not candidates:
         return {"candidates": candidates, "status": "failed", "note": "omdb: not found"}

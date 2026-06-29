@@ -41,7 +41,7 @@ _NONSENSE_TITLE = "zzqxwv no such title 1234567890"
 
 
 def _print_entry(e: Entry) -> None:
-    print(f"  • {e.name!r}" + (f"  [{e.media_type}]" if e.media_type else ""))
+    print(f"  • {e.title!r}" + (f"  [{e.media_type}]" if e.media_type else ""))
     print(f"      page_id            = {e.page_id}")
     print(f"      Enrichment Status  = {e.status}")
     print(f"      IMDB Rating        = {e.imdb_rating}")
@@ -119,7 +119,7 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
 
         entry: Entry | None = final.get("entry")
         print("result:")
-        print(f"  Name               = {entry.name!r}" if entry else "  Name     = ?")
+        print(f"  Name               = {entry.title!r}" if entry else "  Name     = ?")
         print(f"  Enrichment Status  = {final.get('status')}")
         print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
         print(f"  Genre              = {final.get('genre')!r}")
@@ -129,8 +129,8 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         if final.get("note"):
             print(f"  note               = {final['note']}")
 
-        if capture_fixtures and entry and entry.name:
-            await _capture_omdb_fixtures(omdb, entry.name)
+        if capture_fixtures and entry and entry.title:
+            await _capture_omdb_fixtures(omdb, entry.title)
 
 
 async def _reconcile() -> None:

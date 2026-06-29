@@ -7,9 +7,10 @@ IMDb rating, Rotten Tomatoes score, and plot summary from external sources.
 
 **Entry**:
 A single movie or TV-show in the Watchlist — one row in the Notion database / one Notion
-page. Its name comes from the Notion "Title" property, surfaced as `entry.name`; the entity
-itself is an *Entry*, never a "Title" — "Title" reads as the name, not the whole row.
-_Avoid_: title (that's the name field, not the entity), row, record, page, item
+page. Its title (the name) comes from the Notion "Title" property, surfaced as `entry.title`.
+The entity is an *Entry*, so a variable is `entry` — never `title`, which would collide with
+the `.title` field (the original `title.title` confusion).
+_Avoid_: title/Title for the whole entity (that's the `.title` field), row, record, page, item
 
 **Enrichment**:
 The act of filling an Entry's missing fields (IMDb rating, Rotten Tomatoes score, plot)

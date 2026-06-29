@@ -139,7 +139,7 @@ class Runtime:
                     # Names the LangSmith trace by the entry's name and tags the sweep origin
                     # (ADR 0001; `origin` foreshadows the Phase 9 Slack `/add` path).
                     config={
-                        "run_name": entry.name or "(blank Entry)",
+                        "run_name": entry.title or "(blank Entry)",
                         "metadata": {"page_id": entry.page_id, "origin": "sweep"},
                     },
                 )
@@ -147,7 +147,7 @@ class Runtime:
             except Exception:
                 log.exception(
                     "reconcile: transient error on %r (%s) — left pending",
-                    entry.name,
+                    entry.title,
                     entry.page_id,
                 )
                 return _TRANSIENT
