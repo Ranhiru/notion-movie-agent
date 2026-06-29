@@ -95,6 +95,18 @@ class NotionClient:
         resp.raise_for_status()
         return Title.from_page(resp.json())
 
+    async def update_title(self, page_id: str, properties: dict) -> Title:
+        """Write enrichment back to one page (idempotent upsert by `page_id`).
+
+        `properties` is a Notion `properties` payload (build it with
+        `models.enrichment_properties`). PATCH overwrites the named props in place, so
+        re-running enrichment on the same page is a no-op-equivalent (ADR 0004 idempotency).
+        Returns the re-parsed `Title` from the write response.
+        """
+        resp = await self._client.patch(f"/pages/{page_id}", json={"properties": properties})
+        resp.raise_for_status()
+        return Title.from_page(resp.json())
+
     async def query_raw(self) -> dict:
         """Return the raw first-page query JSON (for capturing the Phase 1 fixture).
 

@@ -58,6 +58,29 @@ def _rich_text(props: dict, prop: str) -> str | None:
     return text or None
 
 
+def enrichment_properties(
+    *,
+    imdb_rating: float | None = None,
+    plot: str | None = None,
+    genre: str | None = None,
+    status: str,
+) -> dict:
+    """Serialize enrichment results into a Notion `properties` payload (the write-back of §8).
+
+    Only the fields that were actually found are included (partial-data writes per ADR 0004);
+    `Enrichment Status` is always set. Shapes proven live by `spikes/01_notion_data_source.py`:
+    number, rich_text, select.
+    """
+    props: dict = {PROP_STATUS: {"select": {"name": status}}}
+    if imdb_rating is not None:
+        props[PROP_IMDB_RATING] = {"number": imdb_rating}
+    if plot is not None:
+        props[PROP_PLOT] = {"rich_text": [{"text": {"content": plot}}]}
+    if genre is not None:
+        props[PROP_GENRE] = {"rich_text": [{"text": {"content": genre}}]}
+    return props
+
+
 @dataclass(frozen=True, slots=True)
 class Title:
     """One Watchlist entry, parsed from a Notion page (read projection of §8)."""
