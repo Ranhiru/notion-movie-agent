@@ -152,7 +152,7 @@ extraction, stronger judge; swap via config, not code): [ADR 0008/0011]
 ### Output schema (Pydantic)
 
 ```python
-class EnrichedTitle(BaseModel):
+class EnrichedEntry(BaseModel):
     title: str
     year: int | None
     media_type: Literal["movie", "tv"]
@@ -257,7 +257,7 @@ APIs — you must. [unchanged from prior research]
 3. **`reconcile()` + status lifecycle + in-process cron.** Query unfilled rows → graph each →
    `done`/`failed`/`pending` per §3; single-flight lock; manual "run now". First run = the
    ~100-item backfill.
-4. **Structured output + Judge.** Pydantic `EnrichedTitle`; deterministic assembly; LLM-as-judge
+4. **Structured output + Judge.** Pydantic `EnrichedEntry`; deterministic assembly; LLM-as-judge
    `confidence` node (`OPENAI_JUDGE_MODEL` via the configurable endpoint). *(structured-output learning)*
 5. **RT resolution subgraph + fan-out/fan-in.** Firecrawl `/search` primary, per-provider LLM
    extraction → `rt_critic`/`rt_audience`; OMDb ‖ RT in parallel; assemble → judge. *(core

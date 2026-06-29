@@ -1,7 +1,7 @@
 # Enrichment status lifecycle: IMDb gates, RT is best-effort
 
-A Title carries an `enrichment_status`: `pending` (default) → `done` | `failed`.
-The reconcile query picks up only `pending` (or unset) Titles.
+An Entry carries an `enrichment_status`: `pending` (default) → `done` | `failed`.
+The reconcile query picks up only `pending` (or unset) Entries.
 
 - **`done`** — OMDb resolved the title (IMDb rating + plot present) **and** the RT
   cascade ran to exhaustion. The two RT scores are best-effort and may be `null`; their
@@ -15,14 +15,14 @@ The reconcile query picks up only `pending` (or unset) Titles.
 
 - **Strict `done` (IMDb *and* RT both required) (rejected):** RT genuinely doesn't
   exist for many titles (OMDb never has RT for TV; RT doesn't cover obscure films), so
-  this would permanently `fail` legitimately-enriched titles, and a transient RT blip
+  this would permanently `fail` legitimately-enriched entries, and a transient RT blip
   would become a permanent failure — defeating the cron self-healing in
   [0001](./0001-unified-reconcile-single-flight.md). Briefly chosen, then reversed.
 - **IMDb gates, RT best-effort (chosen).**
 
 ## Consequences
 
-- Accepted trade-off: if the entire RT cascade *transiently* fails in a run, the Title
+- Accepted trade-off: if the entire RT cascade *transiently* fails in a run, the Entry
   is still `done` with `null` RT and is never retried. Consistent with "RT best effort."
 - The transient-vs-definitive distinction is critical: writing `failed` on a transient
   error (instead of leaving `pending`) would silently break self-healing. `failed` is

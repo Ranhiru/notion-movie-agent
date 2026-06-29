@@ -1,23 +1,33 @@
 """Async Notion client for the Watchlist data source (API 2025-09-03).
 
-Phase 1 is read-only: `query_titles()` (the reconcile sweep query) and `get_title(page_id)`
-(single page). Built async-first because everything downstream — LangGraph `max_concurrency`,
-the Phase 3 `aiolimiter` Notion limiter, HITL resume — is async; doing it now avoids a
-sync→async port later. The write path (idempotent upsert by `page_id`) arrives in Phase 2.
+Reads: `query_entries()` (the reconcile sweep query) and `get_entry(page_id)` (single page).
+Write: `update_entry()` (idempotent upsert by `page_id`, Phase 2). Every request goes through
+`_request()`, which applies a process-global `aiolimiter` throttle (≤ `NOTION_RPS`/s) and
+retries 429s honoring `Retry-After` — the rate-limit guard pulled forward to Phase 3 (ADR
+0001). Built async-first because everything downstream (LangGraph, the limiter, HITL resume)
+is async; doing it now avoided a sync→async port.
 
 Query/filter/write shapes were proven live by `spikes/01_notion_data_source.py`.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
+from aiolimiter import AsyncLimiter
 
 from .config import NOTION_VERSION, Settings
-from .models import PROP_STATUS, Title
+from .models import PROP_STATUS, Entry
 
 _API = "https://api.notion.com/v1"
 
-# The reconcile filter (RESEARCH §8, proven by spike 01): a Title needs enrichment when
+# Bounded 429 retries inside the client (honoring `Retry-After`). This is the Notion-
+# specific transient guard pulled forward to Phase 3 (ADR 0001); the graph-level
+# `RetryPolicy` for other transient errors arrives in Phase 7.
+_MAX_429_RETRIES = 3
+
+# The reconcile filter (RESEARCH §8, proven by spike 01): an Entry needs enrichment when
 # Enrichment Status is empty (never run) OR equals "pending" (queued / retry).
 _RECONCILE_FILTER = {
     "or": [
@@ -33,7 +43,7 @@ class NotionClient:
     Use as an async context manager so the underlying HTTP connection pool is closed::
 
         async with NotionClient(settings) as notion:
-            titles = await notion.query_titles()
+            entries = await notion.query_entries()
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -47,6 +57,10 @@ class NotionClient:
             },
             timeout=30.0,
         )
+        # One limiter per client instance; there is one shared NotionClient per process,
+        # so this is effectively a process-global throttle (≤ NOTION_RPS req/s) covering
+        # the sweep and — from Phase 6 — HITL resume alike (ADR 0001).
+        self._limiter = AsyncLimiter(settings.NOTION_RPS, 1)
 
     @property
     def data_source_id(self) -> str:
@@ -61,56 +75,76 @@ class NotionClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        """Send one Notion request through the rate limiter, retrying 429s.
+
+        Every call acquires a limiter slot first (≤ NOTION_RPS/s). On a 429 we sleep for
+        the server-advised `Retry-After` (seconds; default 1s) and retry up to
+        ``_MAX_429_RETRIES`` times; any other non-2xx raises via `raise_for_status()`.
+        """
+        for attempt in range(_MAX_429_RETRIES + 1):
+            async with self._limiter:
+                resp = await self._client.request(method, url, **kwargs)  # type: ignore[arg-type]
+            if resp.status_code == 429 and attempt < _MAX_429_RETRIES:
+                try:
+                    delay = float(resp.headers.get("Retry-After", "1"))
+                except ValueError:
+                    delay = 1.0
+                await asyncio.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp
+        raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
+
     async def _query_page(self, cursor: str | None = None) -> dict:
         """Run one reconcile-filter query page; return the raw Notion response."""
         body: dict = {"filter": _RECONCILE_FILTER, "page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-        resp = await self._client.post(
-            f"/data_sources/{self._data_source_id}/query", json=body
+        resp = await self._request(
+            "POST", f"/data_sources/{self._data_source_id}/query", json=body
         )
-        resp.raise_for_status()
         return resp.json()
 
-    async def query_titles(self) -> list[Title]:
-        """Return every Title needing enrichment (Status empty OR pending).
+    async def query_entries(self) -> list[Entry]:
+        """Return every Entry needing enrichment (Status empty OR pending).
 
         Pages through the full result set (the backfill is ~100 rows); Notion caps
         `page_size` at 100 and returns `has_more`/`next_cursor`.
         """
-        titles: list[Title] = []
+        entries: list[Entry] = []
         cursor: str | None = None
         while True:
             data = await self._query_page(cursor)
-            titles.extend(Title.from_page(p) for p in data.get("results", []))
+            entries.extend(Entry.from_page(p) for p in data.get("results", []))
             # Guard against an infinite loop: stop if Notion claims more pages but
             # omits the cursor to fetch them.
             cursor = data.get("next_cursor")
             if not data.get("has_more") or not cursor:
-                return titles
+                return entries
 
-    async def get_title(self, page_id: str) -> Title:
-        """Fetch and parse a single Title by its Notion page id."""
-        resp = await self._client.get(f"/pages/{page_id}")
-        resp.raise_for_status()
-        return Title.from_page(resp.json())
+    async def get_entry(self, page_id: str) -> Entry:
+        """Fetch and parse a single Entry by its Notion page id."""
+        resp = await self._request("GET", f"/pages/{page_id}")
+        return Entry.from_page(resp.json())
 
-    async def update_title(self, page_id: str, properties: dict) -> Title:
+    async def update_entry(self, page_id: str, properties: dict) -> Entry:
         """Write enrichment back to one page (idempotent upsert by `page_id`).
 
         `properties` is a Notion `properties` payload (build it with
         `models.enrichment_properties`). PATCH overwrites the named props in place, so
         re-running enrichment on the same page is a no-op-equivalent (ADR 0004 idempotency).
-        Returns the re-parsed `Title` from the write response.
+        Returns the re-parsed `Entry` from the write response.
         """
-        resp = await self._client.patch(f"/pages/{page_id}", json={"properties": properties})
-        resp.raise_for_status()
-        return Title.from_page(resp.json())
+        resp = await self._request(
+            "PATCH", f"/pages/{page_id}", json={"properties": properties}
+        )
+        return Entry.from_page(resp.json())
 
     async def query_raw(self) -> dict:
         """Return the raw first-page query JSON (for capturing the Phase 1 fixture).
 
-        Separate from `query_titles()` so the parsed path stays clean; this mirrors the
+        Separate from `query_entries()` so the parsed path stays clean; this mirrors the
         single request shape used to capture `tests/fixtures/notion_query.json`.
         """
         return await self._query_page()

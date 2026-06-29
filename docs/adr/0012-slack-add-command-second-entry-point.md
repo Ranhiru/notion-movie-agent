@@ -1,8 +1,8 @@
 # Slack `/add` command: a second entry point via create-then-enrich, out-of-band
 
-A Slack slash command `/add <name>` lets a human originate a Title from Slack instead of
+A Slack slash command `/add <name>` lets a human originate an Entry from Slack instead of
 adding a row in Notion. Rather than invert the architecture, it is an **additional entry
-point**: the handler creates the Notion page exactly as a human would (Title only, status
+point**: the handler creates the Notion page exactly as a human would (Entry only, status
 `pending`), then enriches that one `page_id` **out-of-band** — directly via the graph, *not*
 under the reconcile single-flight lock — reusing the whole existing pipeline (OMDb,
 disambiguation, RT, Judge, write-back) unchanged because by enrich time a real `page_id`
@@ -20,7 +20,7 @@ HITL Slack picker all intact ([0001](./0001-unified-reconcile-single-flight.md),
   and reconcile discovery all need a parallel identity scheme — a large divergence from
   ADR 0006/0007 for a cosmetic gain. Rejected.
 - **Create page first, then trigger `reconcile()` (rejected):** fully reuses ADR 0001, but
-  `/add` is interactive and ADR 0001 accepts that a Title added during an active sweep waits
+  `/add` is interactive and ADR 0001 accepts that an Entry added during an active sweep waits
   up to ~1 hour for the next cron — poor UX for someone watching Slack.
 - **Create page first, enrich that one page out-of-band (chosen).**
 
@@ -56,7 +56,7 @@ expires ~30 min / 5 uses) precisely because a run can sit in HITL for days.
 
 - **New surface, reused core.** New: the `/add` command registration (delivered over the
   existing Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
-  dedupe query (match the typed Title case-insensitively; on a hit, tell the user and
+  dedupe query (match the typed Entry case-insensitively; on a hit, tell the user and
   create nothing), the in-flight guard, the notify node, and two graph-state fields
   (`origin`, Slack notify context). Unchanged: the enrichment graph, disambiguation picker,
   checkpointer, status lifecycle, single-flight lock, rate limiters.

@@ -1,9 +1,11 @@
 """Domain models for reading the Watchlist.
 
-`Title` is the parsed, agent-facing view of one Notion page (one row), mapping the §8
-properties off the raw Notion JSON. Phase 1 is read-only, so this is a read projection;
-the write-back serialization arrives in Phase 2. Field names follow the ubiquitous
-language in CONTEXT.md ("Title", "Enrichment Status", …) and the §8 "Maps to" column.
+`Entry` is the parsed, agent-facing view of one Notion page (one Watchlist entry — a movie
+or TV show), mapping the §8 properties off the raw Notion JSON. Its `.title` holds the value
+of the Notion "Title" property. The entity is an `Entry`, so its variables are named `entry`
+— never `title`, which would collide with `.title` (the original `title.title` problem).
+Field names follow the ubiquitous language in CONTEXT.md ("Entry", "Enrichment Status", …)
+and the §8 "Maps to" column.
 """
 
 from __future__ import annotations
@@ -82,11 +84,11 @@ def enrichment_properties(
 
 
 @dataclass(frozen=True, slots=True)
-class Title:
-    """One Watchlist entry, parsed from a Notion page (read projection of §8)."""
+class Entry:
+    """One Watchlist entry (a movie or TV show), parsed from a Notion page (§8 projection)."""
 
     page_id: str
-    title: str | None  # None for a blank-Title row (matches the reconcile is_empty filter)
+    title: str | None  # the entry's title; None for a blank row (matches the is_empty filter)
     media_type: str | None  # "Movie" | "TV Show" | None
     imdb_rating: float | None
     rt_critic: float | None
@@ -96,8 +98,8 @@ class Title:
     status: str | None  # pending | awaiting_input | done | failed | None (unset)
 
     @classmethod
-    def from_page(cls, page: dict) -> Title:
-        """Parse a raw Notion page object (query result or page fetch) into a Title."""
+    def from_page(cls, page: dict) -> Entry:
+        """Parse a raw Notion page object (query result or page fetch) into an Entry."""
         props = page.get("properties", {})
         return cls(
             page_id=page["id"],

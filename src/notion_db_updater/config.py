@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     # --- Notion (data model §8) — the only key Phase 1 requires ---
     NOTION_MOVIE_DB_TOKEN: str
     NOTION_WATCHLIST_DATA_SOURCE_ID: str = DEFAULT_WATCHLIST_DATA_SOURCE_ID
+    # Notion REST rate limit (ADR 0001) — Notion's published ceiling is ~3 req/s; the
+    # client throttles to this and honors `Retry-After` on 429 (Phase 3).
+    NOTION_RPS: float = 3.0
+
+    # --- reconcile sweep (ADR 0001 / 0004 — Phase 3) ---
+    # How many entries run through the enrichment graph at once (per-entry `ainvoke`).
+    # Capped low so an N-row backfill can't fan out into an API 429-storm; 1 = fully
+    # sequential for now (raise via env once per-API limiters land in Phase 7).
+    RECONCILE_CONCURRENCY: int = 1
+    # In-process cron period; shorten via env for testing the scheduler.
+    RECONCILE_INTERVAL_SECONDS: int = 3600
 
     # --- OMDb (metadata lane — Phase 2) ---
     OMDB_API_KEY: str = ""
