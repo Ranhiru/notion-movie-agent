@@ -136,7 +136,7 @@ class Runtime:
             try:
                 final = await self._graph.ainvoke(
                     {"page_id": entry.page_id},
-                    # Names the LangSmith trace by the entry's name and tags the sweep origin
+                    # Names the LangSmith trace by the entry's title and tags the sweep origin
                     # (ADR 0001; `origin` foreshadows the Phase 9 Slack `/add` path).
                     config={
                         "run_name": entry.title or "(blank Entry)",

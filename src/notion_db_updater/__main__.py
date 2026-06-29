@@ -83,10 +83,10 @@ async def _read(capture_fixture: bool) -> None:
             _write_fixture(_FIXTURE_PATH, raw)
 
 
-async def _capture_omdb_fixtures(omdb: OMDbClient, name: str) -> None:
+async def _capture_omdb_fixtures(omdb: OMDbClient, title: str) -> None:
     """Snapshot raw OMDb responses (search hit + details + not-found) for offline tests."""
     print("\ncapturing OMDb fixtures…")
-    search = await omdb.raw(s=name)
+    search = await omdb.raw(s=title)
     _write_fixture(_FIXTURE_DIR / "omdb_search.json", search)
     hits = search.get("Search") or []
     if hits:
@@ -119,7 +119,7 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
 
         entry: Entry | None = final.get("entry")
         print("result:")
-        print(f"  Name               = {entry.title!r}" if entry else "  Name     = ?")
+        print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
         print(f"  Enrichment Status  = {final.get('status')}")
         print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
         print(f"  Genre              = {final.get('genre')!r}")
