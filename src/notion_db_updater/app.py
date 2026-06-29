@@ -103,8 +103,13 @@ class Runtime:
         await self._notion.aclose()
         await self._omdb.aclose()
 
-    async def reconcile(self) -> ReconcileSummary:
+    async def reconcile(self, limit: int | None = None) -> ReconcileSummary:
         """Run one reconcile sweep, unless one is already in progress (then drop).
+
+        `limit` caps the sweep to the first N queried entries — a testing aid for smoke-testing
+        the full sweep path (query → lock → semaphore → graph → tally) against one or a few
+        entries without burning the whole backlog. `None` (the default, used by the cron)
+        processes every pending entry.
 
         The `locked()` check and `async with` acquire run with no `await` between them, so in
         single-threaded asyncio they are atomic — no lost-wakeup race on the drop path.
@@ -113,11 +118,14 @@ class Runtime:
             log.info("reconcile already in progress — dropping this trigger")
             return ReconcileSummary(dropped=True)
         async with self._lock:
-            return await self._sweep()
+            return await self._sweep(limit)
 
-    async def _sweep(self) -> ReconcileSummary:
+    async def _sweep(self, limit: int | None = None) -> ReconcileSummary:
         entries = await self._notion.query_entries()
-        log.info("reconcile: %d entries need enrichment", len(entries))
+        if limit is not None:
+            log.info("reconcile: %d entries match; limiting to first %d", len(entries), limit)
+            entries = entries[:limit]
+        log.info("reconcile: %d entries to enrich", len(entries))
         sem = asyncio.Semaphore(self._concurrency)
         statuses = await asyncio.gather(*(self._run_one(e, sem) for e in entries))
         summary = ReconcileSummary.from_statuses(statuses)

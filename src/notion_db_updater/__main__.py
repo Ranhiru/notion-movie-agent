@@ -9,8 +9,9 @@ Phase 2 — enrich ONE Entry end-to-end (read_page → OMDb → write IMDb/plot/
     uv run python -m notion_db_updater --enrich <page_id> --capture-fixtures  # + OMDb fixtures
 
 Phase 3 — sweep the whole Watchlist (the single `reconcile()` entrypoint):
-    uv run python -m notion_db_updater --reconcile   # one manual sweep ("run now")
-    uv run python -m notion_db_updater --serve       # in-process cron (see RECONCILE_INTERVAL)
+    uv run python -m notion_db_updater --reconcile             # one manual sweep ("run now")
+    uv run python -m notion_db_updater --reconcile --limit 1   # sweep just the first entry
+    uv run python -m notion_db_updater --serve                 # in-process cron loop
 
 Verification (TASKS.md Phase 3): `--reconcile` on the real backfill transitions statuses;
 re-running picks up only pending/stragglers; two concurrent triggers → the second is dropped
@@ -133,10 +134,10 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             await _capture_omdb_fixtures(omdb, entry.title)
 
 
-async def _reconcile() -> None:
-    """Run one reconcile sweep over the whole Watchlist ("run now")."""
+async def _reconcile(limit: int | None) -> None:
+    """Run one reconcile sweep over the Watchlist ("run now"); `limit` caps it for testing."""
     async with Runtime() as rt:
-        summary = await rt.reconcile()
+        summary = await rt.reconcile(limit=limit)
     print(f"\nreconcile: {summary}")
 
 
@@ -185,6 +186,13 @@ def main() -> None:
         action="store_true",
         help="run the in-process reconcile cron until interrupted (Phase 3)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="(with --reconcile) cap the sweep to the first N entries — a single-entry "
+        "smoke test of the full sweep path",
+    )
     args = parser.parse_args()
 
     if args.generate_graph:
@@ -197,7 +205,7 @@ def main() -> None:
             print("\nstopped.")
     elif args.reconcile:
         _configure_logging()
-        asyncio.run(_reconcile())
+        asyncio.run(_reconcile(args.limit))
     elif args.enrich:
         asyncio.run(_enrich(args.enrich, args.capture_fixtures))
     else:
