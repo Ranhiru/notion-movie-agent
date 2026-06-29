@@ -28,3 +28,30 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/notion_db_updater"]
+
+# Dev-only tooling (PEP 735 dependency group — uv installs it by default on `uv sync` /
+# `uv run`, and excludes it from the built wheel). Pinned like the runtime deps.
+[dependency-groups]
+dev = [
+    "ruff==0.14.6",          # lint + format (replaces flake8 + black + isort)
+    "basedpyright==1.31.6",  # static type checker (matches the editor)
+]
+
+[tool.ruff]
+line-length = 95
+src = ["src"]
+target-version = "py313"
+# `spikes/` is throwaway Phase 0 code (not maintained, not type-checked) — keep it out of
+# the lint/format gate, mirroring basedpyright's `include = ["src"]`.
+extend-exclude = ["spikes"]
+
+[tool.ruff.lint]
+# E/F (pyflakes+pycodestyle), I (isort), UP (pyupgrade), B (bugbear), SIM (simplify).
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.basedpyright]
+# "standard" = vanilla-pyright behaviour: catch real type errors, skip the Any-from-JSON
+# and unused-result noise that basedpyright's stricter "recommended" default reports.
+typeCheckingMode = "standard"
+pythonVersion = "3.13"
+include = ["src"]
