@@ -89,13 +89,24 @@ async def _capture_omdb_fixtures(omdb: OMDbClient, title: str) -> None:
     _write_fixture(_FIXTURE_DIR / "omdb_not_found.json", not_found)
 
 
+async def _generate_graph() -> None:
+    """Render the graph *structure* to flow.png — no page_id, no enrichment, no live calls.
+
+    Drawing only needs the compiled topology; `build_graph` still needs client instances to
+    bind the nodes via `partial`, but they're never invoked here (the `async with` opens no
+    requests). `draw_mermaid_png` renders through the mermaid.ink web service — the one
+    network call this makes.
+    """
+    settings = get_settings()
+    async with NotionClient(settings) as notion, OMDbClient(settings) as omdb:
+        build_graph(notion, omdb).get_graph().draw_mermaid_png(output_file_path="flow.png")
+    print("wrote flow.png")
+
+
 async def _enrich(page_id: str, capture_fixtures: bool) -> None:
     settings: Settings = get_settings()
     async with NotionClient(settings) as notion, OMDbClient(settings) as omdb:
         graph = build_graph(notion, omdb)
-
-        graph.get_graph().draw_mermaid_png(output_file_path="flow.png")
-
         print(f"enriching page_id = {page_id}\n")
         final = await graph.ainvoke({"page_id": page_id})
 
@@ -132,9 +143,16 @@ def main() -> None:
         action="store_true",
         help="(with --enrich) save raw OMDb search/details/not-found responses as fixtures",
     )
+    parser.add_argument(
+        "--generate-graph",
+        action="store_true",
+        help="render the enrichment graph structure to flow.png (no enrichment run)",
+    )
     args = parser.parse_args()
 
-    if args.enrich:
+    if args.generate_graph:
+        asyncio.run(_generate_graph())
+    elif args.enrich:
         asyncio.run(_enrich(args.enrich, args.capture_fixtures))
     else:
         asyncio.run(_read(args.capture_fixture))

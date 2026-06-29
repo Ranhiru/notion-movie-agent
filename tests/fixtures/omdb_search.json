@@ -1,0 +1,76 @@
+{
+  "Search": [
+    {
+      "Title": "Orphan Black",
+      "Year": "2013\u20132017",
+      "imdbID": "tt2234222",
+      "Type": "series",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BNzdmMzI1NjktOTE5MS00MWM1LWI1YTAtODE4YjkzZmRlNzI4XkEyXkFqcGc@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black: Echoes",
+      "Year": "2023",
+      "imdbID": "tt10016724",
+      "Type": "series",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BZWQ2MGE4NGYtNTZiMS00ZjY0LThmNWYtOGU1ZjcxMGE3YjJkXkEyXkFqcGc@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black: The Next Chapter",
+      "Year": "2019",
+      "imdbID": "tt12106896",
+      "Type": "series",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BNzc4ZDc3OTYtMWQ3Yy00ZTc0LTgzYTUtNGExZTNhMjk4ZTc5XkEyXkFqcGdeQXVyMzY0MTE3NzU@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black: The Cloneversation",
+      "Year": "2014",
+      "imdbID": "tt3776666",
+      "Type": "movie",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BZjVhZDEzZTgtMjVhMy00YmMwLTg5M2YtYzllYTY3YjVmNGQyXkEyXkFqcGc@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black",
+      "Year": "2017\u20132018",
+      "imdbID": "tt7724320",
+      "Type": "series",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BZGM1NDViMWUtODk1Mi00MDJiLWJjZjYtODAwY2NmY2NiZTY1XkEyXkFqcGdeQXVyNTg4NTAwMDY@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black Parody: #OBparody",
+      "Year": "2015",
+      "imdbID": "tt5897820",
+      "Type": "movie",
+      "Poster": "https://m.media-amazon.com/images/M/MV5BNDhjMjFkODEtYjdmNS00ODczLTk2MDktYzA5OWVlNGI2NzcxL2ltYWdlL2ltYWdlXkEyXkFqcGdeQXVyNDU3MTE1MTk@._V1_SX300.jpg"
+    },
+    {
+      "Title": "Orphan Black: 4 Mini Clone Dance Parody",
+      "Year": "2014",
+      "imdbID": "tt6810966",
+      "Type": "movie",
+      "Poster": "N/A"
+    },
+    {
+      "Title": "The Cast of Orphan Black Meets Their Clones",
+      "Year": "2017",
+      "imdbID": "tt7592546",
+      "Type": "movie",
+      "Poster": "N/A"
+    },
+    {
+      "Title": "etalk presents: Orphan Black",
+      "Year": "2015",
+      "imdbID": "tt13689346",
+      "Type": "movie",
+      "Poster": "N/A"
+    },
+    {
+      "Title": "Orphan Black: The Game",
+      "Year": "2017",
+      "imdbID": "tt11755178",
+      "Type": "game",
+      "Poster": "N/A"
+    }
+  ],
+  "totalResults": "10",
+  "Response": "True"
+}
