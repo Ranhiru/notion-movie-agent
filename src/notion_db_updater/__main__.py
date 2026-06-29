@@ -35,9 +35,8 @@ def _print_title(t: Title) -> None:
     print(f"      Plot Summary       = {(t.plot or '')[:80]!r}")
 
 
-def _check_property_drift(raw: dict) -> None:
+def _check_property_drift(results: list[dict]) -> None:
     """Confirm the §8 property names are actually present on a real row (catches drift)."""
-    results = raw.get("results", [])
     if not results:
         print("\n  (no rows matched — cannot check property names)")
         return
@@ -59,11 +58,12 @@ async def _run(capture_fixture: bool) -> None:
     async with NotionClient(settings) as notion:
         print(f"data_source_id = {notion.data_source_id}\n")
         raw = await notion.query_raw()
-        titles = [Title.from_page(p) for p in raw.get("results", [])]
+        results = raw.get("results", [])
+        titles = [Title.from_page(p) for p in results]
         print(f"matched {len(titles)} Title(s) needing enrichment (empty OR pending):\n")
         for t in titles:
             _print_title(t)
-        _check_property_drift(raw)
+        _check_property_drift(results)
         if capture_fixture:
             _capture_fixture(raw)
 

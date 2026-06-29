@@ -61,6 +61,17 @@ class NotionClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _query_page(self, cursor: str | None = None) -> dict:
+        """Run one reconcile-filter query page; return the raw Notion response."""
+        body: dict = {"filter": _RECONCILE_FILTER, "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        resp = await self._client.post(
+            f"/data_sources/{self._data_source_id}/query", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def query_titles(self) -> list[Title]:
         """Return every Title needing enrichment (Status empty OR pending).
 
@@ -70,14 +81,7 @@ class NotionClient:
         titles: list[Title] = []
         cursor: str | None = None
         while True:
-            body: dict = {"filter": _RECONCILE_FILTER, "page_size": 100}
-            if cursor:
-                body["start_cursor"] = cursor
-            resp = await self._client.post(
-                f"/data_sources/{self._data_source_id}/query", json=body
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await self._query_page(cursor)
             titles.extend(Title.from_page(p) for p in data.get("results", []))
             # Guard against an infinite loop: stop if Notion claims more pages but
             # omits the cursor to fetch them.
@@ -97,9 +101,4 @@ class NotionClient:
         Separate from `query_titles()` so the parsed path stays clean; this mirrors the
         single request shape used to capture `tests/fixtures/notion_query.json`.
         """
-        resp = await self._client.post(
-            f"/data_sources/{self._data_source_id}/query",
-            json={"filter": _RECONCILE_FILTER, "page_size": 100},
-        )
-        resp.raise_for_status()
-        return resp.json()
+        return await self._query_page()
