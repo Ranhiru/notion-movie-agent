@@ -25,6 +25,19 @@ A Title left un-enriched after a reconcile — e.g. added while a reconcile was 
 running, so its webhook was dropped. Picked up by the next reconcile or the hourly cron.
 _Avoid_: leftover, missed row
 
+**Origin**:
+Where a Title entered the system — `sweep` (a row added in Notion, discovered by reconcile)
+or `slack` (typed via the `/add` command). Both produce the same pending Title and run the
+same enrichment; Origin only governs whether the run reports its result back to Slack on
+completion.
+_Avoid_: source (means a Provider/Lane here), trigger
+
+**Add**:
+Originating a Title from Slack via the `/add <name>` command: create the Notion page the
+user would have typed, then enrich it. A second entry point alongside the Notion row, not a
+replacement.
+_Avoid_: import, create row, slash command (the mechanism, not the act)
+
 **Lane**:
 One of the two source strategies feeding the merge step, run in parallel:
 the **metadata lane** (OMDb → IMDb rating, IMDb ID, plot) and the **RT resolution**

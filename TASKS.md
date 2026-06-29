@@ -52,7 +52,7 @@ ADR**:
 - **LangSmith ON from phase 1** (pure config) — tracing is the primary way to *understand* the
   graph while learning. `LANGSMITH_TRACING=true`, APAC endpoint, project `NotionMovieDBAgent`.
 - **Secrets:** `.env` in dev (never committed); ship `.env.example` with empty keys. Docker
-  Compose file-mounted secrets only in phase 9.
+  Compose file-mounted secrets only in phase 10.
 - **Fixtures:** when a phase touches a tricky branch, capture a real response into
   `tests/fixtures/` (Notion query JSON, OMDb JSON, Firecrawl markdown) for offline tests.
 
@@ -120,16 +120,29 @@ are written, import cleanly, and self-guard on missing env vars — **run them w
 
 Goal: a runnable `uv` project that reads the Watchlist. ADR 0009 (Docker is deploy-only).
 
-- [ ] Project layout: `pyproject.toml`, `src/` package, `.env` + `.env.example` (all keys from
+- [x] Project layout: `pyproject.toml`, `src/` package, `.env` + `.env.example` (all keys from
       RESEARCH §10), `.gitignore`. LangSmith env wired and ON.
-- [ ] Config loader: read env into a typed settings object (Notion token, OMDb, Firecrawl,
+      → `src/notion_db_updater/` package; `pydantic-settings==2.14.2` added; hatchling
+      build-system so `python -m notion_db_updater` resolves. `.env`/`.env.example`/`.gitignore`
+      already correct from Phase 0.
+- [x] Config loader: read env into a typed settings object (Notion token, OMDb, Firecrawl,
       OPENAI_* base/key/models, Slack tokens, LangSmith, `SEARCH_PROVIDERS`).
-- [ ] Notion client module: `query_titles()` + `get_title(page_id)` against `2025-09-03`,
+      → `config.py` `Settings(BaseSettings)` + cached `get_settings()`. Only
+      `NOTION_MOVIE_DB_TOKEN` required; rest defaulted so the app boots pre-keys. LangSmith
+      block present + `LANGSMITH_TRACING=true` default = tracing ON (nothing to trace yet).
+- [x] Notion client module: `query_titles()` + `get_title(page_id)` against `2025-09-03`,
       honoring the spiked query shape; map property names from §8.
-- [ ] One entry that reads the Watchlist and prints titles + property values.
+      → `notion.py` async `NotionClient` (httpx.AsyncClient, async-first per decision); spiked
+      `is_empty OR equals pending` filter; `query_titles()` paginates `has_more`. `models.py`
+      `Title.from_page()` maps all 8 §8 props (RT scores are `number`, not rich_text).
+- [x] One entry that reads the Watchlist and prints titles + property values.
+      → `__main__.py`; `--capture-fixture` flag saves the query JSON.
 
 **Verification:** run it; see the real rows with correct property names; confirm
 `data_source_id`. Capture the query response as `tests/fixtures/notion_query.json`.
+→ **PROVEN live:** `data_source_id = ffcdcd68-…` confirmed; 100 Titles matched; all 8 §8
+property names present (✓); `tests/fixtures/notion_query.json` captured (100 results,
+`has_more: true`). Blank-Title row reads as `title=None` (Phase 3 will `failed`/skip it).
 
 ---
 
@@ -276,7 +289,44 @@ short-circuits remaining providers. Fixtures per provider.
 
 ---
 
-## Phase 9 — Deploy (local docker compose, always-on)
+## Phase 9 — Slack `/add` second entry point (create-then-enrich, out-of-band)
+
+Goal: a `/add <name>` slash command that originates a Title from Slack, runs the same
+search/disambiguation/enrichment, and reports back. **Additional** entry point — the
+Notion-origin path is unchanged. ADR 0012 (reuses 0006 / 0010 / 0001 / 0004).
+
+- [ ] **Slash command transport:** register `/add` in the Slack app; confirm Socket Mode
+      delivers `command` events. Handler **`ack()`s within 3 s** (ephemeral "Adding *X*…"),
+      then does all work in a background task.
+- [ ] **Pre-create dedupe:** query the Watchlist for an existing Title matching the typed
+      string (case-insensitive). On a hit → reply "already in your watchlist (status: …)",
+      create nothing.
+- [ ] **Create page:** `POST` a new Watchlist page (Title only, `Type` blank, `Enrichment
+      Status = pending`) → `page_id`; idempotent shape reused from phase 2/3.
+- [ ] **Origin in graph state:** add `origin` ∈ {`sweep`, `slack`} + Slack notify context
+      (channel/user) to the graph state; default `sweep`. Slack path sets `slack` + context.
+- [ ] **Out-of-band enrich + in-flight guard:** add `page_id` to a process-global in-flight
+      set; `graph.invoke(thread_id=page_id)` **without** the single-flight lock; remove on
+      return. The reconcile sweep **skips** any `page_id` in the set (crash → set lost, row
+      still `pending` → cron reclaims; ADR 0004 self-heal preserved).
+- [ ] **Type backfill:** search OMDb unfiltered; on resolution, backfill the Notion `Type`
+      select from `media_type` (agent now writes `Type` for `slack`-origin rows).
+- [ ] **Disambiguation reuse:** unsure → existing HITL picker to `#notion-movie-db`, verbatim
+      (button `value` = `page_id` + `imdbID`; resume identical). No new picker code.
+- [ ] **Terminal notify node:** add a final node on both `done` and `failed` paths; if
+      `origin == 'slack'` post the completion (or not-found) message via **`chat_postMessage`**
+      (not the slash `response_url` — it expires), else no-op. Fires on the initial run, the
+      Slack-click resume, and the 7-day cron auto-resolve alike.
+
+**Verification:** `/add Dune` → row created → enriched → completion ping with IMDb/RT/genre;
+`/add` an ambiguous title → picker in `#notion-movie-db` → click → ping fires after resume;
+`/add` a known existing Title → dedupe reply, no new row; `/add` gibberish → not-found ping,
+row `failed`; trigger a cron sweep while an `/add` enrich is in flight → sweep skips that
+`page_id` (no double enrichment). Fixture: a Slack `command` payload.
+
+---
+
+## Phase 10 — Deploy (local docker compose, always-on)
 
 Goal: the only Docker phase. ADR 0009 / 0007.
 
@@ -303,6 +353,8 @@ an `awaiting_input` graph **survives the restart** (volume persistence proves AD
 ## Open setup items (config the owner provides; not design questions — RESEARCH §12)
 
 - Slack app-level token `xapp-…` (`connections:write`); enable Socket Mode + Interactivity.
+- Slack **slash command `/add`** registered in the app config (phase 9; delivered over the
+  same Socket Mode socket — no Request URL needed).
 - Local LLM endpoint + the three `OPENAI_*_MODEL` values (each must support tool-calling;
   verified by the phase-0 structured-output spike).
 - `LANGSMITH_API_KEY` (tracing on; APAC endpoint; project `NotionMovieDBAgent`).
