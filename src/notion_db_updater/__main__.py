@@ -1,16 +1,21 @@
 """CLI entry points for the enrichment agent.
 
-Phase 1 (default) — read the Watchlist and print Titles + property values:
+Phase 1 (default) — read the Watchlist and print entries + property values:
     uv run python -m notion_db_updater
     uv run python -m notion_db_updater --capture-fixture   # also save the query JSON
 
-Phase 2 — enrich ONE Title end-to-end (read_page → OMDb → write IMDb/plot/genre):
+Phase 2 — enrich ONE Entry end-to-end (read_page → OMDb → write IMDb/plot/genre):
     uv run python -m notion_db_updater --enrich <page_id>
     uv run python -m notion_db_updater --enrich <page_id> --capture-fixtures  # + OMDb fixtures
 
-Verification (TASKS.md Phase 2): a known row gains IMDB Rating + Plot Summary + Genre and
-`Enrichment Status = done`; re-running is idempotent; a gibberish Title → `failed`. The
-LangSmith trace shows read_page → omdb → update_notion.
+Phase 3 — sweep the whole Watchlist (the single `reconcile()` entrypoint):
+    uv run python -m notion_db_updater --reconcile   # one manual sweep ("run now")
+    uv run python -m notion_db_updater --serve       # in-process cron (see RECONCILE_INTERVAL)
+
+Verification (TASKS.md Phase 3): `--reconcile` on the real backfill transitions statuses;
+re-running picks up only pending/stragglers; two concurrent triggers → the second is dropped
+(single-flight); `--serve` with a short interval fires repeatedly. LangSmith shows one trace
+per Entry.
 """
 
 from __future__ import annotations
@@ -18,11 +23,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from pathlib import Path
 
+from .app import Runtime
 from .config import Settings, get_settings
 from .graph import build_graph
-from .models import EXPECTED_PROPERTIES, Title
+from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
 
@@ -33,14 +40,14 @@ _FIXTURE_PATH = _FIXTURE_DIR / "notion_query.json"
 _NONSENSE_TITLE = "zzqxwv no such title 1234567890"
 
 
-def _print_title(t: Title) -> None:
-    print(f"  • {t.title!r}" + (f"  [{t.media_type}]" if t.media_type else ""))
-    print(f"      page_id            = {t.page_id}")
-    print(f"      Enrichment Status  = {t.status}")
-    print(f"      IMDB Rating        = {t.imdb_rating}")
-    print(f"      RT Critic/Audience = {t.rt_critic} / {t.rt_audience}")
-    print(f"      Genre              = {t.genre!r}")
-    print(f"      Plot Summary       = {(t.plot or '')[:80]!r}")
+def _print_entry(e: Entry) -> None:
+    print(f"  • {e.name!r}" + (f"  [{e.media_type}]" if e.media_type else ""))
+    print(f"      page_id            = {e.page_id}")
+    print(f"      Enrichment Status  = {e.status}")
+    print(f"      IMDB Rating        = {e.imdb_rating}")
+    print(f"      RT Critic/Audience = {e.rt_critic} / {e.rt_audience}")
+    print(f"      Genre              = {e.genre!r}")
+    print(f"      Plot Summary       = {(e.plot or '')[:80]!r}")
 
 
 def _check_property_drift(results: list[dict]) -> None:
@@ -67,19 +74,19 @@ async def _read(capture_fixture: bool) -> None:
         print(f"data_source_id = {notion.data_source_id}\n")
         raw = await notion.query_raw()
         results = raw.get("results", [])
-        titles = [Title.from_page(p) for p in results]
-        print(f"matched {len(titles)} Title(s) needing enrichment (empty OR pending):\n")
-        for t in titles:
-            _print_title(t)
+        entries = [Entry.from_page(p) for p in results]
+        print(f"matched {len(entries)} entries needing enrichment (empty OR pending):\n")
+        for e in entries:
+            _print_entry(e)
         _check_property_drift(results)
         if capture_fixture:
             _write_fixture(_FIXTURE_PATH, raw)
 
 
-async def _capture_omdb_fixtures(omdb: OMDbClient, title: str) -> None:
+async def _capture_omdb_fixtures(omdb: OMDbClient, name: str) -> None:
     """Snapshot raw OMDb responses (search hit + details + not-found) for offline tests."""
     print("\ncapturing OMDb fixtures…")
-    search = await omdb.raw(s=title)
+    search = await omdb.raw(s=name)
     _write_fixture(_FIXTURE_DIR / "omdb_search.json", search)
     hits = search.get("Search") or []
     if hits:
@@ -110,9 +117,9 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         print(f"enriching page_id = {page_id}\n")
         final = await graph.ainvoke({"page_id": page_id})
 
-        title: Title | None = final.get("title")
+        entry: Entry | None = final.get("entry")
         print("result:")
-        print(f"  Title              = {title.title!r}" if title else "  Title    = ?")
+        print(f"  Name               = {entry.name!r}" if entry else "  Name     = ?")
         print(f"  Enrichment Status  = {final.get('status')}")
         print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
         print(f"  Genre              = {final.get('genre')!r}")
@@ -122,8 +129,28 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         if final.get("note"):
             print(f"  note               = {final['note']}")
 
-        if capture_fixtures and title and title.title:
-            await _capture_omdb_fixtures(omdb, title.title)
+        if capture_fixtures and entry and entry.name:
+            await _capture_omdb_fixtures(omdb, entry.name)
+
+
+async def _reconcile() -> None:
+    """Run one reconcile sweep over the whole Watchlist ("run now")."""
+    async with Runtime() as rt:
+        summary = await rt.reconcile()
+    print(f"\nreconcile: {summary}")
+
+
+async def _serve() -> None:
+    """Run the in-process reconcile cron until interrupted."""
+    async with Runtime() as rt:
+        await rt.run_forever()
+
+
+def _configure_logging() -> None:
+    """Surface the reconcile/cron INFO logs on the console (sweep + serve modes)."""
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
 
 def main() -> None:
@@ -131,7 +158,7 @@ def main() -> None:
     parser.add_argument(
         "--enrich",
         metavar="PAGE_ID",
-        help="run the OMDb enrichment graph for one Title (Phase 2)",
+        help="run the OMDb enrichment graph for one Entry (Phase 2)",
     )
     parser.add_argument(
         "--capture-fixture",
@@ -148,10 +175,29 @@ def main() -> None:
         action="store_true",
         help="render the enrichment graph structure to flow.png (no enrichment run)",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="run one reconcile sweep over the whole Watchlist (Phase 3 'run now')",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="run the in-process reconcile cron until interrupted (Phase 3)",
+    )
     args = parser.parse_args()
 
     if args.generate_graph:
         asyncio.run(_generate_graph())
+    elif args.serve:
+        _configure_logging()
+        try:
+            asyncio.run(_serve())
+        except KeyboardInterrupt:
+            print("\nstopped.")
+    elif args.reconcile:
+        _configure_logging()
+        asyncio.run(_reconcile())
     elif args.enrich:
         asyncio.run(_enrich(args.enrich, args.capture_fixtures))
     else:

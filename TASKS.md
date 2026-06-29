@@ -41,7 +41,7 @@ ADR**:
 - **Package manager:** `uv`. Pin LangGraph/LangChain **1.x** in `pyproject.toml`; pin exact
   versions early (spikes verify against the *installed* version, not memory/tutorials).
 - **Naming:** use the ubiquitous language from `CONTEXT.md` for nodes/state/status —
-  `Title`, `Enrichment`, `Reconcile`, `Lane`, `Provider`, `Candidate`, `Judge`,
+  `Entry`, `Enrichment`, `Reconcile`, `Lane`, `Provider`, `Candidate`, `Judge`,
   `Enrichment Status` ∈ {`pending`, `awaiting_input`, `done`, `failed`}.
 - **Notion:** API version `2025-09-03`; data source `Watchlist`
   id `ffcdcd68-0449-461d-be8e-0af9b71f9d5f`; query `POST /v1/data_sources/{id}/query`;
@@ -72,8 +72,8 @@ Goal: de-risk the recent/uncertain APIs before they block a feature phase. Throw
       `select`. (De-risks phases 1, 2, 3 at once.)
       → `spikes/01_notion_data_source.py` **PROVEN live** (query: 200, compound filter works, all
       6 §8 property names verified; write: 200, number/rich_text/select round-trip confirmed).
-      **Note:** Watchlist has blank rows (empty Title) that match `is_empty` — Phase 3 resolution
-      must skip/`failed` a blank Title, not search OMDb for "". Lioness row holds `[spike]` test
+      **Note:** Watchlist has blank rows (empty Entry) that match `is_empty` — Phase 3 resolution
+      must skip/`failed` a blank Entry, not search OMDb for "". Lioness row holds `[spike]` test
       values (Phase 2 will overwrite).
 - [x] **LangGraph 1.x toy graph spike:** 3-node graph exercising parallel fan-out + a reducer
       fan-in + one `add_conditional_edges` + one `interrupt()`, on the installed 1.x. Capture
@@ -134,21 +134,21 @@ Goal: a runnable `uv` project that reads the Watchlist. ADR 0009 (Docker is depl
       honoring the spiked query shape; map property names from §8.
       → `notion.py` async `NotionClient` (httpx.AsyncClient, async-first per decision); spiked
       `is_empty OR equals pending` filter; `query_titles()` paginates `has_more`. `models.py`
-      `Title.from_page()` maps all 8 §8 props (RT scores are `number`, not rich_text).
-- [x] One entry that reads the Watchlist and prints titles + property values.
+      `Entry.from_page()` maps all 8 §8 props (RT scores are `number`, not rich_text).
+- [x] One entry that reads the Watchlist and prints entries + property values.
       → `__main__.py`; `--capture-fixture` flag saves the query JSON.
 
 **Verification:** run it; see the real rows with correct property names; confirm
 `data_source_id`. Capture the query response as `tests/fixtures/notion_query.json`.
-→ **PROVEN live:** `data_source_id = ffcdcd68-…` confirmed; 100 Titles matched; all 8 §8
+→ **PROVEN live:** `data_source_id = ffcdcd68-…` confirmed; 100 Entries matched; all 8 §8
 property names present (✓); `tests/fixtures/notion_query.json` captured (100 results,
-`has_more: true`). Blank-Title row reads as `title=None` (Phase 3 will `failed`/skip it).
+`has_more: true`). Blank-Entry row reads as `title=None` (Phase 3 will `failed`/skip it).
 
 ---
 
 ## Phase 2 — OMDb lane, single source, end-to-end
 
-Goal: `read_page → OMDb → write IMDb rating + plot + genre` for one Title. Build as a
+Goal: `read_page → OMDb → write IMDb rating + plot + genre` for one Entry. Build as a
 **1-node `StateGraph`** from the start (avoids a later port). ADR 0004.
 
 - [ ] OMDb client: search `?s=` (candidate-shaped from the start, per §4 / ADR 0006) and
@@ -169,21 +169,46 @@ no duplicate writes (idempotency). Capture an OMDb response fixture + one 0-resu
 
 Goal: the one entrypoint that sweeps the Watchlist. ADR 0001 / 0004.
 
-- [ ] **3a — reconcile + lock + status:** query `is_empty OR equals pending` → loop rows
+- [x] **3a — reconcile + lock + status:** query `is_empty OR equals pending` → loop rows
       through the phase-2 graph with `max_concurrency` 3–5 → set `done` / `failed` / `pending`
       per ADR 0004. In-process `asyncio.Lock` single-flight; extra triggers ack/log/drop.
-- [ ] **Transient-vs-definitive error classification:** only definitive 0-results → `failed`;
-      transient OMDb/network errors leave the Title `pending` (cron retries). Always write
+      → `app.py` `Runtime`: owns the clients + the one compiled graph + the single-flight
+      `asyncio.Lock`. `reconcile()` checks `lock.locked()` (atomic — no `await` before the
+      `async with`) → drops a concurrent trigger; `_sweep()` gathers per-Entry `ainvoke`s under
+      an `asyncio.Semaphore(RECONCILE_CONCURRENCY=4)`. Status is written by the graph nodes;
+      reconcile tallies a `ReconcileSummary`. **Offline-proven** (stubbed graph): 2nd concurrent
+      trigger dropped; peak concurrency ≤ cap.
+- [x] **Transient-vs-definitive error classification:** only definitive 0-results → `failed`;
+      transient OMDb/network errors leave the Entry `pending` (cron retries). Always write
       partial data before setting status.
-- [ ] **Pull the Notion rate limiter forward to here** (`aiolimiter` ≤3 rps, honor
+      → Definitive outcomes (`failed` on blank/0-result, `pending` on multi-candidate) are
+      written by the graph nodes; a transient error raises before the terminal write, so
+      nothing is written and the Entry stays pending. `_run_one` catches it → never writes
+      `failed`. Single terminal write already satisfies "partial data before status" (becomes
+      load-bearing in Phase 4's best-effort RT). **Offline-proven:** a raising graph → counted
+      as a transient error, sweep survives, status NOT set to `failed`.
+- [x] **Pull the Notion rate limiter forward to here** (`aiolimiter` ≤3 rps, honor
       `Retry-After`) — the ~100-item backfill is exactly the 429-storm ADR 0001 fears.
-- [ ] **Manual "run now" = CLI/function** (NOT Slack yet — that's 6c).
-- [ ] **3b — in-process cron:** hourly scheduler calling `reconcile()` (shortened interval for
+      → `aiolimiter==1.2.1` pinned. `NotionClient._request()` acquires an `AsyncLimiter`
+      (`NOTION_RPS=3`/s) per call and retries 429s honoring `Retry-After` (≤3×); all three
+      call sites (query/get/patch) route through it. One client per process = process-global
+      throttle (Phase 7 shares it with HITL resume).
+- [x] **Manual "run now" = CLI/function** (NOT Slack yet — that's 6c).
+      → `--reconcile` (one sweep) and `Runtime.reconcile()`. Slack `@movie-bot run` is 6c.
+- [x] **3b — in-process cron:** hourly scheduler calling `reconcile()` (shortened interval for
       testing).
+      → `Runtime.run_forever()` plain-asyncio loop (no APScheduler dep; this *is* ADR 0009's
+      long-lived process); `--serve` CLI. Period = `RECONCILE_INTERVAL_SECONDS` (default 3600;
+      shorten via env). A failed cycle is logged and the loop continues.
 
 **Verification:** run reconcile on the real ~100-item backfill; watch statuses transition;
 re-run → only pending/stragglers picked up; trigger twice concurrently → second dropped
 (lock proven); shorten cron interval → fires. Fixture: a multi-row query for offline tests.
+→ Single-flight drop, concurrency cap, and transient→pending classification **proven offline**
+(stubbed graph). Multi-row fixture: `tests/fixtures/notion_query.json` (100 rows, Phase 1).
+**Live ~100-item backfill is owner-run** (Notion/OMDb creds aren't in Claude's shell env):
+`uv run python -m notion_db_updater --reconcile`, then re-run, then `--serve` with a short
+`RECONCILE_INTERVAL_SECONDS`. LangSmith shows one trace per Entry (named by Entry).
 
 ---
 
@@ -199,7 +224,7 @@ Goal: parallel OMDb ‖ RT lanes, RT as a subgraph. **First `with_structured_out
       fall-through (success = ≥1 usable score).
 - [ ] **Fan-out** OMDb ‖ RT subgraph; **deterministic fan-in `assemble`** node (barrier: both
       lanes complete first). Write `rt_critic` / `rt_audience` (best-effort; null-safe).
-- [ ] Confirm RT absence never blocks `done` (ADR 0004): soft-miss Title stays `done` with null
+- [ ] Confirm RT absence never blocks `done` (ADR 0004): soft-miss Entry stays `done` with null
       RT.
 
 **Verification:** a title with known RT scores → critic + audience written alongside IMDb; a
@@ -208,12 +233,12 @@ concurrently and fan-in waited. Fixtures: Firecrawl markdown (hit + soft-miss).
 
 ---
 
-## Phase 5 — EnrichedTitle schema + LLM-as-judge
+## Phase 5 — EnrichedEntry schema + LLM-as-judge
 
 Goal: formalize the output contract and add the wrong-match guard. **Confidence trace-only.**
 ADR 0008.
 
-- [ ] Pydantic `EnrichedTitle` (per §5) as the graph's output contract.
+- [ ] Pydantic `EnrichedEntry` (per §5) as the graph's output contract.
 - [ ] **LLM-as-judge fan-in node** (`OPENAI_JUDGE_MODEL`, `with_structured_output`): inspects
       the assembled record (OMDb + winning RT) for wrong-match anomalies (IMDb 9.1 vs RT 18%,
       plot/title mismatch) → emits `confidence` ∈ {high, medium, low}.
@@ -235,11 +260,11 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
   - [ ] Switch OMDb resolution to surface the **full candidate list** (the phase-2 TODO).
   - [ ] LLM **disambiguation pre-filter** (`OPENAI_DISAMBIGUATION_MODEL`) picks the best
         Candidate; `add_conditional_edges` route that *always* takes the pick for now.
-  - [ ] **Verify:** a multi-candidate Title (e.g. *Dune*) resolves to the pre-filter's choice;
+  - [ ] **Verify:** a multi-candidate Entry (e.g. *Dune*) resolves to the pre-filter's choice;
         checkpoint rows appear in the `.sqlite` file.
 - [ ] **6b — interrupt() + programmatic resume + restart survival:**
   - [ ] When the pre-filter is unsure → `interrupt()`; set `awaiting_input`; reconcile
-        "moves on" to the next Title.
+        "moves on" to the next Entry.
   - [ ] Resume via `graph.invoke(Command(resume=<imdbID>), thread_id=page_id)` from a test
         harness (no Slack yet).
   - [ ] **Verify:** ambiguous row pauses (`awaiting_input`, `invoke` returns); manual resume
@@ -268,7 +293,7 @@ Goal: make the sweep robust. ADR 0001 / 0004 / 0007. (LangSmith already on since
 - [ ] Remaining per-API limiters (`aiolimiter`): Firecrawl ~10 RPM, Tavily credit-aware;
       process-global, shared by sweep + HITL resume. (Notion limiter landed in phase 3.)
 - [ ] `InMemoryRateLimiter` on judge/extraction models; confirm `max_concurrency` cap.
-- [ ] Checkpoint-per-item so one bad Title doesn't roll back the batch.
+- [ ] Checkpoint-per-item so one bad Entry doesn't roll back the batch.
 
 **Verification:** induce/stub a 429 → retry + backoff, not a crash; confirm limiter caps RPS;
 LangSmith shows per-node traces + retries.
@@ -291,17 +316,17 @@ short-circuits remaining providers. Fixtures per provider.
 
 ## Phase 9 — Slack `/add` second entry point (create-then-enrich, out-of-band)
 
-Goal: a `/add <name>` slash command that originates a Title from Slack, runs the same
+Goal: a `/add <name>` slash command that originates an Entry from Slack, runs the same
 search/disambiguation/enrichment, and reports back. **Additional** entry point — the
 Notion-origin path is unchanged. ADR 0012 (reuses 0006 / 0010 / 0001 / 0004).
 
 - [ ] **Slash command transport:** register `/add` in the Slack app; confirm Socket Mode
       delivers `command` events. Handler **`ack()`s within 3 s** (ephemeral "Adding *X*…"),
       then does all work in a background task.
-- [ ] **Pre-create dedupe:** query the Watchlist for an existing Title matching the typed
+- [ ] **Pre-create dedupe:** query the Watchlist for an existing Entry matching the typed
       string (case-insensitive). On a hit → reply "already in your watchlist (status: …)",
       create nothing.
-- [ ] **Create page:** `POST` a new Watchlist page (Title only, `Type` blank, `Enrichment
+- [ ] **Create page:** `POST` a new Watchlist page (Entry only, `Type` blank, `Enrichment
       Status = pending`) → `page_id`; idempotent shape reused from phase 2/3.
 - [ ] **Origin in graph state:** add `origin` ∈ {`sweep`, `slack`} + Slack notify context
       (channel/user) to the graph state; default `sweep`. Slack path sets `slack` + context.
@@ -320,7 +345,7 @@ Notion-origin path is unchanged. ADR 0012 (reuses 0006 / 0010 / 0001 / 0004).
 
 **Verification:** `/add Dune` → row created → enriched → completion ping with IMDb/RT/genre;
 `/add` an ambiguous title → picker in `#notion-movie-db` → click → ping fires after resume;
-`/add` a known existing Title → dedupe reply, no new row; `/add` gibberish → not-found ping,
+`/add` a known existing Entry → dedupe reply, no new row; `/add` gibberish → not-found ping,
 row `failed`; trigger a cron sweep while an `/add` enrich is in flight → sweep skips that
 `page_id` (no double enrichment). Fixture: a Slack `command` payload.
 
@@ -341,11 +366,11 @@ an `awaiting_input` graph **survives the restart** (volume persistence proves AD
 
 ## Cross-cutting verification (end-to-end, once phases land)
 
-1. Add a fresh Title to the Watchlist → next reconcile enriches it (IMDb + RT + plot + genre)
+1. Add a fresh Entry to the Watchlist → next reconcile enriches it (IMDb + RT + plot + genre)
    and sets `done`; LangSmith trace shows the full graph.
-2. Add an ambiguous Title → pre-filter unsure → Slack picker in `#notion-movie-db` → click →
+2. Add an ambiguous Entry → pre-filter unsure → Slack picker in `#notion-movie-db` → click →
    row completes; restart mid-wait proves durability.
-3. Add a non-existent Title → `failed`, no RT chain burned, no Slack ping.
+3. Add a non-existent Entry → `failed`, no RT chain burned, no Slack ping.
 4. Re-run reconcile → idempotent (no duplicate writes; only pending/stragglers reprocessed).
 
 ---

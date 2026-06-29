@@ -48,7 +48,7 @@ def parse_rating(value: str | None) -> float | None:
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """One OMDb `?s=` search result — a possible match for a typed Title.
+    """One OMDb `?s=` search result — a possible match for a typed entry name.
 
     The unit of disambiguation (ADR 0006). Phase 2 uses only the single-candidate case;
     Phase 6a surfaces the whole list to the LLM pre-filter / Slack picker.
@@ -106,13 +106,13 @@ class OMDbClient:
         """
         return await self._get(params)
 
-    async def search(self, title: str, media_type: str | None = None) -> list[Candidate]:
-        """Search OMDb (`?s=`) for a typed Title; return the candidate list.
+    async def search(self, name: str, media_type: str | None = None) -> list[Candidate]:
+        """Search OMDb (`?s=`) for a typed entry name; return the candidate list.
 
         `media_type` is the Notion `Type` ("Movie" | "TV Show" | None); when set it narrows
         the search via OMDb's `type` param. A definitive not-found returns ``[]``.
         """
-        params: dict = {"s": title}
+        params: dict = {"s": name}
         omdb_type = _omdb_type(media_type)
         if omdb_type:
             params["type"] = omdb_type

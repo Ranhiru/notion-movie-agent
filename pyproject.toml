@@ -17,6 +17,7 @@ dependencies = [
     "httpx==0.28.1",                      # Notion / OMDb / Firecrawl clients
     "python-dotenv==1.2.2",               # load .env in dev
     "pydantic-settings==2.14.2",          # typed Settings from env (Phase 1)
+    "aiolimiter==1.2.1",                  # process-global Notion rate limiter (Phase 3)
     # --- Slack HITL transport (ADR 0010) ---
     "slack-bolt==1.28.0",
     "websocket-client==1.9.0",            # backing client for the sync SocketModeHandler

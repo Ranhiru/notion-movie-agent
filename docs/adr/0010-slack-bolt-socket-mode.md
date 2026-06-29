@@ -5,7 +5,7 @@ to Slack that carries *all* inbound interaction, so the build needs no public HT
 (see [0009](./0009-local-first-cron-only-slack-socket-mode.md)). It serves two purposes:
 
 1. **HITL disambiguation** ([0006](./0006-hitl-disambiguation-out-of-band-resume.md)): post
-   the candidate Titles to **`#notion-movie-db`**, receive the button click, resume the graph.
+   the candidate Entries to **`#notion-movie-db`**, receive the button click, resume the graph.
 2. **Manual run**: an app-mention `@movie-bot run` triggers `reconcile()` (under the
    single-flight lock of [0001](./0001-unified-reconcile-single-flight.md)). The hourly cron
    covers everything else.
@@ -23,7 +23,7 @@ Per the picker mockup: up to **5 candidates**, each a `section` with the **title
 **plot summary**, and the **poster image** as an `accessory` (OMDb `Poster` URL when not
 `N/A`), followed by one `actions` block with up to **5 buttons** (one per candidate).
 
-## Mapping a click back to the right Title
+## Mapping a click back to the right Entry
 
 Each button's `value` encodes **`page_id` + chosen `imdbID`** (the `page_id` is the graph's
 `thread_id`). On click, Bolt's action handler calls

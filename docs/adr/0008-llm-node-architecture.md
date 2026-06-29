@@ -26,7 +26,7 @@ Three LLM roles:
 
 3. **LLM-as-judge fan-in.** The fan-in node inspects the assembled record (OMDb fields +
    winning RT) for wrong-match anomalies and emits the `confidence` field. This is the
-   only guard against confidently enriching the *wrong* Title.
+   only guard against confidently enriching the *wrong* Entry.
 
 ## Consequences
 

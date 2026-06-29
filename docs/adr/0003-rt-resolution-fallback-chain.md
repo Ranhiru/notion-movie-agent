@@ -17,7 +17,7 @@ two scores. The chain advances to the next provider on **either**:
 Transient errors are retried *within* a provider (via `RetryPolicy`) before falling
 through, so a single 429 doesn't burn a fallback. The chain short-circuits at the first
 provider returning any score; if all four come up empty, both RT fields stay `null`
-(best-effort — this does not, by itself, keep a Title from being `done`).
+(best-effort — this does not, by itself, keep an Entry from being `done`).
 
 ## Considered Options
 

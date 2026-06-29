@@ -1,13 +1,13 @@
 # HITL title disambiguation: non-blocking interrupt + out-of-band Slack resume
 
-When OMDb search returns multiple candidates for a Title (e.g. *Dune* 1984/2000/2021),
+When OMDb search returns multiple candidates for an Entry (e.g. *Dune* 1984/2000/2021),
 an LLM disambiguation pre-filter attempts the pick first; a conditional edge escalates to
 the human **only when the LLM is not confident** (see
 [0008](./0008-llm-node-architecture.md)). On escalation the graph calls LangGraph
 `interrupt()` at the disambiguation node. The checkpointer
-persists the graph state (keyed by `thread_id = page_id`), the Title is set to a new
+persists the graph state (keyed by `thread_id = page_id`), the Entry is set to a new
 status **`awaiting_input`**, a Slack prompt with the candidates is posted, and the
-reconcile **moves on to the next Title**. When the human clicks in Slack, Slack POSTs to
+reconcile **moves on to the next Entry**. When the human clicks in Slack, Slack POSTs to
 a callback endpoint that resumes the graph:
 `graph.invoke(Command(resume=<chosen imdbID>), thread_id=page_id)` — **outside** the
 reconcile sweep.
@@ -38,7 +38,7 @@ double-clicks are safe.
 - **Stale `awaiting_input`**: if the human never clicks within **7 days**, the hourly
   cron auto-resolves it using the disambiguation pre-filter's stored best-guess Candidate
   and marks it `done` with `confidence: low` (flagged for review). The best guess is
-  stashed in the interrupt payload so the resume needs no recomputation. No Title is ever
+  stashed in the interrupt payload so the resume needs no recomputation. No Entry is ever
   stuck, and none is lost.
 - Adds one status (`awaiting_input`) and one endpoint (Slack callback); everything else
   (graph, checkpointer, limiters, lock) is reused.

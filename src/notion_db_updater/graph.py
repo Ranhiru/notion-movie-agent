@@ -1,4 +1,4 @@
-"""The enrichment `StateGraph` — Phase 2: a single OMDb source, one Title, end-to-end.
+"""The enrichment `StateGraph` — Phase 2: a single OMDb source, one Entry, end-to-end.
 
 Built as a LangGraph `StateGraph` (not loose functions) from the start so later phases bolt
 on without a port: the linear chain `read_page → omdb → update_notion` keeps the node names of
@@ -23,16 +23,16 @@ from typing import NotRequired, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .models import Title, enrichment_properties
+from .models import Entry, enrichment_properties
 from .notion import NotionClient
 from .omdb import Candidate, OMDbClient, details_fields
 
 
 class EnrichmentState(TypedDict):
-    """Graph state for one Title's enrichment run. `page_id` is the only required input."""
+    """Graph state for one Entry's enrichment run. `page_id` is the only required input."""
 
     page_id: str
-    title: NotRequired[Title | None]
+    entry: NotRequired[Entry | None]
     candidates: NotRequired[list[Candidate]]  # full OMDb list (Phase 6a consumes >1)
     imdb_id: NotRequired[str | None]
     imdb_rating: NotRequired[float | None]
@@ -43,21 +43,21 @@ class EnrichmentState(TypedDict):
 
 
 async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
-    """Fetch the Title; a blank Title is a definitive skip (don't search OMDb for "")."""
-    title = await notion.get_title(state["page_id"])
-    if not title.title:
-        return {"title": title, "status": "failed", "note": "blank Title — skipped"}
-    return {"title": title}
+    """Fetch the Entry; a blank entry is a definitive skip (don't search OMDb for "")."""
+    entry = await notion.get_entry(state["page_id"])
+    if not entry.name:
+        return {"entry": entry, "status": "failed", "note": "blank Entry — skipped"}
+    return {"entry": entry}
 
 
 async def omdb(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
-    """Resolve the Title against OMDb. Handles the 0- and 1-candidate cases (Phase 2 scope)."""
+    """Resolve the Entry against OMDb. Handles the 0- and 1-candidate cases (Phase 2 scope)."""
     if state.get("status") == "failed":
-        return {}  # read_page already resolved this (blank Title)
+        return {}  # read_page already resolved this (blank Entry)
 
-    title = state.get("title")
-    assert title is not None and title.title is not None  # guaranteed by read_page
-    candidates = await omdb.search(title.title, title.media_type)
+    entry = state.get("entry")
+    assert entry is not None and entry.name is not None  # guaranteed by read_page
+    candidates = await omdb.search(entry.name, entry.media_type)
 
     if not candidates:
         return {"candidates": candidates, "status": "failed", "note": "omdb: not found"}
@@ -81,8 +81,8 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
         genre=state.get("genre"),
         status=state.get("status", "pending"),
     )
-    title = await notion.update_title(state["page_id"], props)
-    return {"title": title}
+    entry = await notion.update_entry(state["page_id"], props)
+    return {"entry": entry}
 
 
 def build_graph(notion: NotionClient, omdb_client: OMDbClient):

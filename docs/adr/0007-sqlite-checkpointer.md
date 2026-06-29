@@ -6,7 +6,7 @@ checkpointer that powers HITL (ADR 0006) and durable execution (learning target 
 
 ## Two state stores, deliberately
 
-- **Notion `Enrichment Status`** owns **lifecycle** state — "which Titles need work."
+- **Notion `Enrichment Status`** owns **lifecycle** state — "which Entries need work."
   The reconcile reads it; it is the business source of truth.
 - **The SQLite checkpoint file** owns **execution** state — the paused-run snapshot
   (OMDb candidate list, next node, partial lane results) needed to `Command(resume=...)`
