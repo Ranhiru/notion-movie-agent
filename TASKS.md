@@ -290,6 +290,22 @@ ADR 0008.
       wrong-match anomalies — **(a) cross-lane title/year mismatch** (RT page ≠ OMDb title) and
       **(b) score implausibility** (IMDb 9.1 vs RT 18%, plot/title mismatch) → emits
       `confidence` ∈ {high, medium, low}. Heuristic backstop, not a deterministic join.
+- [ ] **(Optional) RT candidate-set correlation — make RT candidate-shaped like OMDb** (ADR
+      0003 / 0008, "open"). Instead of `pick_rt_hit` collapsing to one page, surface the top-N
+      canonical RT pages as candidates `{rt_url, rt_title, rt_year, rt_critic, rt_audience}`
+      and let the Judge pick the one matching OMDb's title/year. Decide before building the
+      Judge — it changes the Judge's role from anomaly-detector to RT-disambiguator.
+  - [ ] **Cheap scrape:** Firecrawl `/search` already scrapes every hit inline, so the extra
+        pages' markdown is already paid for — `pick_rt_hit` just discards them today.
+  - [ ] **Metadata-first cost control:** Judge correlates on title/year *before* extraction →
+        extract scores **once**, from the winner (not once per candidate).
+  - [ ] **Hybrid escalation (mirror OMDb 0/1/many):** keep the deterministic single-pick fast
+        path for 1 canonical match; only surface a candidate set when **>1** is in contention
+        (the *Orphan Black* tail). Generalizes "soft miss" → "no candidate the Judge accepts."
+  - [ ] **Ordering note:** correlation needs OMDb's *resolved* identity, so a still-ambiguous
+        OMDb (multi-candidate, Phase 6a) must resolve first — a soft cross-lane dependency.
+  - [ ] Recorded as an option; the simpler title-match Judge (above) may be enough. If skipped,
+        leave `pick_rt_hit`'s single pick as-is.
 - [ ] **Confidence stays in graph state / LangSmith only** — NOT written to Notion (no §8
       schema change). Document how to find low-confidence rows via traces.
 

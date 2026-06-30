@@ -38,6 +38,37 @@ Three LLM roles:
    join — it catches mismatches it can see in the assembled context. `confidence` ∈ {high,
    medium, low} is **trace-only** (LangSmith / graph state); it is *not* a §8 Notion property.
 
+## Extension: RT candidate-set correlation (Phase 5+, not yet decided)
+
+The base design (role 1) lets the RT lane deterministically pick **one** page via
+`pick_rt_hit` (canonical `/m/` vs `/tv/`, biased by `media_type`) and surface that single
+match. An optional extension makes the RT lane **candidate-shaped**, symmetric with OMDb
+(which is already a candidate list per [0006](./0006-hitl-disambiguation-out-of-band-resume.md)):
+instead of pre-picking, the lane surfaces the **top-N RT title pages** as candidates — each
+`{rt_url, rt_title, rt_year, rt_critic, rt_audience}` — and the Judge **correlates** them
+against OMDb's resolved identity to choose the right one (or flag that none match).
+
+- **Cheap where it counts:** Firecrawl `/search` already scrapes every hit inline, so the
+  markdown for multiple RT pages is *already paid for* — today `pick_rt_hit` discards all but
+  one. The only added cost is LLM extraction.
+- **Cost control (metadata-first):** the Judge picks the matching page by **title/year**
+  (cheap search-hit metadata) *before* score extraction, so scores are extracted **once**,
+  from the winner — not once per candidate.
+- **Hybrid escalation (mirror OMDb's 0/1/many):** keep the deterministic `pick_rt_hit` fast
+  path for the common **single canonical match**; only surface a candidate *set* to the Judge
+  when **>1** canonical RT page is in contention. Complexity/LLM cost is paid only for the
+  ambiguous tail (e.g. *Orphan Black* vs *Orphan Black: Echoes*).
+- **Role overlap:** this grows the Judge from "anomaly detector" into an **RT disambiguator**,
+  conceptually the RT-side twin of role 2's OMDb pre-filter. Decide whether that lives in the
+  Judge or a dedicated RT-disambiguation node.
+- **Ordering coupling:** correlation needs OMDb's *resolved* identity, so a still-ambiguous
+  OMDb result (multi-candidate, deferred to Phase 6a) must resolve first. Still expressible at
+  the fan-in, but it is a soft cross-lane dependency the base parallel design doesn't have.
+
+Recorded as an option, not a commitment: the simpler title-match Judge (role 3) may be enough.
+If adopted, "soft miss" in [0003](./0003-rt-resolution-fallback-chain.md) generalizes from
+"no score" to "no candidate the Judge accepts."
+
 ## Consequences
 
 - Exercises four LangGraph patterns: structured extraction, conditional edges

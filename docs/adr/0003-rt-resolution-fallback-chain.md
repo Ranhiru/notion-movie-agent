@@ -27,6 +27,10 @@ resolved. Because the RT lane discovers its page by title alone (it shares no ke
 OMDb lane), this reference is the only thing that lets a downstream check detect a
 cross-lane wrong-match.
 
+Within a single provider, how the matched page is chosen is itself a choice (see options
+below): the base design picks **one** page deterministically; an extension surfaces a
+**candidate set** for the Judge to correlate against OMDb.
+
 ## Considered Options
 
 - **Off by default / Firecrawl-only (rejected, reverses RESEARCH.md §4):** minimal keys
@@ -34,6 +38,20 @@ cross-lane wrong-match.
 - **Advance only on hard failure (rejected):** a soft miss would stop the chain with an
   empty RT and the fallbacks would never run — defeating the point of building them.
 - **Full chain, advance on hard-or-soft (chosen).**
+
+### Per-provider page selection (Phase 5+, open)
+
+- **Deterministic single pick (current / base):** `pick_rt_hit` chooses the canonical
+  `/m/` or `/tv/` page, biased by `media_type`. Cheap, no LLM; right for the common case
+  where one RT page obviously matches. A "soft miss" = that page yielded no score.
+- **Candidate set + Judge correlation (extension, see
+  [0008](./0008-llm-node-architecture.md)):** the provider surfaces the top-N RT title
+  pages as candidates `{rt_url, rt_title, rt_year, rt_critic, rt_audience}`; the Judge
+  picks the one matching OMDb's resolved title/year. The inline-scraped markdown for the
+  extra hits is already paid for; metadata-first correlation keeps score extraction to one
+  call. Recommended only as **escalation when >1 canonical RT page is in contention**
+  (mirrors OMDb's 0/1/many). Here a "soft miss" generalizes to "no candidate the Judge
+  accepts." Recorded as an option, not yet committed.
 
 ## Consequences
 
