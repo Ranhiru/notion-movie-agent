@@ -65,13 +65,16 @@ def enrichment_properties(
     imdb_rating: float | None = None,
     plot: str | None = None,
     genre: str | None = None,
+    rt_critic: int | None = None,
+    rt_audience: int | None = None,
     status: str,
 ) -> dict:
     """Serialize enrichment results into a Notion `properties` payload (the write-back of §8).
 
     Only the fields that were actually found are included (partial-data writes per ADR 0004);
-    `Enrichment Status` is always set. Shapes proven live by `spikes/01_notion_data_source.py`:
-    number, rich_text, select.
+    `Enrichment Status` is always set. RT scores are best-effort `number` fields (ADR 0003) —
+    a null RT is simply omitted, never blocking `done`. Shapes proven live by
+    `spikes/01_notion_data_source.py`: number, rich_text, select.
     """
     props: dict = {PROP_STATUS: {"select": {"name": status}}}
     if imdb_rating is not None:
@@ -80,6 +83,10 @@ def enrichment_properties(
         props[PROP_PLOT] = {"rich_text": [{"text": {"content": plot}}]}
     if genre is not None:
         props[PROP_GENRE] = {"rich_text": [{"text": {"content": genre}}]}
+    if rt_critic is not None:
+        props[PROP_RT_CRITIC] = {"number": rt_critic}
+    if rt_audience is not None:
+        props[PROP_RT_AUDIENCE] = {"number": rt_audience}
     return props
 
 

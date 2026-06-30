@@ -29,7 +29,9 @@ from pathlib import Path
 
 from .app import Runtime
 from .config import Settings, get_settings
+from .firecrawl import FirecrawlClient
 from .graph import build_graph
+from .llm import extraction_model
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
@@ -101,20 +103,32 @@ async def _generate_graph() -> None:
     """Render the graph *structure* to flow.png — no page_id, no enrichment, no live calls.
 
     Drawing only needs the compiled topology; `build_graph` still needs client instances to
-    bind the nodes via `partial`, but they're never invoked here (the `async with` opens no
-    requests). `draw_mermaid_png` renders through the mermaid.ink web service — the one
-    network call this makes.
+    bind the nodes via `partial` (now incl. the Firecrawl client + extraction model for the
+    RT lane), but they're never invoked here (the `async with` opens no requests).
+    `draw_mermaid_png` renders through the mermaid.ink web service — the one network call this
+    makes. Pass `xray=True` to `get_graph` to expand the RT subgraph's internals inline.
     """
     settings = get_settings()
-    async with NotionClient(settings) as notion, OMDbClient(settings) as omdb:
-        build_graph(notion, omdb).get_graph().draw_mermaid_png(output_file_path="flow.png")
+    async with (
+        NotionClient(settings) as notion,
+        OMDbClient(settings) as omdb,
+        FirecrawlClient(settings) as firecrawl,
+    ):
+        graph = build_graph(notion, omdb, firecrawl, extraction_model(settings))
+        # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
+        # rendering `rt` as one opaque node — the point of the nested-lane visualization.
+        graph.get_graph(xray=True).draw_mermaid_png(output_file_path="flow.png")
     print("wrote flow.png")
 
 
 async def _enrich(page_id: str, capture_fixtures: bool) -> None:
     settings: Settings = get_settings()
-    async with NotionClient(settings) as notion, OMDbClient(settings) as omdb:
-        graph = build_graph(notion, omdb)
+    async with (
+        NotionClient(settings) as notion,
+        OMDbClient(settings) as omdb,
+        FirecrawlClient(settings) as firecrawl,
+    ):
+        graph = build_graph(notion, omdb, firecrawl, extraction_model(settings))
         print(f"enriching page_id = {page_id}\n")
         final = await graph.ainvoke({"page_id": page_id})
 
@@ -124,6 +138,7 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         print(f"  Enrichment Status  = {final.get('status')}")
         print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
         print(f"  Genre              = {final.get('genre')!r}")
+        print(f"  RT critic/audience = {final.get('rt_critic')} / {final.get('rt_audience')}")
         print(f"  Plot Summary       = {(final.get('plot') or '')[:80]!r}")
         if final.get("candidates") is not None:
             print(f"  OMDb candidates    = {len(final['candidates'])}")

@@ -1,0 +1,23 @@
+{
+  "_comment": "Firecrawl v2 /search response shape for a title with NO Rotten Tomatoes page in the results — the RT soft-miss branch (ADR 0003). pick_rt_hit() returns None for this; the RT lane degrades to null scores and the Entry is still `done` from OMDb (ADR 0004). Captured-shape fixture (not a live snapshot of a specific obscure title).",
+  "success": true,
+  "data": {
+    "web": [
+      {
+        "url": "https://en.wikipedia.org/wiki/An_Obscure_Indie_Short",
+        "title": "An Obscure Indie Short - Wikipedia",
+        "markdown": "# An Obscure Indie Short\n\nA 2014 independent short film...\n"
+      },
+      {
+        "url": "https://www.imdb.com/title/tt9999999/",
+        "title": "An Obscure Indie Short (2014) - IMDb",
+        "markdown": "An Obscure Indie Short. 2014. Short film...\n"
+      },
+      {
+        "url": "https://letterboxd.com/film/an-obscure-indie-short/",
+        "title": "An Obscure Indie Short - Letterboxd",
+        "markdown": "Reviews and ratings...\n"
+      }
+    ]
+  }
+}
