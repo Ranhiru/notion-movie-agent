@@ -19,6 +19,14 @@ through, so a single 429 doesn't burn a fallback. The chain short-circuits at th
 provider returning any score; if all four come up empty, both RT fields stay `null`
 (best-effort — this does not, by itself, keep an Entry from being `done`).
 
+Alongside the two scores, the winning provider also surfaces the **matched page's
+reference** — the canonical RT URL / title (and year, when shown) — into **graph state**.
+These are *not* stored in Notion (§8 is unchanged); they exist so the LLM-as-judge
+([0008](./0008-llm-node-architecture.md)) can confirm the RT page is the same title OMDb
+resolved. Because the RT lane discovers its page by title alone (it shares no key with the
+OMDb lane), this reference is the only thing that lets a downstream check detect a
+cross-lane wrong-match.
+
 ## Considered Options
 
 - **Off by default / Firecrawl-only (rejected, reverses RESEARCH.md §4):** minimal keys

@@ -151,14 +151,14 @@ property names present (✓); `tests/fixtures/notion_query.json` captured (100 r
 Goal: `read_page → OMDb → write IMDb rating + plot + genre` for one Entry. Build as a
 **1-node `StateGraph`** from the start (avoids a later port). ADR 0004.
 
-- [ ] OMDb client: search `?s=` (candidate-shaped from the start, per §4 / ADR 0006) and
+- [x] OMDb client: search `?s=` (candidate-shaped from the start, per §4 / ADR 0006) and
       details `?i=<imdbID>`; pass `type=movie|series` from the `Type` select when set.
-- [ ] **Resolution logic — handle count ∈ {0, 1} only now:** 1 result → proceed; 0 results →
+- [x] **Resolution logic — handle count ∈ {0, 1} only now:** 1 result → proceed; 0 results →
       `failed` (definitive not-found). Leave a clear TODO for the multi-candidate branch
       (phase 6a) — the `?s=` shape is chosen so 6a is *additive*, not a rewrite.
-- [ ] Notion **write path** (first time): serialize `number` (IMDb rating), `rich_text`
+- [x] Notion **write path** (first time): serialize `number` (IMDb rating), `rich_text`
       (plot, genre); idempotent upsert by `page_id`; set `Enrichment Status`.
-- [ ] `read_page → omdb → update_notion` as a single-node-chain StateGraph.
+- [x] `read_page → omdb → update_notion` as a single-node-chain StateGraph.
 
 **Verification:** run one known row → 3 fields + `done` appear in Notion; re-run → identical,
 no duplicate writes (idempotency). Capture an OMDb response fixture + one 0-result fixture.
@@ -217,19 +217,52 @@ re-run → only pending/stragglers picked up; trigger twice concurrently → sec
 Goal: parallel OMDb ‖ RT lanes, RT as a subgraph. **First `with_structured_output`.** ADR
 0003 / 0008. (Built before the Judge so the Judge later sees a full record.)
 
-- [ ] RT subgraph skeleton with **Firecrawl `/search` only** (scoped to rottentomatoes.com +
+- [x] RT subgraph skeleton with **Firecrawl `/search` only** (scoped to rottentomatoes.com +
       content scrape); fallbacks are phase 8.
-- [ ] Per-provider **LLM extraction** node: `with_structured_output` → `{rt_critic,
+      → `firecrawl.py` async `FirecrawlClient` (thin httpx, mirrors `omdb.py`; ports spike-05
+      `/search`+`pick_rt_hit`, v2→v1 fallback, `maxAge`=1wk cache). `rt.py` `build_rt_subgraph`
+      = compiled `StateGraph` (`firecrawl_provider → extract`), embedded as the `rt` **node** of
+      the parent graph (xray-confirmed: subgraph internals nest in LangSmith/Studio). **Year
+      caveat:** RT runs *parallel* to OMDb so it can't use OMDb's year and §8 carries none — query
+      is title-only; `pick_rt_hit` biases `/m/` vs `/tv/` by `media_type` instead (proven offline).
+      **Identity gap (deferred to Phase 5):** `search_rt` returns only the markdown and the lane
+      surfaces only `{rt_critic, rt_audience}` — the matched RT page URL/title is *dropped*, so
+      the future Judge can't yet detect a cross-lane title mismatch. Phase 5 surfaces it (ADR
+      0003 / 0008 updated).
+- [x] Per-provider **LLM extraction** node: `with_structured_output` → `{rt_critic,
       rt_audience}` (`OPENAI_EXTRACTION_MODEL`). The extraction result drives chain
       fall-through (success = ≥1 usable score).
-- [ ] **Fan-out** OMDb ‖ RT subgraph; **deterministic fan-in `assemble`** node (barrier: both
+      → `rt.extract` — the project's **first `with_structured_output`** (`RTScores` Pydantic,
+      `int|None` 0-100). `llm.py` `extraction_model()` factory (the 1st of 3 ADR-0008 roles).
+      Applies the spike-05 learning: `_score_region()` anchors on a score marker
+      (Tomatometer/Popcornmeter/…) then takes a 12k window capped at 20k — *not* a blind
+      `[:8000]` (which dropped scores sitting ~15k chars in). No markdown → null without an LLM call.
+- [x] **Fan-out** OMDb ‖ RT subgraph; **deterministic fan-in `assemble`** node (barrier: both
       lanes complete first). Write `rt_critic` / `rt_audience` (best-effort; null-safe).
-- [ ] Confirm RT absence never blocks `done` (ADR 0004): soft-miss Entry stays `done` with null
+      → `graph.py` rewired: `read_page →{omdb, rt}`, `{omdb, rt}→ assemble → update_notion`
+      (topology verified). Lanes write **disjoint** channels (omdb: status+imdb/plot/genre; rt:
+      rt_critic/rt_audience) → no reducer needed on the concurrent fan-out. `assemble` is a thin
+      pass-through today, reserved as Phase 5's Judge slot. `enrichment_properties` extended with
+      null-safe RT `number` props (`RT Critic/Audience Score`).
+- [x] Confirm RT absence never blocks `done` (ADR 0004): soft-miss Entry stays `done` with null
       RT.
+      → RT lane **swallows its own errors** (soft miss *and* hard Firecrawl failure → null
+      scores, never raises) — contrast the OMDb lane where a transient error propagates → Entry
+      stays `pending`. Proven offline: blank Entry skips the search; a raising Firecrawl client
+      degrades to `{rt_markdown: None}`. **Known Phase-4 cost:** no `RetryPolicy` (Phase 7) /
+      fallbacks (Phase 8) yet → a *transient* Firecrawl error = permanently-null RT on a `done`
+      row until a manual re-run.
 
 **Verification:** a title with known RT scores → critic + audience written alongside IMDb; a
 soft-miss title → RT null but still `done`; LangSmith trace shows OMDb and RT ran
 concurrently and fan-in waited. Fixtures: Firecrawl markdown (hit + soft-miss).
+→ **Offline-proven** (deterministic logic): fan-out/fan-in topology, subgraph nesting (xray),
+`pick_rt_hit` canonical+media_type bias, `_score_region` slicing, blank-skip, error-swallow.
+Fixtures captured: `tests/fixtures/firecrawl_rt_hit.md` (real Dune RT markdown, scores ~15k in)
++ `firecrawl_search_soft_miss.json` (no RT page → `pick_rt_hit`=None). **Live happy-path +
+soft-miss are owner-run** (Firecrawl/OMDb/LLM creds aren't in Claude's shell env):
+`uv run python -m notion_db_updater --reconcile` on a known-RT row, then a no-RT-page row;
+LangSmith should show OMDb ‖ RT concurrent under one trace and `assemble` waiting for both.
 
 ---
 
@@ -239,15 +272,32 @@ Goal: formalize the output contract and add the wrong-match guard. **Confidence 
 ADR 0008.
 
 - [ ] Pydantic `EnrichedEntry` (per §5) as the graph's output contract.
+- [ ] **Surface both lanes' *identity* into the assembled record — the Judge needs full
+      context, not just numbers** (ADR 0003 / 0008). Phase 4's RT lane currently returns only
+      `{rt_critic, rt_audience}` and *discards* the matched page (`search_rt` computes the RT
+      hit's URL but drops it). Before the Judge can work:
+  - [ ] **RT lane:** carry the matched page reference up — add `rt_url` / `rt_title` (+ RT
+        page `rt_year` when shown) to `RTState` *and* the parent `EnrichmentState` (shared
+        keys, so they merge back); have `firecrawl.search_rt()` return the hit, not just its
+        markdown.
+  - [ ] **OMDb lane:** ensure the resolved identity (`imdb_id`, title, **year** — add a year
+        field to the `Candidate`/details mapping) is in state for the Judge to compare against.
+  - [ ] Rationale: the two lanes resolve identity **independently with no shared key**, so a
+        title mismatch (*Orphan Black* 2013 vs *Orphan Black: Echoes* 2024) is invisible to a
+        scores-only Judge. Title-level matching needs both identities present.
 - [ ] **LLM-as-judge fan-in node** (`OPENAI_JUDGE_MODEL`, `with_structured_output`): inspects
-      the assembled record (OMDb + winning RT) for wrong-match anomalies (IMDb 9.1 vs RT 18%,
-      plot/title mismatch) → emits `confidence` ∈ {high, medium, low}.
+      the assembled record (OMDb identity + fields ‖ winning RT identity + scores) for
+      wrong-match anomalies — **(a) cross-lane title/year mismatch** (RT page ≠ OMDb title) and
+      **(b) score implausibility** (IMDb 9.1 vs RT 18%, plot/title mismatch) → emits
+      `confidence` ∈ {high, medium, low}. Heuristic backstop, not a deterministic join.
 - [ ] **Confidence stays in graph state / LangSmith only** — NOT written to Notion (no §8
       schema change). Document how to find low-confidence rows via traces.
 
-**Verification:** force a bad `imdbID` → Judge returns low confidence / wrong-match flag; a
-clean match → high. Confirm confidence appears in the LangSmith trace, not in Notion.
-Fixture: a deliberately-wrong assembled record.
+**Verification:** force a bad `imdbID` → Judge returns low confidence / wrong-match flag; point
+the RT lane at a *different* title than OMDb resolved → Judge flags the cross-lane mismatch (the
+case scores-only could not catch); a clean match → high. Confirm confidence appears in the
+LangSmith trace, not in Notion. Fixture: a deliberately-wrong assembled record (mismatched
+OMDb title vs RT page).
 
 ---
 
