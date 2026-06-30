@@ -8,8 +8,9 @@ In production we start from a *title*, not a URL, and RT slugs aren't derivable 
     → use the markdown Firecrawl scraped inline (one call) → hand to the LLM extractor
 
 Thin httpx wrapper (mirrors `omdb.py`) rather than the Firecrawl SDK — the codebase rolls its
-own clients, and the spike proved the raw `/search` shape. v2→v1 base fallback is kept from
-the spike. `maxAge` makes repeat scrapes within a week hit Firecrawl's cache.
+own clients, and the spike proved the raw `/search` shape. Pinned to the **v2** API (proven
+4/4 by the spike; the live sweep hits `/v2/search`). `maxAge` makes repeat scrapes within a
+week hit Firecrawl's cache.
 
 **Year caveat:** the RT lane runs *concurrently* with OMDb (Phase 4 fan-out), so it cannot
 use OMDb's resolved year, and the Watchlist Entry carries none (§8). The query is therefore
@@ -29,17 +30,10 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
+_API = "https://api.firecrawl.dev/v2"
+
 # maxAge (ms): serve from Firecrawl's cache if the page was scraped < 1 week ago.
 _WEEK_MS = 7 * 24 * 60 * 60 * 1000
-
-
-def _bases(override: str) -> list[str]:
-    """Firecrawl API base(s): an explicit override, else v2 with a v1 fallback (spike 05)."""
-    return (
-        [override]
-        if override
-        else ["https://api.firecrawl.dev/v2", "https://api.firecrawl.dev/v1"]
-    )
 
 
 def pick_rt_hit(hits: list[dict], media_type: str | None = None) -> dict | None:
@@ -80,9 +74,14 @@ class FirecrawlClient:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self._api_key = settings.FIRECRAWL_API_KEY
-        self._bases = _bases(getattr(settings, "FIRECRAWL_API_URL", "") or "")
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._client = httpx.AsyncClient(
+            base_url=_API,
+            headers={
+                "Authorization": f"Bearer {settings.FIRECRAWL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=120.0,
+        )
 
     async def __aenter__(self) -> FirecrawlClient:
         return self
@@ -93,43 +92,33 @@ class FirecrawlClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
-
     async def _search(self, query: str, limit: int = 5) -> list[dict]:
-        """POST /search, scraping each hit to markdown inline. v2→v1 fallback (spike 05)."""
-        scrape_opts = {"formats": ["markdown"], "onlyMainContent": True, "maxAge": _WEEK_MS}
-        last_err: str | None = None
-        for base in self._bases:
-            body: dict = {"query": query, "limit": limit, "scrapeOptions": scrape_opts}
-            if base.endswith("/v2"):
-                body["sources"] = ["web"]  # v2 groups results by source; v1 rejects this key
-            try:
-                resp = await self._client.post(
-                    f"{base}/search", headers=self._headers(), json=body
-                )
-                if resp.status_code == 404:  # wrong API version — try the next base
-                    last_err = f"404 at {base}"
-                    continue
-                resp.raise_for_status()
-                data = resp.json().get("data", {})
-                if isinstance(data, dict):  # v2: {"web": [...]}
-                    hits = data.get("web") or data.get("results") or []
-                elif isinstance(data, list):  # v1: flat list
-                    hits = data
-                else:
-                    hits = []
-                return [
-                    {
-                        "url": h.get("url", ""),
-                        "title": h.get("title", ""),
-                        "markdown": h.get("markdown", ""),
-                    }
-                    for h in hits
-                ]
-            except httpx.HTTPError as e:
-                last_err = f"{type(e).__name__} at {base}: {e}"
-        raise RuntimeError(f"firecrawl search failed for {query!r}: {last_err}")
+        """POST /v2/search, scraping each hit to markdown inline.
+
+        v2 groups results by source (`sources: ["web"]` → `{"data": {"web": [...]}}`). A
+        transport / non-2xx error raises; the RT subgraph treats that as best-effort (0004).
+        """
+        body = {
+            "query": query,
+            "limit": limit,
+            "sources": ["web"],
+            "scrapeOptions": {
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+                "maxAge": _WEEK_MS,
+            },
+        }
+        resp = await self._client.post("/search", json=body)
+        resp.raise_for_status()
+        hits = resp.json().get("data", {}).get("web") or []
+        return [
+            {
+                "url": h.get("url", ""),
+                "title": h.get("title", ""),
+                "markdown": h.get("markdown", ""),
+            }
+            for h in hits
+        ]
 
     async def search_rt(self, title: str, media_type: str | None = None) -> str | None:
         """Find a title's Rotten Tomatoes page and return its markdown, or None on a soft miss.
