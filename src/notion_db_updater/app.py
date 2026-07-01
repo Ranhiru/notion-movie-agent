@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import extraction_model
+from .llm import extraction_model, judge_model
 from .models import Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
@@ -93,7 +93,11 @@ class Runtime:
         # (the checkpointer arrives in Phase 6a, keyed thread_id = page_id). The extraction
         # model is bound once (stateless per .invoke) and shared by the RT lane.
         self._graph = build_graph(
-            self._notion, self._omdb, self._firecrawl, extraction_model(self._settings)
+            self._notion,
+            self._omdb,
+            self._firecrawl,
+            extraction_model(self._settings),
+            judge_model(self._settings),
         )
         self._concurrency = self._settings.RECONCILE_CONCURRENCY
         # Single-flight: only one reconcile runs at a time (ADR 0001).
