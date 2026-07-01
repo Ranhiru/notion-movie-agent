@@ -363,7 +363,11 @@ page URL; `details_fields` drops the year). Fix that first — nothing downstrea
       refactored out of `rt.extract`). Sets `rt_url/title/year/critic/audience`.
       → Uses `judge_model`. `RTMatch{index:int|None, reason}` structured output. **On an LLM
       error it falls back to the top-ranked candidate** (RT stays best-effort); an out-of-range
-      index is clamped to 0.
+      index is clamped to 0. **Plot-aware correlation:** RT extraction now also pulls the
+      synopsis (`RTPage{plot, rt_critic, rt_audience}`; single `extract_rt_page`), so the
+      correlation prompt weighs OMDb's `plot` against each candidate's synopsis slice
+      (`synopsis_region`, cheap — no per-candidate LLM), not just title/year. `rt_plot` is added
+      to state (winner's, extracted once) and also fed to the Judge for plot-mismatch detection.
 - [x] **Ordering coupling** (ADR 0008): correlation needs OMDb's *resolved* identity, so a
       still-ambiguous OMDb (multi-candidate → `pending`, Phase 6a) never reaches `resolve_rt`
       (the `status=="done"` guard skips it) and is retried after 6a resolves it — self-healing,

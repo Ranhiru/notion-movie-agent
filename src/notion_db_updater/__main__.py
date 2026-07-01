@@ -150,7 +150,8 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             print(f"  Genre              = {enriched.genre!r}")
             print(f"  RT critic/audience = {enriched.rt_critic} / {enriched.rt_audience}")
             print(f"  RT page (title/url)= {final.get('rt_title')!r} / {final.get('rt_url')}")
-            print(f"  Plot Summary       = {(enriched.plot or '')[:80]!r}")
+            print(f"  Plot (OMDb)        = {(enriched.plot or '')[:80]!r}")
+            print(f"  Plot (RT)          = {(final.get('rt_plot') or '')[:80]!r}")
             print(f"  Sources used       = {enriched.sources_used}")
             # Judge output — trace-only (never written to Notion; here for verification).
             print(f"  Confidence         = {enriched.confidence}")
