@@ -35,6 +35,7 @@ from .llm import extraction_model, judge_model
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .schema import EnrichedEntry
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 _FIXTURE_PATH = _FIXTURE_DIR / "notion_query.json"
@@ -137,23 +138,32 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         final = await graph.ainvoke({"page_id": page_id})
 
         entry: Entry | None = final.get("entry")
+        enriched: EnrichedEntry | None = final.get("enriched")
         print("result:")
-        print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
         print(f"  Enrichment Status  = {final.get('status')}")
-        print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
-        print(f"  Genre              = {final.get('genre')!r}")
-        print(f"  RT critic/audience = {final.get('rt_critic')} / {final.get('rt_audience')}")
-        print(f"  RT page (title/url) = {final.get('rt_title')!r} / {final.get('rt_url')}")
-        print(f"  Plot Summary       = {(final.get('plot') or '')[:80]!r}")
-        # Judge output — trace-only (never written to Notion; here for local verification).
-        _wm = final.get("wrong_match")
-        print(f"  confidence         = {final.get('confidence')} (wrong_match={_wm})")
-        if final.get("judge_reason"):
-            print(f"  judge reason       = {final['judge_reason']}")
-        if final.get("candidates") is not None:
-            print(f"  OMDb candidates    = {len(final['candidates'])}")
-        if final.get("note"):
-            print(f"  note               = {final['note']}")
+
+        if enriched is not None:
+            # A resolved Entry — print the graph's actual output contract (built by `judge`).
+            print(f"  Title              = {enriched.title!r} ({enriched.year})")
+            print(f"  Media type         = {enriched.media_type}")
+            print(f"  IMDB id / rating   = {enriched.imdb_id} / {enriched.imdb_rating}")
+            print(f"  Genre              = {enriched.genre!r}")
+            print(f"  RT critic/audience = {enriched.rt_critic} / {enriched.rt_audience}")
+            print(f"  RT page (title/url)= {final.get('rt_title')!r} / {final.get('rt_url')}")
+            print(f"  Plot Summary       = {(enriched.plot or '')[:80]!r}")
+            print(f"  Sources used       = {enriched.sources_used}")
+            # Judge output — trace-only (never written to Notion; here for verification).
+            print(f"  Confidence         = {enriched.confidence}")
+            print(f"  Wrong match        = {final.get('wrong_match')}")
+            if final.get("judge_reason"):
+                print(f"  Judge reason       = {final['judge_reason']}")
+        else:
+            # Not resolved (blank / not-found / multi-candidate) — no contract to show.
+            print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
+            if final.get("candidates") is not None:
+                print(f"  OMDb candidates    = {len(final['candidates'])}")
+            if final.get("note"):
+                print(f"  note               = {final['note']}")
 
         if capture_fixtures and entry and entry.title:
             await _capture_omdb_fixtures(omdb, entry.title)
