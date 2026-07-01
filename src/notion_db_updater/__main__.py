@@ -31,10 +31,11 @@ from .app import Runtime
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import extraction_model
+from .llm import extraction_model, judge_model
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .schema import EnrichedEntry
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 _FIXTURE_PATH = _FIXTURE_DIR / "notion_query.json"
@@ -114,7 +115,9 @@ async def _generate_graph() -> None:
         OMDbClient(settings) as omdb,
         FirecrawlClient(settings) as firecrawl,
     ):
-        graph = build_graph(notion, omdb, firecrawl, extraction_model(settings))
+        graph = build_graph(
+            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+        )
         # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
         # rendering `rt` as one opaque node — the point of the nested-lane visualization.
         graph.get_graph(xray=True).draw_mermaid_png(output_file_path="flow.png")
@@ -128,22 +131,40 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         OMDbClient(settings) as omdb,
         FirecrawlClient(settings) as firecrawl,
     ):
-        graph = build_graph(notion, omdb, firecrawl, extraction_model(settings))
+        graph = build_graph(
+            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+        )
         print(f"enriching page_id = {page_id}\n")
         final = await graph.ainvoke({"page_id": page_id})
 
         entry: Entry | None = final.get("entry")
+        enriched: EnrichedEntry | None = final.get("enriched")
         print("result:")
-        print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
         print(f"  Enrichment Status  = {final.get('status')}")
-        print(f"  IMDB id / rating   = {final.get('imdb_id')} / {final.get('imdb_rating')}")
-        print(f"  Genre              = {final.get('genre')!r}")
-        print(f"  RT critic/audience = {final.get('rt_critic')} / {final.get('rt_audience')}")
-        print(f"  Plot Summary       = {(final.get('plot') or '')[:80]!r}")
-        if final.get("candidates") is not None:
-            print(f"  OMDb candidates    = {len(final['candidates'])}")
-        if final.get("note"):
-            print(f"  note               = {final['note']}")
+
+        if enriched is not None:
+            # A resolved Entry — print the graph's actual output contract (built by `judge`).
+            print(f"  Title              = {enriched.title!r} ({enriched.year})")
+            print(f"  Media type         = {enriched.media_type}")
+            print(f"  IMDB id / rating   = {enriched.imdb_id} / {enriched.imdb_rating}")
+            print(f"  Genre              = {enriched.genre!r}")
+            print(f"  RT critic/audience = {enriched.rt_critic} / {enriched.rt_audience}")
+            print(f"  RT page (title/url)= {final.get('rt_title')!r} / {final.get('rt_url')}")
+            print(f"  Plot (OMDb)        = {(enriched.plot or '')[:80]!r}")
+            print(f"  Plot (RT)          = {(final.get('rt_plot') or '')[:80]!r}")
+            print(f"  Sources used       = {enriched.sources_used}")
+            # Judge output — trace-only (never written to Notion; here for verification).
+            print(f"  Confidence         = {enriched.confidence}")
+            print(f"  Wrong match        = {final.get('wrong_match')}")
+            if final.get("judge_reason"):
+                print(f"  Judge reason       = {final['judge_reason']}")
+        else:
+            # Not resolved (blank / not-found / multi-candidate) — no contract to show.
+            print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
+            if final.get("candidates") is not None:
+                print(f"  OMDb candidates    = {len(final['candidates'])}")
+            if final.get("note"):
+                print(f"  note               = {final['note']}")
 
         if capture_fixtures and entry and entry.title:
             await _capture_omdb_fixtures(omdb, entry.title)

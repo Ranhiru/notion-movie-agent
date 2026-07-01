@@ -1,0 +1,28 @@
+{
+  "_comment": "Firecrawl v2 /search response shape for a title with >1 canonical Rotten Tomatoes page in contention — the Phase 5 RT correlation branch (ADR 0003 / 0008). rank_rt_hits() keeps both /m/ title pages (dune_2021, dune_1984), drops the /reviews deep link and the off-domain hit; the RT subgraph defers to resolve_rt, which correlates title/year against OMDb's resolved identity and extracts scores once from the winner. Captured-shape fixture (illustrative markdown, not a live snapshot).",
+  "success": true,
+  "data": {
+    "web": [
+      {
+        "url": "https://www.rottentomatoes.com/m/dune_2021",
+        "title": "Dune (2021) - Rotten Tomatoes",
+        "markdown": "# Dune\n\nTomatometer 83%\n\nPopcornmeter 90%\n\nA noble family becomes embroiled in a war for control of the galaxy's most valuable asset."
+      },
+      {
+        "url": "https://www.rottentomatoes.com/m/dune_1984",
+        "title": "Dune (1984) - Rotten Tomatoes",
+        "markdown": "# Dune\n\nTomatometer 37%\n\nPopcornmeter 58%\n\nIn the year 10191, a spice called melange is the most valuable substance in the universe."
+      },
+      {
+        "url": "https://www.rottentomatoes.com/m/dune_2021/reviews",
+        "title": "Dune (2021) - Reviews - Rotten Tomatoes",
+        "markdown": "# Dune - Critic Reviews\n\nAll critics ..."
+      },
+      {
+        "url": "https://en.wikipedia.org/wiki/Dune_(2021_film)",
+        "title": "Dune (2021 film) - Wikipedia",
+        "markdown": "# Dune (2021 film)\n\nDune is a 2021 American epic science fiction film."
+      }
+    ]
+  }
+}

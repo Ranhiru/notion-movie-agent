@@ -1,0 +1,16 @@
+{
+  "_comment": "A deliberately-wrong assembled enrichment record for the Phase 5 Judge (ADR 0008): the OMDb lane resolved 'Orphan Black' (2013) but the RT lane independently landed on 'Orphan Black: Echoes' (2024) — a cross-lane title/year mismatch that a scores-only check could not catch. Feed this as graph state to the `judge` node (status='done'); expect confidence='low' and wrong_match=true. Illustrative values, not a live snapshot.",
+  "status": "done",
+  "omdb_title": "Orphan Black",
+  "year": 2013,
+  "imdb_id": "tt1412386",
+  "imdb_rating": 8.0,
+  "genre": "Drama, Sci-Fi, Thriller",
+  "plot": "A streetwise hustler is pulled into a compelling conspiracy after witnessing the suicide of a woman who looks just like her.",
+  "rt_title": "Orphan Black: Echoes (2024) - Rotten Tomatoes",
+  "rt_year": 2024,
+  "rt_url": "https://www.rottentomatoes.com/tv/orphan_black_echoes",
+  "rt_critic": 62,
+  "rt_audience": 45,
+  "sources_used": ["omdb", "firecrawl"]
+}

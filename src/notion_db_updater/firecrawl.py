@@ -22,6 +22,8 @@ this); the spike's 4/4 was *with* year.
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
@@ -35,14 +37,41 @@ _API = "https://api.firecrawl.dev/v2"
 # maxAge (ms): serve from Firecrawl's cache if the page was scraped < 1 week ago.
 _WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
+# RT slugs often carry a disambiguating year suffix: /m/parasite_2019, /tv/dune_prophecy.
+_SLUG_YEAR = re.compile(r"_(\d{4})$")
 
-def pick_rt_hit(hits: list[dict], media_type: str | None = None) -> dict | None:
-    """Choose the canonical Rotten Tomatoes title page from search hits.
 
-    Prefers a bare `/m/<slug>` or `/tv/<slug>` (2 path segments) over deep links like
-    `/m/<slug>/reviews`. When `media_type` is known, biases toward the matching path
-    (`Movie` → `/m/`, `TV Show` → `/tv/`) — the parallel RT lane's only disambiguator, since
-    it has no year. Returns the best hit, or None when no RT page is present (a soft miss).
+@dataclass(frozen=True, slots=True)
+class RTHit:
+    """One canonical Rotten Tomatoes title page discovered by the RT lane.
+
+    Carries the page *identity* (`url`, `title`, `year`) the Judge needs to correlate against
+    OMDb's resolved identity (ADR 0003 / 0008), plus the `markdown` Firecrawl scraped inline
+    (already paid for) so score extraction can run without a second fetch. `year` is parsed
+    from the RT slug (`/m/parasite_2019`) when present, else None.
+    """
+
+    url: str
+    title: str
+    year: int | None
+    markdown: str | None
+
+
+def _slug_year(url: str) -> int | None:
+    """Parse the trailing `_YYYY` year off an RT slug, or None when absent."""
+    slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+    match = _SLUG_YEAR.search(slug)
+    return int(match.group(1)) if match else None
+
+
+def rank_rt_hits(hits: list[dict], media_type: str | None = None) -> list[dict]:
+    """Rank the canonical Rotten Tomatoes title pages among search hits, best first.
+
+    Keeps only bare `/m/<slug>` or `/tv/<slug>` pages (2 path segments), dropping deep links
+    like `/m/<slug>/reviews`. When `media_type` is known, biases toward the matching path
+    (`Movie` → `/m/`, `TV Show` → `/tv/`) — the parallel RT lane's only disambiguator, since it
+    has no year. Returns the ranked list (empty on a soft miss); Phase 5's `resolve_rt`
+    correlates the top-N against OMDb's identity when more than one is in contention.
     """
     preferred = {"Movie": "/m/", "TV Show": "/tv/"}.get(media_type or "")
     scored: list[tuple[int, dict]] = []
@@ -54,14 +83,19 @@ def pick_rt_hit(hits: list[dict], media_type: str | None = None) -> dict | None:
         if not (path.startswith("/m/") or path.startswith("/tv/")):
             continue
         canonical = path.rstrip("/").count("/") == 2  # /m/slug, not /m/slug/reviews
+        if not canonical:
+            continue  # only canonical title pages are candidates (deep links can't score)
         on_type = preferred is not None and path.startswith(preferred)
-        # Lower rank sorts first: matching media type beats canonical-shape beats the rest.
-        rank = (0 if on_type else 1, 0 if canonical else 1)
-        scored.append((rank[0] * 2 + rank[1], h))
-    if not scored:
-        return None
+        # Lower rank sorts first: matching media type wins.
+        scored.append((0 if on_type else 1, h))
     scored.sort(key=lambda t: t[0])
-    return scored[0][1]
+    return [h for _, h in scored]
+
+
+def pick_rt_hit(hits: list[dict], media_type: str | None = None) -> dict | None:
+    """The single best canonical RT page (deterministic fast path), or None on a soft miss."""
+    ranked = rank_rt_hits(hits, media_type)
+    return ranked[0] if ranked else None
 
 
 class FirecrawlClient:
@@ -70,7 +104,7 @@ class FirecrawlClient:
     Use as an async context manager so the HTTP connection pool is closed::
 
         async with FirecrawlClient(settings) as fc:
-            markdown = await fc.search_rt("Dune: Part Two", "Movie")
+            candidates = await fc.search_rt_candidates("Dune: Part Two", "Movie")
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -120,22 +154,29 @@ class FirecrawlClient:
             for h in hits
         ]
 
-    async def search_rt(self, title: str, media_type: str | None = None) -> str | None:
-        """Find a title's Rotten Tomatoes page and return its markdown, or None on a soft miss.
+    async def search_rt_candidates(
+        self, title: str, media_type: str | None = None
+    ) -> list[RTHit]:
+        """Find a title's canonical RT pages, ranked best-first (empty on a soft miss).
 
-        Title-only query (see the module note on the year caveat). Returns None when no RT page
-        appears in the results — a soft miss, distinct from a hard failure (which raises). The
-        caller (RT subgraph) decides what an exception means; here we only signal "no page".
+        Title-only query (see the module note on the year caveat). Returns the ranked canonical
+        `RTHit`s — each carrying identity (`url`/`title`/`year`) and the inline-scraped
+        `markdown` (already paid for). The RT subgraph takes `[0]` on the common single-match
+        fast path; Phase 5's `resolve_rt` correlates the set against OMDb when >1 is in
+        contention. An empty list is a soft miss (no RT page), distinct from a hard failure
+        (which raises — the caller decides what that means; ADR 0004).
         """
         query = f"{title} site:rottentomatoes.com"
         hits = await self._search(query)
-        hit = pick_rt_hit(hits, media_type)
-        if not hit:
+        ranked = rank_rt_hits(hits, media_type)
+        if not ranked:
             log.info("firecrawl: no RT page for %r in %d hits — soft miss", title, len(hits))
-            return None
-        markdown = hit.get("markdown") or None
-        if not markdown:
-            log.info(
-                "firecrawl: RT page %s had no inline markdown — soft miss", hit.get("url")
+        return [
+            RTHit(
+                url=h.get("url", ""),
+                title=h.get("title", ""),
+                year=_slug_year(h.get("url", "")),
+                markdown=h.get("markdown") or None,
             )
-        return markdown
+            for h in ranked
+        ]

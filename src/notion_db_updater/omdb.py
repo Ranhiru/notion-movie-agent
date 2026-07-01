@@ -13,6 +13,7 @@ OMDb quirks handled here:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -44,6 +45,19 @@ def parse_rating(value: str | None) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def parse_year(value: str | None) -> int | None:
+    """Parse an OMDb `Year` into an int, taking the first 4-digit run.
+
+    OMDb series carry a range ("2013–2017", "2013–") and movies a plain year ("2021"); we
+    keep the *start* year — enough for the Judge's cross-lane title/year correlation (Phase 5).
+    """
+    text = _clean(value)
+    if text is None:
+        return None
+    match = re.search(r"\d{4}", text)
+    return int(match.group()) if match else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,15 +141,19 @@ class OMDbClient:
 
 
 def details_fields(details: dict) -> dict:
-    """Extract the Phase 2 enrichment fields from a `?i=` details response.
+    """Extract the enrichment + identity fields from a `?i=` details response.
 
-    Keeps OMDb's field names (imdbID / imdbRating / Plot / Genre) confined to this module;
-    the graph node consumes the normalized dict. RT scores and the year/type live in later
-    phases — only the metadata-lane fields are pulled here.
+    Keeps OMDb's field names (imdbID / imdbRating / Plot / Genre / Year / Type) confined to
+    this module; the graph node consumes the normalized dict. Alongside the Phase-2 metadata,
+    Phase 5 pulls the **resolved identity** — `omdb_title`, `year`, `omdb_type` — so the Judge
+    can correlate against the RT lane's independently-resolved page (ADR 0008).
     """
     return {
         "imdb_id": _clean(details.get("imdbID")),
         "imdb_rating": parse_rating(details.get("imdbRating")),
         "plot": _clean(details.get("Plot")),
         "genre": _clean(details.get("Genre")),
+        "omdb_title": _clean(details.get("Title")),
+        "year": parse_year(details.get("Year")),
+        "omdb_type": _clean(details.get("Type")),
     }

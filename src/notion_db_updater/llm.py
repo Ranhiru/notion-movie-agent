@@ -31,3 +31,18 @@ def extraction_model(settings: Settings) -> ChatOpenAI:
         model=settings.OPENAI_EXTRACTION_MODEL,
         temperature=0,
     )
+
+
+def judge_model(settings: Settings) -> ChatOpenAI:
+    """The judge model (`OPENAI_JUDGE_MODEL`) — Phase 5's LLM-as-judge (ADR 0008, role 3).
+
+    Also drives Phase 5's `resolve_rt` correlation (same identity-judgment role family). A
+    sibling of `extraction_model`, differing only in the configured model; a stronger model
+    than extraction is the intended split (RESEARCH §5), swapped via config, not code.
+    """
+    return ChatOpenAI(
+        base_url=settings.OPENAI_BASE_URL,
+        api_key=settings.OPENAI_API_KEY,  # type: ignore[arg-type]  # str coerced to SecretStr
+        model=settings.OPENAI_JUDGE_MODEL,
+        temperature=0,
+    )

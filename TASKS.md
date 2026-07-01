@@ -266,54 +266,141 @@ LangSmith should show OMDb ‖ RT concurrent under one trace and `assemble` wait
 
 ---
 
-## Phase 5 — EnrichedEntry schema + LLM-as-judge
+## Phase 5 — EnrichedEntry schema + LLM-as-judge + RT correlation
 
-Goal: formalize the output contract and add the wrong-match guard. **Confidence trace-only.**
-ADR 0008.
+Goal: formalize the output contract, add the wrong-match guard, and make the RT lane
+candidate-shaped so the Judge can correlate RT pages against OMDb's resolved identity.
+**Confidence trace-only.** ADR 0003 / 0008.
 
-- [ ] Pydantic `EnrichedEntry` (per §5) as the graph's output contract.
-- [ ] **Surface both lanes' *identity* into the assembled record — the Judge needs full
-      context, not just numbers** (ADR 0003 / 0008). Phase 4's RT lane currently returns only
-      `{rt_critic, rt_audience}` and *discards* the matched page (`search_rt` computes the RT
-      hit's URL but drops it). Before the Judge can work:
-  - [ ] **RT lane:** carry the matched page reference up — add `rt_url` / `rt_title` (+ RT
-        page `rt_year` when shown) to `RTState` *and* the parent `EnrichmentState` (shared
-        keys, so they merge back); have `firecrawl.search_rt()` return the hit, not just its
-        markdown.
-  - [ ] **OMDb lane:** ensure the resolved identity (`imdb_id`, title, **year** — add a year
-        field to the `Candidate`/details mapping) is in state for the Judge to compare against.
-  - [ ] Rationale: the two lanes resolve identity **independently with no shared key**, so a
-        title mismatch (*Orphan Black* 2013 vs *Orphan Black: Echoes* 2024) is invisible to a
-        scores-only Judge. Title-level matching needs both identities present.
-- [ ] **LLM-as-judge fan-in node** (`OPENAI_JUDGE_MODEL`, `with_structured_output`): inspects
-      the assembled record (OMDb identity + fields ‖ winning RT identity + scores) for
-      wrong-match anomalies — **(a) cross-lane title/year mismatch** (RT page ≠ OMDb title) and
-      **(b) score implausibility** (IMDb 9.1 vs RT 18%, plot/title mismatch) → emits
-      `confidence` ∈ {high, medium, low}. Heuristic backstop, not a deterministic join.
-- [ ] **(Optional) RT candidate-set correlation — make RT candidate-shaped like OMDb** (ADR
-      0003 / 0008, "open"). Instead of `pick_rt_hit` collapsing to one page, surface the top-N
-      canonical RT pages as candidates `{rt_url, rt_title, rt_year, rt_critic, rt_audience}`
-      and let the Judge pick the one matching OMDb's title/year. Decide before building the
-      Judge — it changes the Judge's role from anomaly-detector to RT-disambiguator.
-  - [ ] **Cheap scrape:** Firecrawl `/search` already scrapes every hit inline, so the extra
-        pages' markdown is already paid for — `pick_rt_hit` just discards them today.
-  - [ ] **Metadata-first cost control:** Judge correlates on title/year *before* extraction →
-        extract scores **once**, from the winner (not once per candidate).
-  - [ ] **Hybrid escalation (mirror OMDb 0/1/many):** keep the deterministic single-pick fast
-        path for 1 canonical match; only surface a candidate set when **>1** is in contention
-        (the *Orphan Black* tail). Generalizes "soft miss" → "no candidate the Judge accepts."
-  - [ ] **Ordering note:** correlation needs OMDb's *resolved* identity, so a still-ambiguous
-        OMDb (multi-candidate, Phase 6a) must resolve first — a soft cross-lane dependency.
-  - [ ] Recorded as an option; the simpler title-match Judge (above) may be enough. If skipped,
-        leave `pick_rt_hit`'s single pick as-is.
-- [ ] **Confidence stays in graph state / LangSmith only** — NOT written to Notion (no §8
-      schema change). Document how to find low-confidence rows via traces.
+Target topology (two new nodes; `assemble` graduates from no-op to real work):
+
+    read_page ──→ {omdb, rt} ──→ assemble ──→ resolve_rt ──→ judge ──→ update_notion ──→ END
+
+**Decisions of record (this phase):**
+- **Assemble stays deterministic; the Judge is a *new* node after it** (ADR 0008: deterministic
+  assembly feeds the Judge, which supplies `confidence`). `assemble` builds the `EnrichedEntry`
+  + `sources_used`; `judge` sets `confidence`. No merge/reconcile — the lanes wrote disjoint
+  channels.
+- **No `add_conditional_edges` yet** — the new nodes self-guard on `status` / candidate-count.
+  Conditional *routing* is Phase 6a's learning slice; adding it here would churn topology twice.
+- **Judge (and correlation) are best-effort** — they never block `done`; on LLM failure/skip
+  `confidence` degrades to `low` (surfaces the row for review). `confidence` is **trace-only**,
+  never a §8 property (§8 unchanged).
+- **RT correlation is IN** (ADR 0003 / 0008 extension, "hybrid escalation"): keep the
+  deterministic single-pick fast path for 1 canonical RT page; surface a candidate set and
+  correlate only when **>1** canonical page is in contention (the *Orphan Black* tail).
+- **Correlation lives at a post-fan-in node, not in the RT subgraph** — the lanes run *in
+  parallel*, so the RT lane can't see OMDb's identity at scrape time. `resolve_rt` runs after
+  the barrier, where both identities exist.
+
+### 5a — `EnrichedEntry` contract + cross-lane identity plumbing (prerequisite)
+
+Both lanes currently *discard* the identity the Judge needs (`search_rt` drops the matched
+page URL; `details_fields` drops the year). Fix that first — nothing downstream works without it.
+
+- [x] Pydantic `EnrichedEntry` (RESEARCH §5) in a new `schema.py`, the graph's output contract:
+      `title, year:int|None, media_type:Literal["movie","tv"], imdb_id, imdb_rating, rt_critic,
+      rt_audience, plot, genre, confidence:Literal["high","medium","low"], sources_used:list[str]`.
+      → `schema.py` created; only `title`/`media_type`/`confidence` required, the rest nullable
+      (enrichment is best-effort). Aliased `MediaType`/`Confidence` `Literal`s reused across nodes.
+- [x] Helpers: `parse_year` (`"2013–"` → `2013`, first 4 digits) and `normalize_media_type`
+      (OMDb `movie/series/episode` + Notion `Movie/TV Show` → `movie/tv`; fallback `movie`).
+      → `parse_year` lives in `omdb.py` (an OMDb-field parser, beside `parse_rating`);
+      `normalize_media_type` in `schema.py`. Both offline-proven.
+- [x] **OMDb identity:** extend `details_fields()` to also return `year` (via `parse_year`) +
+      `omdb_title` (resolved canonical `Title`); add `year`, `omdb_title` to `EnrichmentState`.
+      → Also added `omdb_type` (drives `EnrichedEntry.media_type`). All three in `EnrichmentState`.
+- [x] **RT identity:** `firecrawl.search_rt()` returns the matched hit (`RTHit{url, title,
+      markdown}`), not bare markdown; `firecrawl_provider` surfaces `rt_url`, `rt_title`,
+      `rt_year` (parse trailing `_YYYY` from the slug/title). Add these to `RTState` **and**
+      `EnrichmentState` (shared keys, disjoint from OMDb's → still no reducer). Update the
+      firecrawl.py `search_rt` docstring example + retire the Phase 4 "identity gap" note above.
+      → `search_rt` replaced by `search_rt_candidates() -> list[RTHit]` (candidate-shaped for 5c,
+      supersedes the old single-markdown return); `RTHit{url,title,year,markdown}` carries the
+      inline-scraped markdown too. `_slug_year` parses the RT slug year. Docstring updated.
+
+### 5b — deterministic assemble + LLM-as-judge
+
+- [x] `assemble` (was a no-op): build the `EnrichedEntry` from state (minus `confidence`) and
+      compute `sources_used` (`["omdb"]` + `["firecrawl"]` when the RT lane ran). Deterministic
+      fan-in barrier — no LLM. (A reducer-tracked `sources_used` channel is a possible learning
+      enhancement; the deterministic compute avoids a parallel-write reducer for now.)
+      → **Refinement:** `assemble` computes `sources_used` only; the `EnrichedEntry` is built once
+      in `judge` (the sole point where every field is final — RT scores may be rewritten by
+      `resolve_rt`, and `confidence` is the Judge's own output, a required field). `assemble`
+      self-guards on `status=="done"`.
+- [x] `judge_model(settings)` factory (`OPENAI_JUDGE_MODEL`; sibling of `extraction_model`, the
+      3rd ADR-0008 role — env var already in `config.py`).
+      → In `llm.py`; also drives `resolve_rt` (same identity-judgment role family).
+- [x] `judge` node (`with_structured_output` → `JudgeVerdict{confidence, wrong_match:bool,
+      reason:str}`): guard on `status=="done"` (skip `failed`/`pending`). Prompt with **both
+      identities** — OMDb title/year/imdb_id/rating/plot/genre ‖ winning RT title/url/year/
+      critic/audience — to flag **(a) cross-lane title/year mismatch** (RT page ≠ OMDb title)
+      and **(b) score implausibility** (IMDb 9.1 vs RT 18%, plot/title mismatch). Best-effort:
+      swallow LLM errors → `confidence="low"`. Finalize `confidence` on the assembled record.
+      → Guard + best-effort degrade offline-proven (skips `failed`/`pending` without an LLM call).
+- [x] `build_graph` gains a `judge_llm` param; add the `judge` node + rewire; update call sites
+      (`app.py`, `__main__.py` ×2). `update_notion` unchanged — `confidence` is **not** written.
+      → Topology `assemble → resolve_rt → judge → update_notion` verified via `get_graph()`.
+      `__main__ --enrich` now prints `confidence`/`wrong_match`/RT page for local verification.
+
+### 5c — RT candidate-set correlation (ADR 0003 / 0008 extension)
+
+- [x] `rank_rt_hits()` returns the ranked canonical RT hits (`pick_rt_hit` becomes
+      `rank_rt_hits()[0]`); `firecrawl_provider` surfaces `rt_candidates:
+      list[RTCandidate{rt_url, rt_title, rt_year, rt_markdown}]` (markdown already scraped inline
+      — free) into `RTState` + `EnrichmentState`.
+      → Candidate type is the `RTHit` from 5a (carries markdown), so one type serves both. Only
+      *canonical* `/m/`,`/tv/` title pages are candidates (deep links can't score → dropped).
+- [x] **Hybrid escalation** in the RT subgraph's `extract`: 0 canonical → null; exactly 1 →
+      extract inline (today's fast path); **>1 → defer** extraction, carry the candidate set
+      (metadata + already-paid markdown) up to the fan-in for correlation.
+      → Offline-proven for 0 / >1 (no LLM call); the exactly-1 fast path extracts inline.
+- [x] `resolve_rt` node (parent graph, between `assemble` and `judge`): guard on `status=="done"`
+      **and** `len(rt_candidates)>1`. **Metadata-first** — LLM correlates candidate title/year
+      against OMDb's resolved title/year (cheap), picks the winner (or none → soft miss), then
+      **extracts scores once** from the winner's markdown (shared `extract_rt_scores` helper
+      refactored out of `rt.extract`). Sets `rt_url/title/year/critic/audience`.
+      → Uses `judge_model`. `RTMatch{index:int|None, reason}` structured output. **On an LLM
+      error it falls back to the top-ranked candidate** (RT stays best-effort); an out-of-range
+      index is clamped to 0. **Plot-aware correlation:** RT extraction now also pulls the
+      synopsis (`RTPage{plot, rt_critic, rt_audience}`; single `extract_rt_page`), so the
+      correlation prompt weighs OMDb's `plot` against each candidate's synopsis slice
+      (`synopsis_region`, cheap — no per-candidate LLM), not just title/year. `rt_plot` is added
+      to state (winner's, extracted once) and also fed to the Judge for plot-mismatch detection.
+- [x] **Ordering coupling** (ADR 0008): correlation needs OMDb's *resolved* identity, so a
+      still-ambiguous OMDb (multi-candidate → `pending`, Phase 6a) never reaches `resolve_rt`
+      (the `status=="done"` guard skips it) and is retried after 6a resolves it — self-healing,
+      no hard dependency.
+      → Enforced by the `status=="done"` guard in `resolve_rt` (and `judge`).
+- [x] **Checkpoint hygiene:** candidate markdown in state will bloat the Phase 6 checkpoint —
+      drop `rt_markdown` / `rt_candidates` from state once `resolve_rt` picks a winner.
+      → `resolve_rt` returns `rt_candidates: []` on both the winner and no-match paths.
+- [x] **Confidence stays in graph state / LangSmith only** — NOT written to Notion. Document how
+      to find low-confidence rows (filter LangSmith by the `confidence` / `wrong_match` metadata).
+      → `update_notion` (`enrichment_properties`) writes no confidence — §8 untouched. Low-
+      confidence rows: filter the LangSmith project by the `judge` node's `confidence` output.
 
 **Verification:** force a bad `imdbID` → Judge returns low confidence / wrong-match flag; point
 the RT lane at a *different* title than OMDb resolved → Judge flags the cross-lane mismatch (the
-case scores-only could not catch); a clean match → high. Confirm confidence appears in the
-LangSmith trace, not in Notion. Fixture: a deliberately-wrong assembled record (mismatched
-OMDb title vs RT page).
+case scores-only could not catch); a clean match → high; an *Orphan Black*-style query (>1
+canonical RT page) → `resolve_rt` picks the page matching OMDb's year and extracts scores once.
+Confirm `confidence` appears in the LangSmith trace, not in Notion. Fixtures:
+`firecrawl_rt_multi_candidate.json` (>1 canonical RT page) + a deliberately-wrong assembled
+record (mismatched OMDb title vs RT page). Offline-provable: `EnrichedEntry` build, year /
+media_type normalization, identity plumbing, `sources_used`, `rank_rt_hits`, node skip-guards.
+Live judge + correlation are owner-run (LLM creds aren't in Claude's shell env).
+→ **Offline-proven** (`ruff` clean; `uv run` checks): `parse_year` / `normalize_media_type` /
+`_slug_year` / `rank_rt_hits`; graph compiles with the new topology (`assemble → resolve_rt →
+judge → update_notion`); `assemble`/`resolve_rt`/`judge` skip-guards + `rt.extract` hybrid
+escalation all short-circuit `failed`/`pending`/0/1-candidate state **without** an LLM call.
+Fixtures captured: `tests/fixtures/firecrawl_rt_multi_candidate.json` (>1 canonical RT page →
+`rank_rt_hits` yields Dune 2021 + 1984, drops deep-link/off-domain) +
+`tests/fixtures/judge_wrong_match.json` (a `status=done` record with an *Orphan Black* cross-lane
+title/year mismatch). **Live happy-path + wrong-match + >1-candidate correlation are owner-run**
+(LLM/Firecrawl/OMDb creds aren't in Claude's shell env): `uv run python -m notion_db_updater
+--enrich <page_id>`; LangSmith should show `resolve_rt` firing only on the >1 tail and
+`confidence` in the `judge` node output (absent from Notion).
 
 ---
 

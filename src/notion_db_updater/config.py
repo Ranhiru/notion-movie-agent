@@ -16,6 +16,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root = two levels up from this file (src/notion_db_updater/config.py).
@@ -93,5 +94,12 @@ def get_settings() -> Settings:
 
     Raises ``pydantic.ValidationError`` with a clear message if a required key
     (currently just ``NOTION_MOVIE_DB_TOKEN``) is unset.
+
+    `load_dotenv` also copies `.env` into `os.environ`, which is what makes LangSmith tracing
+    work: LangChain/LangGraph read their `LANGSMITH_*` config **directly from `os.environ`** at
+    runtime, not from this `Settings` object — so without loading the file into the process env
+    the keys are invisible and no traces are emitted. `override=False` keeps a shell-exported
+    value winning over the `.env` one, matching pydantic-settings' own precedence.
     """
+    load_dotenv(_ENV_PATH, override=False)
     return Settings()  # type: ignore[call-arg]  # values come from env, not args
