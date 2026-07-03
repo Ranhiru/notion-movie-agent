@@ -27,9 +27,8 @@ import json
 import logging
 from pathlib import Path
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
 from .app import Runtime
+from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
@@ -137,11 +136,10 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         NotionClient(settings) as notion,
         OMDbClient(settings) as omdb,
         FirecrawlClient(settings) as firecrawl,
-        AsyncSqliteSaver.from_conn_string(settings.CHECKPOINT_DB_PATH) as saver,
+        open_checkpointer(settings.CHECKPOINT_DB_PATH) as saver,
     ):
         # Checkpointed like the reconcile Runtime (thread_id = page_id), so a single-Entry run
         # writes the same checkpoint rows — the substrate Phase 6b's interrupt/resume uses.
-        await saver.setup()
         graph = build_graph(
             notion,
             omdb,
@@ -169,6 +167,21 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             print(f"  Pre-filter confident = {final_state.get('confident')}")
             if final_state.get("disambiguation_reason"):
                 print(f"  Pre-filter reason  = {final_state['disambiguation_reason']}")
+
+        # Phase 6b — the run paused at interrupt() for human disambiguation. The state is
+        # checkpointed under thread_id = page_id; resume out-of-band with the chosen imdbID.
+        interrupts = final_state.get("__interrupt__")
+        if interrupts:
+            payload = interrupts[0].value
+            print("  → PAUSED (awaiting_input) — pick one candidate to resume:")
+            for c in payload.get("candidates", []):
+                print(
+                    f"      [{c['index']}] {c['title']!r} ({c['year']}) — "
+                    f"{c['media_type']} — {c['imdb_id']}"
+                )
+            print(f"  Pre-filter best guess = {payload.get('best_guess_imdb_id')}")
+            print(f"\n  resume: python -m notion_db_updater --resume {page_id} <imdbID>")
+            return
 
         if enriched is not None:
             # A resolved Entry — print the graph's actual output contract (built by `judge`).
@@ -204,6 +217,19 @@ async def _reconcile(limit: int | None) -> None:
     async with Runtime() as rt:
         summary = await rt.reconcile(limit=limit)
     print(f"\nreconcile: {summary}")
+
+
+async def _resume(page_id: str, chosen_imdb_id: str) -> None:
+    """Resume a paused HITL run (Phase 6b) with the human's chosen imdbID — the test harness.
+
+    Stands in for the Phase-6c Slack action handler: drives `Runtime.resume` (out-of-band, no
+    single-flight lock) on the same thread_id = page_id, so the paused `await_human` node gets
+    the pick and the graph runs to completion. Reuses the full `Runtime` wiring (clients +
+    checkpointer + one compiled graph).
+    """
+    async with Runtime() as rt:
+        status = await rt.resume(page_id, chosen_imdb_id)
+    print(f"resumed {page_id} with {chosen_imdb_id} → {status}")
 
 
 async def _serve() -> None:
@@ -242,6 +268,12 @@ def main() -> None:
         help="render the enrichment graph structure to flow.png (no enrichment run)",
     )
     parser.add_argument(
+        "--resume",
+        nargs=2,
+        metavar=("PAGE_ID", "IMDB_ID"),
+        help="resume a paused HITL run (Phase 6b) with the chosen imdbID — the manual picker",
+    )
+    parser.add_argument(
         "--reconcile",
         action="store_true",
         help="run one reconcile sweep over the whole Watchlist (Phase 3 'run now')",
@@ -271,6 +303,8 @@ def main() -> None:
     elif args.reconcile:
         _configure_logging()
         asyncio.run(_reconcile(args.limit))
+    elif args.resume:
+        asyncio.run(_resume(args.resume[0], args.resume[1]))
     elif args.enrich:
         asyncio.run(_enrich(args.enrich, args.capture_fixtures))
     else:

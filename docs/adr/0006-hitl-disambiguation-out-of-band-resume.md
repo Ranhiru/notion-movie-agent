@@ -4,7 +4,10 @@ When OMDb search returns multiple candidates for an Entry (e.g. *Dune* 1984/2000
 an LLM disambiguation pre-filter attempts the pick first; a conditional edge escalates to
 the human **only when the LLM is not confident** (see
 [0008](./0008-llm-node-architecture.md)). On escalation the graph calls LangGraph
-`interrupt()` at the disambiguation node. The checkpointer
+`interrupt()`. In implementation (Phase 6b) this lives in a **dedicated `await_human` node**
+downstream of `disambiguate`, not inside `disambiguate` itself: `interrupt()` re-runs its
+whole node from the top on resume, so isolating it keeps the disambiguation LLM (and the OMDb
+`details` fetch, in `omdb_details`) from re-firing on every resume. The checkpointer
 persists the graph state (keyed by `thread_id = page_id`), the Entry is set to a new
 status **`awaiting_input`**, a Slack prompt with the candidates is posted, and the
 reconcile **moves on to the next Entry**. When the human clicks in Slack, Slack POSTs to
