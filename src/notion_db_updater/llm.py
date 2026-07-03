@@ -46,3 +46,18 @@ def judge_model(settings: Settings) -> ChatOpenAI:
         model=settings.OPENAI_JUDGE_MODEL,
         temperature=0,
     )
+
+
+def disambiguation_model(settings: Settings) -> ChatOpenAI:
+    """The disambiguation pre-filter model (`OPENAI_DISAMBIGUATION_MODEL`) — Phase 6a, role 2.
+
+    Picks the best OMDb candidate when search returns >1 and self-reports whether the pick is
+    a clear match (ADR 0008 role 2). Third and final of the three ADR-0008 role factories; a
+    sibling of `extraction_model` / `judge_model`, differing only in the configured model.
+    """
+    return ChatOpenAI(
+        base_url=settings.OPENAI_BASE_URL,
+        api_key=settings.OPENAI_API_KEY,  # type: ignore[arg-type]  # str coerced to SecretStr
+        model=settings.OPENAI_DISAMBIGUATION_MODEL,
+        temperature=0,
+    )

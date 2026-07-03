@@ -408,13 +408,46 @@ title/year mismatch). **Live happy-path + wrong-match + >1-candidate correlation
 
 Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0007 / 0010.
 
-- [ ] **6a — checkpointer + many-candidate path + pre-filter (auto-pick, no human):**
-  - [ ] Compile graph with `AsyncSqliteSaver` on a `.sqlite` file, `thread_id = page_id`.
-  - [ ] Switch OMDb resolution to surface the **full candidate list** (the phase-2 TODO).
-  - [ ] LLM **disambiguation pre-filter** (`OPENAI_DISAMBIGUATION_MODEL`) picks the best
+- [x] **6a — checkpointer + many-candidate path + pre-filter (auto-pick, no human):**
+  - [x] Compile graph with `AsyncSqliteSaver` on a `.sqlite` file, `thread_id = page_id`.
+        → `build_graph(..., checkpointer=)` param; `Runtime` opens the saver in `__aenter__`
+        via an `AsyncExitStack` (`saver.setup()` is async), compiles the one shared graph there,
+        and closes it in `aclose`. `_run_one` passes `configurable.thread_id = page_id`.
+        `--enrich` opens its own saver so single-Entry runs checkpoint identically. New config
+        `CHECKPOINT_DB_PATH` (`.env.example` updated; `*.sqlite` already gitignored).
+  - [x] Switch OMDb resolution to surface the **full candidate list** (the phase-2 TODO).
+        → The single `omdb` node is split into **`omdb_search`** (search → candidates; 0 →
+        `failed`, 1 → trivial `chosen_imdb_id`, >1 → carry the list) and **`omdb_details`**
+        (fetch details for `chosen_imdb_id`; no-op when none). The split is *forced*: `details`
+        needs the post-pick id, and it must stay out of any node a 6b `interrupt()` would re-run.
+        The OMDb lane always terminates at `omdb_details`, so the fan-in stays a clean two-edge
+        barrier (no conditional edge lands on `assemble`).
+  - [x] LLM **disambiguation pre-filter** (`OPENAI_DISAMBIGUATION_MODEL`) picks the best
         Candidate; `add_conditional_edges` route that *always* takes the pick for now.
-  - [ ] **Verify:** a multi-candidate Entry (e.g. *Dune*) resolves to the pre-filter's choice;
+        → `disambiguation_model()` factory (3rd of the 3 ADR-0008 roles). `disambiguate` node:
+        `with_structured_output` → `DisambiguationPick{index, confident, reason}` (index →
+        validated candidate). `add_conditional_edges("omdb_search", route_after_search, …)` sends
+        >1 → `disambiguate`, ≤1 → `omdb_details`; `disambiguate → omdb_details` is a **plain
+        edge** (6a always takes the pick — 6b makes it conditional on `confident`). Unlike the
+        best-effort RT/Judge nodes, `disambiguate` **fails safe**: an LLM error or an unusable
+        index yields `confident=False` + no `chosen_imdb_id` (defer to a human in 6b), never a
+        guessed identity. Pick stashed as `best_guess_imdb_id` for the 6d timeout.
+  - [x] **Verify:** a multi-candidate Entry (e.g. *Dune*) resolves to the pre-filter's choice;
         checkpoint rows appear in the `.sqlite` file.
+        → **Offline-proven** (`ruff` + `basedpyright` clean; stubbed-client graph runs): all
+        four routes execute correctly through the conditional edge + fan-in barrier
+        (multi→disambiguate→done, single→details→done, not-found→failed, blank→failed), and the
+        checkpoint persists under `thread_id=page_id` (`aget_state` → `status=done`, `next=()`).
+        Pure-logic checks: `route_after_search`, `omdb_details` no-op, `disambiguate` fail-safe
+        (LLM error + out-of-range index) and happy path. **Live multi-candidate (real LLM pick +
+        `.sqlite` inspection) is owner-run** (LLM/OMDb creds aren't in Claude's shell env):
+        `uv run python -m notion_db_updater --enrich <page_id>` on a *Dune*-like row → prints the
+        pre-filter's chosen imdb_id / confident / reason; `sqlite3 checkpoints.sqlite '.tables'`
+        shows the checkpoint rows.
+        - [ ] **Deferred to 6b:** register `Entry`/`Candidate`/`EnrichedEntry` for msgpack serde
+              (LangGraph 1.2.6 warns "unregistered type … blocked in a future version"). Non-
+              breaking on the pin today; deserialization round-trips — but it's the exact state
+              6b must restore across a process restart, so fix it where restart-survival is tested.
 - [ ] **6b — interrupt() + programmatic resume + restart survival:**
   - [ ] When the pre-filter is unsure → `interrupt()`; set `awaiting_input`; reconcile
         "moves on" to the next Entry.

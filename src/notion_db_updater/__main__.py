@@ -27,11 +27,13 @@ import json
 import logging
 from pathlib import Path
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 from .app import Runtime
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import extraction_model, judge_model
+from .llm import disambiguation_model, extraction_model, judge_model
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
@@ -116,7 +118,12 @@ async def _generate_graph() -> None:
         FirecrawlClient(settings) as firecrawl,
     ):
         graph = build_graph(
-            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+            notion,
+            omdb,
+            firecrawl,
+            extraction_model(settings),
+            judge_model(settings),
+            disambiguation_model(settings),
         )
         # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
         # rendering `rt` as one opaque node — the point of the nested-lane visualization.
@@ -130,17 +137,38 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         NotionClient(settings) as notion,
         OMDbClient(settings) as omdb,
         FirecrawlClient(settings) as firecrawl,
+        AsyncSqliteSaver.from_conn_string(settings.CHECKPOINT_DB_PATH) as saver,
     ):
+        # Checkpointed like the reconcile Runtime (thread_id = page_id), so a single-Entry run
+        # writes the same checkpoint rows — the substrate Phase 6b's interrupt/resume uses.
+        await saver.setup()
         graph = build_graph(
-            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+            notion,
+            omdb,
+            firecrawl,
+            extraction_model(settings),
+            judge_model(settings),
+            disambiguation_model(settings),
+            checkpointer=saver,
         )
         print(f"enriching page_id = {page_id}\n")
-        final = await graph.ainvoke({"page_id": page_id})
+        final_state = await graph.ainvoke(
+            {"page_id": page_id}, config={"configurable": {"thread_id": page_id}}
+        )
 
-        entry: Entry | None = final.get("entry")
-        enriched: EnrichedEntry | None = final.get("enriched")
+        entry: Entry | None = final_state.get("entry")
+        enriched: EnrichedEntry | None = final_state.get("enriched")
         print("result:")
-        print(f"  Enrichment Status  = {final.get('status')}")
+        print(f"  Enrichment Status  = {final_state.get('status')}")
+
+        # Phase 6a — the disambiguation pre-filter's pick (only fires for >1 candidates).
+        candidates = final_state.get("candidates") or []
+        if len(candidates) > 1:
+            print(f"  OMDb candidates    = {len(candidates)}")
+            print(f"  Pre-filter chose   = {final_state.get('chosen_imdb_id')}")
+            print(f"  Pre-filter confident = {final_state.get('confident')}")
+            if final_state.get("disambiguation_reason"):
+                print(f"  Pre-filter reason  = {final_state['disambiguation_reason']}")
 
         if enriched is not None:
             # A resolved Entry — print the graph's actual output contract (built by `judge`).
@@ -149,22 +177,23 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             print(f"  IMDB id / rating   = {enriched.imdb_id} / {enriched.imdb_rating}")
             print(f"  Genre              = {enriched.genre!r}")
             print(f"  RT critic/audience = {enriched.rt_critic} / {enriched.rt_audience}")
-            print(f"  RT page (title/url)= {final.get('rt_title')!r} / {final.get('rt_url')}")
+            rt_title = final_state.get("rt_title")
+            print(f"  RT page (title/url)= {rt_title!r} / {final_state.get('rt_url')}")
             print(f"  Plot (OMDb)        = {(enriched.plot or '')[:80]!r}")
-            print(f"  Plot (RT)          = {(final.get('rt_plot') or '')[:80]!r}")
+            print(f"  Plot (RT)          = {(final_state.get('rt_plot') or '')[:80]!r}")
             print(f"  Sources used       = {enriched.sources_used}")
             # Judge output — trace-only (never written to Notion; here for verification).
             print(f"  Confidence         = {enriched.confidence}")
-            print(f"  Wrong match        = {final.get('wrong_match')}")
-            if final.get("judge_reason"):
-                print(f"  Judge reason       = {final['judge_reason']}")
+            print(f"  Wrong match        = {final_state.get('wrong_match')}")
+            if final_state.get("judge_reason"):
+                print(f"  Judge reason       = {final_state['judge_reason']}")
         else:
             # Not resolved (blank / not-found / multi-candidate) — no contract to show.
             print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
-            if final.get("candidates") is not None:
-                print(f"  OMDb candidates    = {len(final['candidates'])}")
-            if final.get("note"):
-                print(f"  note               = {final['note']}")
+            if final_state.get("candidates") is not None:
+                print(f"  OMDb candidates    = {len(final_state['candidates'])}")
+            if final_state.get("note"):
+                print(f"  note               = {final_state['note']}")
 
         if capture_fixtures and entry and entry.title:
             await _capture_omdb_fixtures(omdb, entry.title)

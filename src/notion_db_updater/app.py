@@ -23,14 +23,18 @@ Status lifecycle (ADR 0004) is split between the graph and this sweep:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections import Counter
 from dataclasses import dataclass
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph.state import CompiledStateGraph
+
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import extraction_model, judge_model
+from .llm import disambiguation_model, extraction_model, judge_model
 from .models import Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
@@ -38,7 +42,7 @@ from .omdb import OMDbClient
 log = logging.getLogger(__name__)
 
 # Returned by _run_one when the graph raised a transient error: the Entry was left in its
-# prior (pending/unset) state — distinct from the graph-written "pending" (multi-candidate).
+# prior (pending/unset) state — distinct from a graph-written terminal status.
 _TRANSIENT = "error"
 
 
@@ -50,7 +54,9 @@ class ReconcileSummary:
     total: int = 0
     done: int = 0
     failed: int = 0
-    pending: int = 0  # graph-written: multi-candidate, deferred to Phase 6a
+    # graph-written "pending" — no longer produced in 6a (multi-candidate now auto-resolves
+    # via the disambiguation pre-filter); kept for the tally + Phase 6b's `awaiting_input`.
+    pending: int = 0
     error: int = 0  # transient failure → Entry left pending for the next cron pass
 
     @classmethod
@@ -69,8 +75,7 @@ class ReconcileSummary:
             return "dropped (a reconcile is already in progress)"
         return (
             f"{self.total} entries → {self.done} done, {self.failed} failed, "
-            f"{self.pending} pending (multi-candidate), "
-            f"{self.error} transient error(s) left pending"
+            f"{self.pending} pending, {self.error} transient error(s) left pending"
         )
 
 
@@ -89,27 +94,39 @@ class Runtime:
         self._notion = NotionClient(self._settings)
         self._omdb = OMDbClient(self._settings)
         self._firecrawl = FirecrawlClient(self._settings)
-        # One compiled graph, reused across entries — it is stateless without a checkpointer
-        # (the checkpointer arrives in Phase 6a, keyed thread_id = page_id). The extraction
-        # model is bound once (stateless per .invoke) and shared by the RT lane.
+        self._concurrency = self._settings.RECONCILE_CONCURRENCY
+        # Single-flight: only one reconcile runs at a time (ADR 0001).
+        self._lock = asyncio.Lock()
+        # The compiled graph is built in __aenter__: it needs the AsyncSqliteSaver, whose
+        # setup() is async (ADR 0006 / 0007). Held via an AsyncExitStack so the checkpointer's
+        # connection is closed on exit.
+        self._stack = contextlib.AsyncExitStack()
+        self._graph: CompiledStateGraph | None = None
+
+    async def __aenter__(self) -> Runtime:
+        # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
+        # across entries. WAL + .setup() lifecycle proven by spike 03. Models are bound once
+        # (ChatOpenAI is stateless per .invoke); the extraction model is shared by the RT lane.
+        saver = await self._stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(self._settings.CHECKPOINT_DB_PATH)
+        )
+        await saver.setup()
         self._graph = build_graph(
             self._notion,
             self._omdb,
             self._firecrawl,
             extraction_model(self._settings),
             judge_model(self._settings),
+            disambiguation_model(self._settings),
+            checkpointer=saver,
         )
-        self._concurrency = self._settings.RECONCILE_CONCURRENCY
-        # Single-flight: only one reconcile runs at a time (ADR 0001).
-        self._lock = asyncio.Lock()
-
-    async def __aenter__(self) -> Runtime:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
     async def aclose(self) -> None:
+        await self._stack.aclose()  # closes the checkpointer's sqlite connection
         await self._notion.aclose()
         await self._omdb.aclose()
         await self._firecrawl.aclose()
@@ -151,18 +168,21 @@ class Runtime:
         the next cron pass (ADR 0004). `failed` is only ever written by the graph, on a
         definitive not-found.
         """
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         async with sem:
             try:
-                final = await self._graph.ainvoke(
+                final_state = await self._graph.ainvoke(
                     {"page_id": entry.page_id},
-                    # Names the LangSmith trace by the entry's title and tags the sweep origin
-                    # (ADR 0001; `origin` foreshadows the Phase 9 Slack `/add` path).
+                    # thread_id = page_id keys the checkpoint (ADR 0006/0007), so a Phase-6b
+                    # paused run resumes on this same key. run_name names the LangSmith trace;
+                    # `origin` foreshadows the Phase 9 Slack `/add` path (ADR 0001).
                     config={
+                        "configurable": {"thread_id": entry.page_id},
                         "run_name": entry.title or "(blank Entry)",
                         "metadata": {"page_id": entry.page_id, "origin": "sweep"},
                     },
                 )
-                return final.get("status", "pending")
+                return final_state.get("status", "pending")
             except Exception:
                 log.exception(
                     "reconcile: transient error on %r (%s) — left pending",

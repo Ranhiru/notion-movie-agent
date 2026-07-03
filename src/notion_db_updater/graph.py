@@ -1,30 +1,47 @@
-"""The enrichment `StateGraph` — Phase 5: parallel lanes, deterministic assemble, Judge.
+"""The enrichment `StateGraph` — Phase 6a: parallel lanes + OMDb disambiguation pre-filter.
 
 Built as a LangGraph `StateGraph` (not loose functions) from the start so later phases bolt
 on without a port. The lane splits after `read_page` and rejoins at `assemble`:
 
-                ┌──→ omdb ───────┐
-    read_page ──┤                ├──→ assemble → resolve_rt → judge → update_notion → END
-                └──→ rt ─────────┘
+                ┌── omdb_search ─(route)─┬─≤1─→ omdb_details ──┐
+    read_page ──┤                        └─>1─→ disambiguate ──┘
+                │                                    (→ omdb_details)
+                └── rt ───────────────────────────────────────────┐
+                                                                    │
+       omdb_details ─┐                                              │
+                     ├─→ assemble → resolve_rt → judge → update_notion → END
+                rt ──┘
 
 - **Fan-out** = two edges out of `read_page`; **fan-in** = two edges into `assemble`, which
-  LangGraph holds until *both* lanes complete (a barrier — proven in spike 02).
+  LangGraph holds until *both* lanes complete (a barrier — proven in spike 02). The OMDb lane
+  is now variable-length but always terminates at `omdb_details`, so the fan-in stays a clean
+  two-edge join (no conditional edge lands on `assemble`).
 - The two lanes write **disjoint** state channels (omdb → status + imdb/plot/genre + identity;
   rt → rt_* scores/identity/candidates), so the concurrent fan-out needs no reducer.
+- **Phase 6a — OMDb disambiguation (ADR 0008 role 2):** `omdb_search` surfaces the full OMDb
+  candidate list; `add_conditional_edges` (`route_after_search`) routes >1 candidates to the
+  LLM `disambiguate` pre-filter, and ≤1 straight to `omdb_details`. `disambiguate` picks the
+  best candidate and self-assesses `confident`; in 6a the route *always* takes the pick
+  (`disambiguate → omdb_details` is a plain edge — 6b makes it conditional, escalating an
+  unsure pick to a human via `interrupt()`). `omdb_details` fetches details for the resolved
+  `chosen_imdb_id` — kept out of any interrupt-re-run node, since `interrupt()` re-runs its
+  whole node on resume and OMDb `details` is an external call (Phase 6b).
 - `assemble` is the deterministic fan-in barrier (computes `sources_used`). `resolve_rt` and
-  `judge` are linear post-fan-in nodes; both self-guard on `status`/candidate-count (no
-  conditional edges yet — that is Phase 6a). `resolve_rt` correlates a >1 RT candidate set
-  against OMDb's resolved identity; `judge` is the LLM-as-judge, building the `EnrichedEntry`
-  output contract and emitting a trace-only `confidence` (ADR 0008).
+  `judge` are linear post-fan-in nodes that self-guard on `status`/candidate-count.
+  `resolve_rt` correlates a >1 RT candidate set against OMDb's resolved identity; `judge` is
+  the LLM-as-judge, building the `EnrichedEntry` output contract and emitting a trace-only
+  `confidence` (ADR 0008).
 
-OMDb resolution scope is unchanged from Phase 2 (counts 0 and 1; >1 deferred to Phase 6a).
 Transient OMDb errors still propagate (nothing written → Entry stays pending; RetryPolicy is
 Phase 7). The RT lane, `resolve_rt`, and `judge` all swallow their own errors (best-effort;
 ADR 0004) — RT must never block `done`, and `confidence` is trace-only, so a judge failure
-degrades to `confidence=low` rather than failing the Entry.
+degrades to `confidence=low` rather than failing the Entry. `disambiguate`, by contrast, is a
+correctness decision: it fails *safe* (defers the pick) rather than guessing an identity.
 
-Clients/models are injected via `build_graph(...)` (bound into nodes with `partial`); the
-caller owns their async-context lifecycles.
+The graph is compiled with an `AsyncSqliteSaver` checkpointer (ADR 0006 / 0007), keyed by
+`thread_id = page_id`, so a Phase-6b paused HITL run survives a process restart. Clients/models
+are injected via `build_graph(...)` (bound into nodes with `partial`); the caller owns their
+async-context lifecycles (incl. the checkpointer).
 """
 
 from __future__ import annotations
@@ -34,7 +51,9 @@ import logging
 from typing import NotRequired, TypedDict
 
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
 
 from .firecrawl import FirecrawlClient, RTHit
@@ -52,7 +71,16 @@ class EnrichmentState(TypedDict):
 
     page_id: str
     entry: NotRequired[Entry | None]
-    candidates: NotRequired[list[Candidate]]  # full OMDb list (Phase 6a consumes >1)
+    candidates: NotRequired[list[Candidate]]  # full OMDb list (>1 → disambiguate, Phase 6a)
+    # OMDb disambiguation (Phase 6a / ADR 0008 role 2)
+    chosen_imdb_id: NotRequired[
+        str | None
+    ]  # resolved candidate: single pick / pre-filter / human
+    best_guess_imdb_id: NotRequired[
+        str | None
+    ]  # pre-filter's pick — stashed for the 6d timeout
+    confident: NotRequired[bool]  # pre-filter self-assessment (drives 6b's escalate branch)
+    disambiguation_reason: NotRequired[str]  # trace-only justification for the pick
     # OMDb lane — metadata + resolved identity (identity feeds the Judge, Phase 5 / ADR 0008)
     imdb_id: NotRequired[str | None]
     imdb_rating: NotRequired[float | None]
@@ -87,10 +115,17 @@ async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
     return {"entry": entry}
 
 
-async def omdb(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
-    """Resolve the Entry against OMDb. Handles the 0- and 1-candidate cases (Phase 2 scope)."""
+async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
+    """Search OMDb for the Entry's candidates — the head of the OMDb fan-out lane.
+
+    Resolves the trivial cases inline: 0 → `failed` (definitive not-found, ADR 0004); exactly
+    1 → the trivial pick, stashed in `chosen_imdb_id` (no LLM needed). A >1 set is carried for
+    the `disambiguate` pre-filter (`route_after_search` decides). Details are fetched
+    *separately* in `omdb_details`, after the pick is settled — so the OMDb `details` call
+    never sits in a node that a Phase-6b `interrupt()` would re-run on resume.
+    """
     if state.get("status") == "failed":
-        return {}  # read_page already resolved this (blank Entry)
+        return {}  # read_page already resolved this (blank Entry) → omdb_details will no-op
 
     entry = state.get("entry")
     assert entry is not None and entry.title is not None  # guaranteed by read_page
@@ -98,16 +133,98 @@ async def omdb(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
 
     if not candidates:
         return {"candidates": candidates, "status": "failed", "note": "omdb: not found"}
-    if len(candidates) > 1:
-        # TODO(phase 6a): surface the full candidate list → LLM pre-filter → Slack HITL picker.
-        return {
-            "candidates": candidates,
-            "status": "pending",
-            "note": f"multi-candidate ({len(candidates)}); deferred to phase 6a",
-        }
+    if len(candidates) == 1:
+        return {"candidates": candidates, "chosen_imdb_id": candidates[0].imdb_id}
+    return {"candidates": candidates}  # >1 → route_after_search sends this to disambiguate
 
-    details = await omdb.details(candidates[0].imdb_id)
-    return {"candidates": candidates, "status": "done", **details_fields(details)}
+
+def route_after_search(state: EnrichmentState) -> str:
+    """Conditional route out of `omdb_search` (ADR 0008 role 2 — the first conditional edge).
+
+    >1 candidates → the LLM `disambiguate` pre-filter. The 0-candidate (not-found / blank) and
+    1-candidate cases both go straight to `omdb_details`, which fetches details for
+    `chosen_imdb_id` or no-ops when there is none — so the OMDb lane always terminates at
+    `omdb_details`, keeping the fan-in a clean two-edge barrier.
+    """
+    candidates = state.get("candidates") or []
+    return "disambiguate" if len(candidates) > 1 else "omdb_details"
+
+
+class DisambiguationPick(BaseModel):
+    """The disambiguation pre-filter's structured output (ADR 0008 role 2)."""
+
+    index: int | None = Field(
+        None, description="0-based index of the best-matching candidate, or null if none fit"
+    )
+    confident: bool = Field(
+        description="true only if a single candidate is a clear, unambiguous match"
+    )
+    reason: str = Field("", description="brief justification for the pick")
+
+
+async def disambiguate(state: EnrichmentState, *, llm: ChatOpenAI) -> dict:
+    """LLM disambiguation pre-filter (ADR 0008 role 2): pick the best OMDb candidate.
+
+    Fires only on the ambiguous tail (>1 candidates). Returns a structured pick (a list index,
+    validated back to a real candidate) plus a self-assessment (`confident`) that Phase 6b's
+    conditional edge uses to decide whether to auto-take the pick or escalate to a human via
+    `interrupt()`. In 6a the route *always* takes the pick.
+
+    Unlike the best-effort RT / Judge nodes, this is a **correctness** decision — picking the
+    wrong IMDb identity is the one thing this phase exists to prevent — so it fails *safe*: a
+    transport error or an unusable index yields `confident=False` and *no* `chosen_imdb_id`
+    (deferring the pick) rather than guessing. The fallback for uncertainty is a human (6b),
+    not a wrong write. The pick is also stashed as `best_guess_imdb_id` for the 6d timeout.
+    """
+    candidates = state.get("candidates") or []
+    entry = state.get("entry")
+    listing = "\n".join(
+        f"[{i}] {c.title!r} ({c.year}) — {c.media_type} — {c.imdb_id}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = (
+        f"A user added this to their watchlist: {(entry.title if entry else None)!r}"
+        + (f" (type: {entry.media_type})" if entry and entry.media_type else "")
+        + ".\n\nOMDb returned these candidates:\n\n"
+        + listing
+        + "\n\nPick the ONE candidate that best matches what the user meant. Set "
+        "confident=true only if a single candidate is a clear, unambiguous match; if several "
+        "are plausible (e.g. a remake and its original, or the same title across years), set "
+        "confident=false so a human can decide."
+    )
+    try:
+        pick = await llm.with_structured_output(DisambiguationPick).ainvoke(prompt)
+        assert isinstance(pick, DisambiguationPick)  # narrow for the type checker
+    except Exception:  # noqa: BLE001 — fail safe: defer the pick to a human, never guess
+        log.exception("disambiguate: pre-filter failed — deferring the pick")
+        return {"confident": False, "disambiguation_reason": "pre-filter unavailable"}
+
+    idx = pick.index
+    if idx is None or not 0 <= idx < len(candidates):
+        # No usable pick → don't guess an identity; 6b escalates this to a human.
+        return {"confident": False, "disambiguation_reason": pick.reason or "no valid pick"}
+    chosen = candidates[idx].imdb_id
+    return {
+        "chosen_imdb_id": chosen,
+        "best_guess_imdb_id": chosen,
+        "confident": pick.confident,
+        "disambiguation_reason": pick.reason,
+    }
+
+
+async def omdb_details(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
+    """Fetch OMDb details for the resolved candidate → the metadata lane's output + identity.
+
+    The single tail of the OMDb lane: reached for the 1-candidate case, the pre-filter's pick,
+    and (Phase 6b) the human's pick alike. No-ops when there is no `chosen_imdb_id` — the
+    not-found (0) and blank-Entry paths route here too so the lane has one exit into the
+    fan-in, but there is nothing to fetch and the `failed` status stands.
+    """
+    chosen = state.get("chosen_imdb_id")
+    if not chosen:
+        return {}
+    details = await omdb.details(chosen)
+    return {"status": "done", **details_fields(details)}
 
 
 class RTMatch(BaseModel):
@@ -294,18 +411,27 @@ def build_graph(
     firecrawl: FirecrawlClient,
     extraction_llm: ChatOpenAI,
     judge_llm: ChatOpenAI,
-):
+    disambiguation_llm: ChatOpenAI,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
     """Compile the fan-out/fan-in enrichment graph with clients + models bound into the nodes.
 
     The RT lane is a compiled subgraph (`rt.py`) embedded as the single `rt` node, so it nests
     in LangSmith/Studio and grows into Phase 8's provider chain in place. `judge_llm` drives
-    both the post-fan-in `resolve_rt` correlation and the `judge` node (Phase 5).
+    both the post-fan-in `resolve_rt` correlation and the `judge` node (Phase 5);
+    `disambiguation_llm` drives the Phase-6a `disambiguate` pre-filter (ADR 0008 role 2).
+
+    `checkpointer` is an `AsyncSqliteSaver` (ADR 0006 / 0007) when durable execution is wanted
+    (the reconcile Runtime, and single-Entry `--enrich`/`--resume`); pass `None` for pure
+    topology work (e.g. drawing the graph), where no state is persisted.
     """
     rt_subgraph = build_rt_subgraph(firecrawl, extraction_llm)
 
     g = StateGraph(EnrichmentState)
     g.add_node("read_page", functools.partial(read_page, notion=notion))
-    g.add_node("omdb", functools.partial(omdb, omdb=omdb_client))
+    g.add_node("omdb_search", functools.partial(omdb_search, omdb=omdb_client))
+    g.add_node("disambiguate", functools.partial(disambiguate, llm=disambiguation_llm))
+    g.add_node("omdb_details", functools.partial(omdb_details, omdb=omdb_client))
     g.add_node("rt", rt_subgraph)  # compiled subgraph as a node (shared keys: entry, rt_*)
     g.add_node("assemble", assemble)
     g.add_node("resolve_rt", functools.partial(resolve_rt, llm=judge_llm))
@@ -313,13 +439,19 @@ def build_graph(
     g.add_node("update_notion", functools.partial(update_notion, notion=notion))
 
     g.add_edge(START, "read_page")
-    g.add_edge("read_page", "omdb")  # fan-out: OMDb lane
+    g.add_edge("read_page", "omdb_search")  # fan-out: OMDb lane
     g.add_edge("read_page", "rt")  # fan-out: RT lane (parallel)
-    g.add_edge("omdb", "assemble")  # fan-in: barrier waits for both lanes
+    # >1 candidates → the LLM pre-filter; ≤1 → straight to details (ADR 0008 role 2).
+    g.add_conditional_edges(
+        "omdb_search", route_after_search, ["disambiguate", "omdb_details"]
+    )
+    # 6a: always take the pre-filter's pick. 6b makes this conditional (unsure → escalate).
+    g.add_edge("disambiguate", "omdb_details")
+    g.add_edge("omdb_details", "assemble")  # fan-in: barrier waits for both lanes
     g.add_edge("rt", "assemble")
     g.add_edge("assemble", "resolve_rt")  # linear post-fan-in; nodes self-guard on status
     g.add_edge("resolve_rt", "judge")
     g.add_edge("judge", "update_notion")
     g.add_edge("update_notion", END)
 
-    return g.compile()  # no checkpointer yet — that arrives with interrupt() in Phase 6a
+    return g.compile(checkpointer=checkpointer)

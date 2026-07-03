@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # In-process cron period; shorten via env for testing the scheduler.
     RECONCILE_INTERVAL_SECONDS: int = 3600
 
+    # --- durable checkpointer (ADR 0006 / 0007 — Phase 6) ---
+    # `AsyncSqliteSaver` file, keyed by thread_id = page_id. Persists paused HITL runs
+    # across a process restart, so it must live on a persistent path (a named volume in
+    # the Phase 10 Docker deploy). `*.sqlite` is gitignored.
+    CHECKPOINT_DB_PATH: str = "checkpoints.sqlite"
+
     # --- OMDb (metadata lane — Phase 2) ---
     OMDB_API_KEY: str = ""
 
