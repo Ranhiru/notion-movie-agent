@@ -38,6 +38,34 @@ _MAX_CANDIDATES = 5
 _BUTTON_LABEL_MAX = 70
 _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 … pick:4
 
+# IMDb title page for a given imdbID — rendered as a clickable link in the picker.
+_IMDB_URL = "https://www.imdb.com/title/{}/"
+
+
+def _fmt_year(year: str | None) -> str:
+    """OMDb `Year` for display: a plain movie year ("2021") or a series range ("2013–2017").
+
+    An open-ended range ("2013–", ongoing series) reads better as "2013–present".
+    """
+    y = (year or "").strip()
+    if y.endswith(("-", "–", "—")):
+        y = y[:-1].strip() + "–present"
+    return y
+
+
+def _button_label(c: dict) -> str:
+    """Button text: "Title (year/range)", capped to Slack's limit with the year kept intact.
+
+    If the combined text exceeds `_BUTTON_LABEL_MAX`, only the title is truncated — the year
+    suffix always survives, so two same-titled candidates stay distinguishable at a glance.
+    """
+    title = c.get("title") or "?"
+    year = _fmt_year(c.get("year"))
+    suffix = f" ({year})" if year else ""
+    if len(title) + len(suffix) > _BUTTON_LABEL_MAX:
+        title = title[: _BUTTON_LABEL_MAX - len(suffix)]
+    return f"{title}{suffix}"
+
 
 def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     """Render the disambiguation `interrupt()` payload into a Block Kit candidate picker.
@@ -62,10 +90,13 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     for c in candidates:
         label = c.get("title") or "(untitled)"
         bits = f"*{label}*"
-        if c.get("year"):
-            bits += f"  ({c['year']})"
+        year = _fmt_year(c.get("year"))
+        if year:
+            bits += f"  ({year})"
         if c.get("media_type"):
             bits += f" · {c['media_type']}"
+        if c.get("imdb_id"):
+            bits += f" · <{_IMDB_URL.format(c['imdb_id'])}|IMDb ↗>"
         if c.get("imdb_id") == best_guess:
             bits += "   _⭐ best guess_"
         section: dict[str, Any] = {"type": "section", "text": {"type": "mrkdwn", "text": bits}}
@@ -77,10 +108,7 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     buttons = [
         {
             "type": "button",
-            "text": {
-                "type": "plain_text",
-                "text": (c.get("title") or "?")[:_BUTTON_LABEL_MAX],
-            },
+            "text": {"type": "plain_text", "text": _button_label(c)},
             "value": json.dumps({"page_id": page_id, "imdb_id": c["imdb_id"]}),
             "action_id": f"pick:{i}",
         }
@@ -135,7 +163,7 @@ class SlackTransport:
             label = result.title or imdb_id
             if result.year:
                 label += f" ({result.year})"
-            imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
+            imdb_url = _IMDB_URL.format(imdb_id)
             await client.chat_update(
                 channel=channel,
                 ts=ts,
