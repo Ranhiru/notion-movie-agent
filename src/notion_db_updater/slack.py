@@ -90,6 +90,11 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     return blocks
 
 
+def _section_blocks(text: str) -> list[dict]:
+    """A one-section mrkdwn message (used to replace the picker as it resolves)."""
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+
 class SlackTransport:
     """Bolt Socket Mode app wiring the HITL picker + manual-run mention to a `Runtime`."""
 
@@ -110,7 +115,21 @@ class SlackTransport:
             data = json.loads(action["value"])
             page_id, imdb_id = data["page_id"], data["imdb_id"]
             user = body.get("user", {}).get("id")
+            picked = action.get("text", {}).get("text") or imdb_id  # the button label
+            channel, ts = body["channel"]["id"], body["message"]["ts"]
             logger.info("slack: pick %s for page %s by %s", imdb_id, page_id, user)
+
+            # Immediate feedback: drop the buttons and show progress. resume() re-runs the
+            # enrichment tail (resolve_rt → judge → update_notion) — several LLM calls — so the
+            # final update can be seconds away; without this the picker would sit unchanged and
+            # look broken (and invite confused re-clicks).
+            await client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=f"Resolving {picked}…",
+                blocks=_section_blocks(f"⏳ <@{user}> picked *{picked}* — resolving…"),
+            )
+
             # resume() is a no-op on an already-finished thread, so a double-click is safe.
             result = await self._runtime.resume(page_id, imdb_id)
             label = result.title or imdb_id
@@ -118,21 +137,13 @@ class SlackTransport:
                 label += f" ({result.year})"
             imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
             await client.chat_update(
-                channel=body["channel"]["id"],
-                ts=body["message"]["ts"],
+                channel=channel,
+                ts=ts,
                 text=f"Resolved: {label} → {result.status}",  # notification fallback
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
-                                f"_Enrichment status: *{result.status}*_"
-                            ),
-                        },
-                    }
-                ],
+                blocks=_section_blocks(
+                    f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
+                    f"_Enrichment status: *{result.status}*_"
+                ),
             )
 
         @self._app.event("app_mention")
