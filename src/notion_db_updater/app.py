@@ -171,7 +171,7 @@ class Runtime:
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         async with sem:
             try:
-                final = await self._graph.ainvoke(
+                final_state = await self._graph.ainvoke(
                     {"page_id": entry.page_id},
                     # thread_id = page_id keys the checkpoint (ADR 0006/0007), so a Phase-6b
                     # paused run resumes on this same key. run_name names the LangSmith trace;
@@ -182,7 +182,7 @@ class Runtime:
                         "metadata": {"page_id": entry.page_id, "origin": "sweep"},
                     },
                 )
-                return final.get("status", "pending")
+                return final_state.get("status", "pending")
             except Exception:
                 log.exception(
                     "reconcile: transient error on %r (%s) — left pending",

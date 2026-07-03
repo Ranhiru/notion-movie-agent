@@ -152,23 +152,23 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             checkpointer=saver,
         )
         print(f"enriching page_id = {page_id}\n")
-        final = await graph.ainvoke(
+        final_state = await graph.ainvoke(
             {"page_id": page_id}, config={"configurable": {"thread_id": page_id}}
         )
 
-        entry: Entry | None = final.get("entry")
-        enriched: EnrichedEntry | None = final.get("enriched")
+        entry: Entry | None = final_state.get("entry")
+        enriched: EnrichedEntry | None = final_state.get("enriched")
         print("result:")
-        print(f"  Enrichment Status  = {final.get('status')}")
+        print(f"  Enrichment Status  = {final_state.get('status')}")
 
         # Phase 6a — the disambiguation pre-filter's pick (only fires for >1 candidates).
-        candidates = final.get("candidates") or []
+        candidates = final_state.get("candidates") or []
         if len(candidates) > 1:
             print(f"  OMDb candidates    = {len(candidates)}")
-            print(f"  Pre-filter chose   = {final.get('chosen_imdb_id')}")
-            print(f"  Pre-filter confident = {final.get('confident')}")
-            if final.get("disambiguation_reason"):
-                print(f"  Pre-filter reason  = {final['disambiguation_reason']}")
+            print(f"  Pre-filter chose   = {final_state.get('chosen_imdb_id')}")
+            print(f"  Pre-filter confident = {final_state.get('confident')}")
+            if final_state.get("disambiguation_reason"):
+                print(f"  Pre-filter reason  = {final_state['disambiguation_reason']}")
 
         if enriched is not None:
             # A resolved Entry — print the graph's actual output contract (built by `judge`).
@@ -177,22 +177,23 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             print(f"  IMDB id / rating   = {enriched.imdb_id} / {enriched.imdb_rating}")
             print(f"  Genre              = {enriched.genre!r}")
             print(f"  RT critic/audience = {enriched.rt_critic} / {enriched.rt_audience}")
-            print(f"  RT page (title/url)= {final.get('rt_title')!r} / {final.get('rt_url')}")
+            rt_title = final_state.get("rt_title")
+            print(f"  RT page (title/url)= {rt_title!r} / {final_state.get('rt_url')}")
             print(f"  Plot (OMDb)        = {(enriched.plot or '')[:80]!r}")
-            print(f"  Plot (RT)          = {(final.get('rt_plot') or '')[:80]!r}")
+            print(f"  Plot (RT)          = {(final_state.get('rt_plot') or '')[:80]!r}")
             print(f"  Sources used       = {enriched.sources_used}")
             # Judge output — trace-only (never written to Notion; here for verification).
             print(f"  Confidence         = {enriched.confidence}")
-            print(f"  Wrong match        = {final.get('wrong_match')}")
-            if final.get("judge_reason"):
-                print(f"  Judge reason       = {final['judge_reason']}")
+            print(f"  Wrong match        = {final_state.get('wrong_match')}")
+            if final_state.get("judge_reason"):
+                print(f"  Judge reason       = {final_state['judge_reason']}")
         else:
             # Not resolved (blank / not-found / multi-candidate) — no contract to show.
             print(f"  Title              = {entry.title!r}" if entry else "  Title    = ?")
-            if final.get("candidates") is not None:
-                print(f"  OMDb candidates    = {len(final['candidates'])}")
-            if final.get("note"):
-                print(f"  note               = {final['note']}")
+            if final_state.get("candidates") is not None:
+                print(f"  OMDb candidates    = {len(final_state['candidates'])}")
+            if final_state.get("note"):
+                print(f"  note               = {final_state['note']}")
 
         if capture_fixtures and entry and entry.title:
             await _capture_omdb_fixtures(omdb, entry.title)
