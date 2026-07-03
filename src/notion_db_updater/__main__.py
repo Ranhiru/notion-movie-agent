@@ -27,11 +27,13 @@ import json
 import logging
 from pathlib import Path
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 from .app import Runtime
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import extraction_model, judge_model
+from .llm import disambiguation_model, extraction_model, judge_model
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
@@ -116,7 +118,12 @@ async def _generate_graph() -> None:
         FirecrawlClient(settings) as firecrawl,
     ):
         graph = build_graph(
-            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+            notion,
+            omdb,
+            firecrawl,
+            extraction_model(settings),
+            judge_model(settings),
+            disambiguation_model(settings),
         )
         # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
         # rendering `rt` as one opaque node — the point of the nested-lane visualization.
@@ -130,17 +137,38 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         NotionClient(settings) as notion,
         OMDbClient(settings) as omdb,
         FirecrawlClient(settings) as firecrawl,
+        AsyncSqliteSaver.from_conn_string(settings.CHECKPOINT_DB_PATH) as saver,
     ):
+        # Checkpointed like the reconcile Runtime (thread_id = page_id), so a single-Entry run
+        # writes the same checkpoint rows — the substrate Phase 6b's interrupt/resume uses.
+        await saver.setup()
         graph = build_graph(
-            notion, omdb, firecrawl, extraction_model(settings), judge_model(settings)
+            notion,
+            omdb,
+            firecrawl,
+            extraction_model(settings),
+            judge_model(settings),
+            disambiguation_model(settings),
+            checkpointer=saver,
         )
         print(f"enriching page_id = {page_id}\n")
-        final = await graph.ainvoke({"page_id": page_id})
+        final = await graph.ainvoke(
+            {"page_id": page_id}, config={"configurable": {"thread_id": page_id}}
+        )
 
         entry: Entry | None = final.get("entry")
         enriched: EnrichedEntry | None = final.get("enriched")
         print("result:")
         print(f"  Enrichment Status  = {final.get('status')}")
+
+        # Phase 6a — the disambiguation pre-filter's pick (only fires for >1 candidates).
+        candidates = final.get("candidates") or []
+        if len(candidates) > 1:
+            print(f"  OMDb candidates    = {len(candidates)}")
+            print(f"  Pre-filter chose   = {final.get('chosen_imdb_id')}")
+            print(f"  Pre-filter confident = {final.get('confident')}")
+            if final.get("disambiguation_reason"):
+                print(f"  Pre-filter reason  = {final['disambiguation_reason']}")
 
         if enriched is not None:
             # A resolved Entry — print the graph's actual output contract (built by `judge`).
