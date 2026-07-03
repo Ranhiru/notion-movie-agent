@@ -30,6 +30,10 @@ def extraction_model(settings: Settings) -> ChatOpenAI:
         api_key=settings.OPENAI_API_KEY,  # type: ignore[arg-type]  # str coerced to SecretStr
         model=settings.OPENAI_EXTRACTION_MODEL,
         temperature=0,
+        # Bound the response so a reasoning model can't emit unbounded <think> and hang the
+        # sweep. `max_completion_tokens` is the ChatOpenAI field alias for `max_tokens`; 0 in
+        # config → None → omit the cap (server default). ADR 0011.
+        max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,
     )
 
 
@@ -45,6 +49,7 @@ def judge_model(settings: Settings) -> ChatOpenAI:
         api_key=settings.OPENAI_API_KEY,  # type: ignore[arg-type]  # str coerced to SecretStr
         model=settings.OPENAI_JUDGE_MODEL,
         temperature=0,
+        max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,  # see extraction_model
     )
 
 
@@ -60,4 +65,5 @@ def disambiguation_model(settings: Settings) -> ChatOpenAI:
         api_key=settings.OPENAI_API_KEY,  # type: ignore[arg-type]  # str coerced to SecretStr
         model=settings.OPENAI_DISAMBIGUATION_MODEL,
         temperature=0,
+        max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,  # see extraction_model
     )
