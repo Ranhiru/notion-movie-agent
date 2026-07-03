@@ -6,6 +6,9 @@
 __pycache__/
 *.py[cod]
 
+# Per-run log files
+logs/
+
 # Spike scratch artifacts
 *.sqlite
 *.sqlite-shm
