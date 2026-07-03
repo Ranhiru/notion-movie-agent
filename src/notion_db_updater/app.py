@@ -269,12 +269,19 @@ class Runtime:
         )
         return final_state.get("status", "pending")
 
-    async def run_forever(self, interval: float | None = None) -> None:
+    async def run_forever(
+        self, interval: float | None = None, limit: int | None = None
+    ) -> None:
         """In-process cron: run reconcile, sleep, repeat (ADR 0001's hourly safety net).
 
         `interval` defaults to `RECONCILE_INTERVAL_SECONDS` (shorten via env to test the
         scheduler). A failed cycle is logged and the loop continues — one bad pass must not
         kill the long-lived process (ADR 0009: this *is* the always-on process before Docker).
+
+        `limit` caps each sweep to the first N pending entries — a testing aid for `--serve`:
+        with the default 1-hour interval, a bounded startup sweep processes just those N rows
+        (e.g. one ambiguous Entry → one Slack picker) and then idles, keeping the Socket Mode
+        listener alive so the button click can be received.
         """
         period = (
             interval if interval is not None else self._settings.RECONCILE_INTERVAL_SECONDS
@@ -282,7 +289,7 @@ class Runtime:
         log.info("starting reconcile cron (every %gs) — Ctrl-C to stop", period)
         while True:
             try:
-                await self.reconcile()
+                await self.reconcile(limit=limit)
             except Exception:
                 log.exception("reconcile cron cycle failed — continuing")
             await asyncio.sleep(period)

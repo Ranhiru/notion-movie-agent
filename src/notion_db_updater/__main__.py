@@ -235,17 +235,21 @@ async def _resume(page_id: str, chosen_imdb_id: str) -> None:
     print(f"resumed {page_id} with {chosen_imdb_id} → {status}")
 
 
-async def _serve() -> None:
+async def _serve(limit: int | None = None) -> None:
     """Run the reconcile cron + (when Slack is configured) the Socket Mode listener.
 
     Slack is the app's inbound path (ADR 0009 / 0010): it posts the HITL picker when a run
     pauses and handles the `@movie-bot run` manual trigger. The picker notifier is wired to the
     same `Runtime` the cron drives, so a paused sweep prompts in Slack and the button click
     resumes it. When Slack tokens are unset (local dev), falls back to cron-only.
+
+    `limit` caps each sweep to the first N pending entries (testing aid): with the 1-hour
+    interval, `--serve --limit 1` processes one ambiguous Entry → one Slack picker, then idles
+    with the listener open so the click round-trip can be verified in isolation.
     """
     settings = get_settings()
     async with Runtime(settings) as rt:
-        tasks = [rt.run_forever()]
+        tasks = [rt.run_forever(limit=limit)]
         if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
             slack = SlackTransport(settings, rt)
             rt.set_notifier(slack.post_picker)
@@ -305,8 +309,8 @@ def main() -> None:
         "--limit",
         type=int,
         metavar="N",
-        help="(with --reconcile) cap the sweep to the first N entries — a single-entry "
-        "smoke test of the full sweep path",
+        help="(with --reconcile/--serve) cap each sweep to the first N pending entries — a "
+        "single-entry smoke test (with --serve: one picker, then idle)",
     )
     args = parser.parse_args()
 
@@ -315,7 +319,7 @@ def main() -> None:
     elif args.serve:
         _configure_logging()
         try:
-            asyncio.run(_serve())
+            asyncio.run(_serve(args.limit))
         except KeyboardInterrupt:
             print("\nstopped.")
     elif args.reconcile:
