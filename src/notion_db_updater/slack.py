@@ -172,6 +172,8 @@ class SlackTransport:
                     f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
                     f"_Enrichment status: *{result.status}*_"
                 ),
+                unfurl_links=False,  # the IMDb link is for clicking, not a preview card
+                unfurl_media=False,
             )
 
         @self._app.event("app_mention")
@@ -192,6 +194,10 @@ class SlackTransport:
             channel=self._channel,
             text=f"Need a hand disambiguating {title}",  # notification fallback
             blocks=build_picker_blocks(page_id, payload),
+            # The candidate IMDb links are for clicking, not previewing — suppress unfurls so
+            # the picker stays compact (no poster/summary cards stacked under each option).
+            unfurl_links=False,
+            unfurl_media=False,
         )
         log.info("slack: posted disambiguation picker for page %s", page_id)
 
