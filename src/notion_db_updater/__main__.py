@@ -37,6 +37,9 @@ from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
 from .schema import EnrichedEntry
+from .slack import SlackTransport
+
+log = logging.getLogger(__name__)
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 _FIXTURE_PATH = _FIXTURE_DIR / "notion_query.json"
@@ -233,9 +236,24 @@ async def _resume(page_id: str, chosen_imdb_id: str) -> None:
 
 
 async def _serve() -> None:
-    """Run the in-process reconcile cron until interrupted."""
-    async with Runtime() as rt:
-        await rt.run_forever()
+    """Run the reconcile cron + (when Slack is configured) the Socket Mode listener.
+
+    Slack is the app's inbound path (ADR 0009 / 0010): it posts the HITL picker when a run
+    pauses and handles the `@movie-bot run` manual trigger. The picker notifier is wired to the
+    same `Runtime` the cron drives, so a paused sweep prompts in Slack and the button click
+    resumes it. When Slack tokens are unset (local dev), falls back to cron-only.
+    """
+    settings = get_settings()
+    async with Runtime(settings) as rt:
+        tasks = [rt.run_forever()]
+        if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
+            slack = SlackTransport(settings, rt)
+            rt.set_notifier(slack.post_picker)
+            tasks.append(slack.start())
+            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention run)")
+        else:
+            log.info("serve: Slack tokens unset — cron only (no HITL picker)")
+        await asyncio.gather(*tasks)
 
 
 def _configure_logging() -> None:

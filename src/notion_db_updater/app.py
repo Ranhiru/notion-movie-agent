@@ -12,8 +12,11 @@ lock — as an async context manager. It is deliberately the home that Phase 6 e
 `AsyncSqliteSaver` checkpointer, the Slack app, and the out-of-band in-flight set.
 
 Status lifecycle (ADR 0004) is split between the graph and this sweep:
-  - The graph nodes write the **definitive** outcomes — `done` (resolved), `failed` (blank
-    Entry or a real OMDb not-found), and `pending`+note (multi-candidate, deferred to 6a).
+  - The graph nodes write the **definitive** outcomes — `done` (resolved) and `failed` (blank
+    Entry or a real OMDb not-found).
+  - An **ambiguous** multi-candidate the pre-filter isn't sure about pauses the graph at
+    `interrupt()`; this sweep marks it `awaiting_input`, posts the HITL picker (Phase 6c), and
+    moves on — an out-of-band resume finishes it (ADR 0006).
   - A **transient** error (network / 5xx / exhausted 429) raises out of the graph before its
     terminal write, so nothing is written and the Entry keeps its `pending`/unset status for
     the next cron pass. `reconcile()` catches it here and never writes `failed` — `failed` is
@@ -26,6 +29,7 @@ import asyncio
 import contextlib
 import logging
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from langgraph.graph.state import CompiledStateGraph
@@ -111,6 +115,18 @@ class Runtime:
         # connection is closed on exit.
         self._stack = contextlib.AsyncExitStack()
         self._graph: CompiledStateGraph | None = None
+        # Optional interrupt notifier (Phase 6c): set to `SlackTransport.post_picker` so a
+        # paused run posts its candidate picker to Slack. Left None (no notification) for CLI.
+        self._notifier: Callable[[str, dict], Awaitable[None]] | None = None
+
+    def set_notifier(self, notifier: Callable[[str, dict], Awaitable[None]]) -> None:
+        """Register the interrupt notifier (`page_id`, payload) → posts the HITL picker.
+
+        Wired by `_serve` to `SlackTransport.post_picker` (ADR 0010). Kept separate from
+        `__init__` because the Slack transport needs a live `Runtime` to bind its handlers, so
+        the two are wired after the Runtime is entered.
+        """
+        self._notifier = notifier
 
     async def __aenter__(self) -> Runtime:
         # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
@@ -192,7 +208,8 @@ class Runtime:
                         "metadata": {"page_id": entry.page_id, "origin": "sweep"},
                     },
                 )
-                if final_state.get("__interrupt__"):
+                interrupts = final_state.get("__interrupt__")
+                if interrupts:
                     # Paused for human disambiguation (Phase 6b). The run is checkpointed
                     # under thread_id = page_id; mark the Entry awaiting_input so the next
                     # sweep skips it (the filter queries empty/pending only) and an
@@ -200,6 +217,14 @@ class Runtime:
                     await self._notion.update_entry(
                         entry.page_id, enrichment_properties(status=_AWAITING)
                     )
+                    # Post the HITL picker (Phase 6c), if a notifier is wired. Best-effort: a
+                    # Slack failure must not fail the sweep — the row stays awaiting_input and
+                    # the next `@movie-bot run` (or manual --enrich) can re-prompt.
+                    if self._notifier is not None:
+                        try:
+                            await self._notifier(entry.page_id, interrupts[0].value)
+                        except Exception:
+                            log.exception("reconcile: failed to notify for %s", entry.page_id)
                     log.info(
                         "reconcile: %r (%s) awaiting human input", entry.title, entry.page_id
                     )
@@ -223,8 +248,17 @@ class Runtime:
         the paused `await_human` node via `Command(resume=...)` on the same `thread_id =
         page_id`; the graph runs on through `omdb_details` → … → `update_notion`, which writes
         the terminal status. Returns that status (`done` / `failed`).
+
+        A resume on an already-finished thread is a **safe no-op** (ADR 0006): if the
+        checkpoint has nothing pending (`state.next == ()`) — e.g. a Slack double-click, or two
+        people clicking — we return the stored status without re-invoking, so the graph never
+        re-runs `update_notion` or double-writes Notion.
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        state = await self._graph.aget_state({"configurable": {"thread_id": page_id}})
+        if not state.next:
+            log.info("resume: %s already resolved — no-op (double click?)", page_id)
+            return state.values.get("status", "done")
         final_state = await self._graph.ainvoke(
             Command(resume=chosen_imdb_id),
             config={
