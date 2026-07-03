@@ -231,8 +231,11 @@ async def _resume(page_id: str, chosen_imdb_id: str) -> None:
     checkpointer + one compiled graph).
     """
     async with Runtime() as rt:
-        status = await rt.resume(page_id, chosen_imdb_id)
-    print(f"resumed {page_id} with {chosen_imdb_id} → {status}")
+        result = await rt.resume(page_id, chosen_imdb_id)
+    label = result.title or chosen_imdb_id
+    if result.year:
+        label += f" ({result.year})"
+    print(f"resumed {page_id}: {label} [{chosen_imdb_id}] → {result.status}")
 
 
 async def _serve(limit: int | None = None) -> None:

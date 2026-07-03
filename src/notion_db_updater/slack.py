@@ -112,17 +112,24 @@ class SlackTransport:
             user = body.get("user", {}).get("id")
             logger.info("slack: pick %s for page %s by %s", imdb_id, page_id, user)
             # resume() is a no-op on an already-finished thread, so a double-click is safe.
-            status = await self._runtime.resume(page_id, imdb_id)
+            result = await self._runtime.resume(page_id, imdb_id)
+            label = result.title or imdb_id
+            if result.year:
+                label += f" ({result.year})"
+            imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
             await client.chat_update(
                 channel=body["channel"]["id"],
                 ts=body["message"]["ts"],
-                text=f"Resolved → {imdb_id} ({status})",
+                text=f"Resolved: {label} → {result.status}",  # notification fallback
                 blocks=[
                     {
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": f"✅ <@{user}> picked `{imdb_id}` → *{status}*",
+                            "text": (
+                                f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
+                                f"_Enrichment status: *{result.status}*_"
+                            ),
                         },
                     }
                 ],

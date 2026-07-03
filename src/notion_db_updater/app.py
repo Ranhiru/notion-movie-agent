@@ -92,6 +92,31 @@ class ReconcileSummary:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResumeResult:
+    """Outcome of a HITL resume — enough for the Slack handler to show a human-friendly result.
+
+    `status` is the terminal graph status (`done` / `failed`); `title` / `year` / `imdb_id` are
+    the *resolved* identity (from the completed run's `EnrichedEntry`), so the picker message
+    can render "✅ *The Agency* (2024) — IMDb" instead of a bare imdbID.
+    """
+
+    status: str
+    title: str | None = None
+    year: int | None = None
+    imdb_id: str | None = None
+
+    @classmethod
+    def from_state(cls, values: dict) -> ResumeResult:
+        enriched = values.get("enriched")  # EnrichedEntry | None — present once status == done
+        return cls(
+            status=values.get("status", "done"),
+            title=(enriched.title if enriched else None) or values.get("omdb_title"),
+            year=(enriched.year if enriched else None) or values.get("year"),
+            imdb_id=values.get("imdb_id") or values.get("chosen_imdb_id"),
+        )
+
+
 class Runtime:
     """Owns the long-lived clients, graph, and single-flight lock for the reconcile sweep.
 
@@ -238,7 +263,7 @@ class Runtime:
                 )
                 return _TRANSIENT
 
-    async def resume(self, page_id: str, chosen_imdb_id: str) -> str:
+    async def resume(self, page_id: str, chosen_imdb_id: str) -> ResumeResult:
         """Resume a paused HITL run with the human's chosen imdbID (ADR 0006 — out-of-band).
 
         Called from *outside* the sweep — a test harness in Phase 6b, the Slack action handler
@@ -247,18 +272,18 @@ class Runtime:
         `awaiting_input`, so the two paths can never touch the same row). Feeds the pick into
         the paused `await_human` node via `Command(resume=...)` on the same `thread_id =
         page_id`; the graph runs on through `omdb_details` → … → `update_notion`, which writes
-        the terminal status. Returns that status (`done` / `failed`).
+        the terminal status. Returns a `ResumeResult` (status + resolved identity).
 
         A resume on an already-finished thread is a **safe no-op** (ADR 0006): if the
         checkpoint has nothing pending (`state.next == ()`) — e.g. a Slack double-click, or two
-        people clicking — we return the stored status without re-invoking, so the graph never
+        people clicking — we return the stored result without re-invoking, so the graph never
         re-runs `update_notion` or double-writes Notion.
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         state = await self._graph.aget_state({"configurable": {"thread_id": page_id}})
         if not state.next:
             log.info("resume: %s already resolved — no-op (double click?)", page_id)
-            return state.values.get("status", "done")
+            return ResumeResult.from_state(state.values)
         final_state = await self._graph.ainvoke(
             Command(resume=chosen_imdb_id),
             config={
@@ -267,7 +292,7 @@ class Runtime:
                 "metadata": {"page_id": page_id, "origin": "resume"},
             },
         )
-        return final_state.get("status", "pending")
+        return ResumeResult.from_state(final_state)
 
     async def run_forever(
         self, interval: float | None = None, limit: int | None = None
