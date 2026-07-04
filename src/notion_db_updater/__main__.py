@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from .app import Runtime
@@ -37,9 +38,15 @@ from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
 from .schema import EnrichedEntry
+from .slack import SlackTransport
+
+log = logging.getLogger(__name__)
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 _FIXTURE_PATH = _FIXTURE_DIR / "notion_query.json"
+
+# Per-run log files land here (one per invocation, named "<mode>-<timestamp>.log").
+_LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 
 # A query OMDb will never resolve — used to capture the 0-result fixture / branch.
 _NONSENSE_TITLE = "zzqxwv no such title 1234567890"
@@ -228,21 +235,59 @@ async def _resume(page_id: str, chosen_imdb_id: str) -> None:
     checkpointer + one compiled graph).
     """
     async with Runtime() as rt:
-        status = await rt.resume(page_id, chosen_imdb_id)
-    print(f"resumed {page_id} with {chosen_imdb_id} → {status}")
+        result = await rt.resume(page_id, chosen_imdb_id)
+    label = result.title or chosen_imdb_id
+    if result.year:
+        label += f" ({result.year})"
+    print(f"resumed {page_id}: {label} [{chosen_imdb_id}] → {result.status}")
 
 
-async def _serve() -> None:
-    """Run the in-process reconcile cron until interrupted."""
-    async with Runtime() as rt:
-        await rt.run_forever()
+async def _serve(limit: int | None = None) -> None:
+    """Run the reconcile cron + (when Slack is configured) the Socket Mode listener.
+
+    Slack is the app's inbound path (ADR 0009 / 0010): it posts the HITL picker when a run
+    pauses and handles the `@movie-bot run` manual trigger. The picker notifier is wired to the
+    same `Runtime` the cron drives, so a paused sweep prompts in Slack and the button click
+    resumes it. When Slack tokens are unset (local dev), falls back to cron-only.
+
+    `limit` caps each sweep to the first N pending entries (testing aid): with the 1-hour
+    interval, `--serve --limit 1` processes one ambiguous Entry → one Slack picker, then idles
+    with the listener open so the click round-trip can be verified in isolation.
+    """
+    settings = get_settings()
+    async with Runtime(settings) as rt:
+        tasks = [rt.run_forever(limit=limit)]
+        if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
+            slack = SlackTransport(settings, rt)
+            rt.set_notifier(slack.post_picker)
+            tasks.append(slack.start())
+            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention run)")
+        else:
+            log.info("serve: Slack tokens unset — cron only (no HITL picker)")
+        await asyncio.gather(*tasks)
 
 
-def _configure_logging() -> None:
-    """Surface the reconcile/cron INFO logs on the console (sweep + serve modes)."""
+def _configure_logging(mode: str) -> None:
+    """Tee the INFO logs to the console *and* a fresh per-run file under ``logs/``.
+
+    Each invocation gets its own file, ``logs/<mode>-<timestamp>.log`` (e.g.
+    ``logs/reconcile-20260703-153012.log``), so a run's logs are isolated and easy to find by
+    what it did. The module loggers (``logging.getLogger(__name__)`` in app/graph/rt/slack)
+    all flow into both handlers — no call-site changes needed. Files are never pruned (add
+    ``logs/`` to .gitignore); prune manually if they pile up.
+    """
+    _LOG_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = _LOG_DIR / f"{mode}-{stamp}.log"
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
     )
+    log.info("logging to %s", log_path)
 
 
 def main() -> None:
@@ -287,27 +332,31 @@ def main() -> None:
         "--limit",
         type=int,
         metavar="N",
-        help="(with --reconcile) cap the sweep to the first N entries — a single-entry "
-        "smoke test of the full sweep path",
+        help="(with --reconcile/--serve) cap each sweep to the first N pending entries — a "
+        "single-entry smoke test (with --serve: one picker, then idle)",
     )
     args = parser.parse_args()
 
     if args.generate_graph:
+        _configure_logging("graph")
         asyncio.run(_generate_graph())
     elif args.serve:
-        _configure_logging()
+        _configure_logging("serve")
         try:
-            asyncio.run(_serve())
+            asyncio.run(_serve(args.limit))
         except KeyboardInterrupt:
             print("\nstopped.")
     elif args.reconcile:
-        _configure_logging()
+        _configure_logging("reconcile")
         asyncio.run(_reconcile(args.limit))
     elif args.resume:
+        _configure_logging("resume")
         asyncio.run(_resume(args.resume[0], args.resume[1]))
     elif args.enrich:
+        _configure_logging("enrich")
         asyncio.run(_enrich(args.enrich, args.capture_fixtures))
     else:
+        _configure_logging("read")
         asyncio.run(_read(args.capture_fixture))
 
 

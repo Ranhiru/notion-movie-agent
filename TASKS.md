@@ -485,17 +485,78 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
         shell env: `--enrich <ambiguous page_id>` → prints the pause + candidates, then
         `--resume <page_id> <imdbID>` finishes it; `sqlite3 checkpoints.sqlite '.tables'` shows
         the persisted thread.
-- [ ] **6c — Slack Bolt Socket Mode transport:**
-  - [ ] Block Kit picker (≤5 candidates: title + plot + poster; ≤5 buttons; `value` encodes
+- [x] **6c — Slack Bolt Socket Mode transport:**
+  - [x] Block Kit picker (≤5 candidates: title + plot + poster; ≤5 buttons; `value` encodes
         `page_id` + `imdbID`) posted to `#notion-movie-db`.
-  - [ ] Action handler → `graph.invoke(Command(resume=imdbID), thread_id=page_id)` (resume does
+        → New `slack.py`: `build_picker_blocks(page_id, payload)` renders the `interrupt()`
+        payload — one `section` per candidate (title · year · type, poster as an image accessory
+        when present, best-guess flagged), then one `actions` block of buttons whose `value` is
+        `json({page_id, imdb_id})` and `action_id` is `pick:<i>`. **Plot omitted:** OMDb `?s=`
+        search carries no plot, so rendering it would cost N extra `?i=` detail calls just to
+        draw the prompt; title/year/type/poster disambiguates fine. Needed a new **`aiohttp`**
+        dep (slack-bolt's async transport).
+  - [x] Action handler → `graph.invoke(Command(resume=imdbID), thread_id=page_id)` (resume does
         NOT take the single-flight lock — coordination is by status, ADR 0006).
-  - [ ] Wire `@movie-bot run` → `reconcile()` (single-flight).
-  - [ ] **Verify:** a real Slack click resolves a real `awaiting_input` row; double-click is a
+        → `SlackTransport` (`AsyncApp` + `AsyncSocketModeHandler`): the `pick:*` action handler
+        decodes the button `value` and calls `Runtime.resume(page_id, imdb_id)`, then
+        `chat_update`s the message to show who resolved it. Double-click is a safe no-op —
+        `Runtime.resume` checks `aget_state().next` and returns the stored status without
+        re-invoking when the thread is already finished.
+  - [x] Wire `@movie-bot run` → `reconcile()` (single-flight).
+        → `app_mention` handler: `run` → `Runtime.reconcile()` (same single-flight lock), replies
+        with the summary. The sweep posts pickers via `Runtime.set_notifier(post_picker)`, wired
+        in `_serve`, which now runs the cron loop + Socket Mode listener concurrently (Slack
+        started only when both tokens are set; else cron-only).
+  - [x] **Verify:** a real Slack click resolves a real `awaiting_input` row; double-click is a
         safe no-op (finished-thread resume).
+        → **Offline-proven** (`ruff` + `basedpyright` clean): `build_picker_blocks` shape +
+        button values decode to `{page_id, imdb_id}` + 5-candidate cap; `SlackTransport`
+        constructs with fake tokens, registers both listeners, and `post_picker` posts the
+        picker blocks to the channel (client mocked); the double-click guard (`state.next == ()`
+        after resolve → no-op) on the real stubbed graph. **Live** (a real Slack click on a real
+        `awaiting_input` row + a real double-click) is owner-run — needs `SLACK_BOT_TOKEN` /
+        `SLACK_APP_TOKEN` and the app configured for Socket Mode + Interactivity: `--serve` with
+        tokens set → an ambiguous row posts a picker in `#notion-movie-db`; clicking a button
+        resolves the row to `done`; `@movie-bot run` triggers a sweep.
 - [ ] **6d — 7-day stale-interrupt auto-resolve:** cron finds `awaiting_input` older than 7
       days → resume with the stored pre-filter best-guess + `confidence: low`.
   - [ ] **Verify:** with a shortened timeout, an unclicked row auto-resolves to `done`/low.
+- [ ] **6e — "None of the above" in the HITL picker (reject all candidates):** today the human
+      must pick one of the ≤5 shown OMDb candidates; if the right title isn't among them (or none
+      is correct) there is no in-Slack escape — it has to be fixed out-of-band by imdbID
+      (`--resume PAGE_ID IMDB_ID`, as done manually for *Michael* → `tt11378946`, which OMDb `?s=`
+      search never surfaced in the top 5). Add a first-class reject path.
+  - [ ] Add a "🚫 None of the above" button to `build_picker_blocks` with a distinct `action_id`
+        (e.g. `pick:none`) so it can't collide with the `pick:<i>` candidate buttons.
+  - [ ] **New graph branch out of `await_human`:** the resume value is currently always an
+        imdbID fed straight to `omdb_details`. Introduce a sentinel (e.g. `resume="__none__"`)
+        and route it *away* from `omdb_details` to a manual-resolution path — accept a
+        human-supplied IMDb link / corrected title rather than writing a wrong identity.
+  - [ ] Slack handler: on "None of the above", prompt for the correct IMDb link (follow-up
+        message or modal), extract the imdbID, and resume via the same `Command(resume=<imdbID>)`
+        path — the mechanism `--resume` already proves works for a non-candidate id.
+  - [ ] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → "None of the
+        above" → paste a link → resolves to `done` with the human's identity (repro: *Michael*).
+- [ ] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
+      `omdb_search` returns 0 candidates, the row is written terminal `failed` and dropped from
+      the sweep — but most such failures are *title-matching* misses, not "doesn't exist".
+      Normalize the title before search, and on a still-empty result escalate to the 6e human
+      path instead of `failed` (reserve `failed` for genuine not-founds). Observed from the
+      backfill (all resolved by hand to real imdbIDs):
+  - Season/qualifier suffixes OMDb can't search: `Beef Season 2` → *Beef* (`tt14403178`),
+    `Fallout (Season 2)` → *Fallout* (`tt12637874`), `The Bear (S04)` → *The Bear*
+    (`tt14452776`), `The Punisher - One Last Kill` → *The Punisher: One Last Kill* (`tt36042156`)
+  - Misspellings: `The Oddessey` → *The Odyssey* (`tt33764258`)
+  - Punctuation / spelling variants: `Your Friends and Neighbours` → *Your Friends & Neighbors*
+    (`tt30459041`), `The Man from U.N.C.L.E` → *The Man from U.N.C.L.E.* (`tt1638355`)
+  - Regional / alternate titles: `Department Q` → *Dept. Q* (`tt27995114`), `Ne Zha II` →
+    *Ne Zha 2* (`tt34956443`)
+  - [ ] Normalize before search: strip trailing `Season N` / `(SNN)` / `(Season N)` qualifiers
+        (series enrich at the series level anyway); normalize `and`↔`&` and stray punctuation.
+  - [ ] On a still-empty search, route to the 6e human path (post a picker/prompt asking for the
+        correct IMDb link) instead of writing `failed`.
+  - [ ] **Verify:** each example above ends `done` (via normalization or a human paste); a
+        genuinely nonexistent title still ends `failed`.
 
 ---
 

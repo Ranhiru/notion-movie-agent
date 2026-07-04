@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     OPENAI_EXTRACTION_MODEL: str = ""
     OPENAI_DISAMBIGUATION_MODEL: str = ""
     OPENAI_JUDGE_MODEL: str = ""
+    # Per-request output cap for every role model. Reasoning models (e.g. gemma-4-12B) can
+    # otherwise emit unbounded <think> tokens on a large extraction prompt and never return —
+    # a hung sweep. 0 = unset (let the server decide); a positive value bounds each response.
+    OPENAI_MAX_TOKENS: int = 0
 
     # --- Slack HITL transport (Socket Mode — ADR 0010; used from Phase 6) ---
     SLACK_BOT_TOKEN: str = ""
