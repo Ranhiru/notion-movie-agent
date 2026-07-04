@@ -1,31 +1,34 @@
-"""The enrichment `StateGraph` — Phase 6a: parallel lanes + OMDb disambiguation pre-filter.
+"""The enrichment `StateGraph` — Phase 6b: parallel lanes + HITL disambiguation (interrupt).
 
 Built as a LangGraph `StateGraph` (not loose functions) from the start so later phases bolt
 on without a port. The lane splits after `read_page` and rejoins at `assemble`:
 
-                ┌── omdb_search ─(route)─┬─≤1─→ omdb_details ──┐
-    read_page ──┤                        └─>1─→ disambiguate ──┘
-                │                                    (→ omdb_details)
-                └── rt ───────────────────────────────────────────┐
-                                                                    │
-       omdb_details ─┐                                              │
-                     ├─→ assemble → resolve_rt → judge → update_notion → END
-                rt ──┘
+                ┌─ omdb_search ─(≤1)───────────────────────────────┐
+                │       │ (>1)                                      │
+    read_page ──┤   disambiguate ─(confident)─────→ omdb_details ───┤
+                │       │ (unsure / fail-safe)           ↑          │
+                │   await_human ──(interrupt() ↔ resume)─┘          │
+                └─ rt ─────────────────────────────────────────────┴─→ assemble
+                                                    → resolve_rt → judge → update_notion → END
 
 - **Fan-out** = two edges out of `read_page`; **fan-in** = two edges into `assemble`, which
   LangGraph holds until *both* lanes complete (a barrier — proven in spike 02). The OMDb lane
-  is now variable-length but always terminates at `omdb_details`, so the fan-in stays a clean
-  two-edge join (no conditional edge lands on `assemble`).
+  is now variable-length (and can *pause*) but always terminates at `omdb_details`, so the
+  fan-in stays a clean two-edge join (no conditional edge lands on `assemble`).
 - The two lanes write **disjoint** state channels (omdb → status + imdb/plot/genre + identity;
   rt → rt_* scores/identity/candidates), so the concurrent fan-out needs no reducer.
-- **Phase 6a — OMDb disambiguation (ADR 0008 role 2):** `omdb_search` surfaces the full OMDb
-  candidate list; `add_conditional_edges` (`route_after_search`) routes >1 candidates to the
-  LLM `disambiguate` pre-filter, and ≤1 straight to `omdb_details`. `disambiguate` picks the
-  best candidate and self-assesses `confident`; in 6a the route *always* takes the pick
-  (`disambiguate → omdb_details` is a plain edge — 6b makes it conditional, escalating an
-  unsure pick to a human via `interrupt()`). `omdb_details` fetches details for the resolved
-  `chosen_imdb_id` — kept out of any interrupt-re-run node, since `interrupt()` re-runs its
-  whole node on resume and OMDb `details` is an external call (Phase 6b).
+- **OMDb disambiguation (ADR 0008 role 2):** `omdb_search` surfaces the full OMDb candidate
+  list; `route_after_search` routes >1 candidates to the LLM `disambiguate` pre-filter, ≤1
+  straight to `omdb_details`. `disambiguate` picks the best candidate and self-assesses
+  `confident`.
+- **Phase 6b — HITL escalation (ADR 0006):** `route_after_disambiguate` takes a *confident*
+  pick straight to `omdb_details`; an unsure pick (or a fail-safe) goes to `await_human`, which
+  calls `interrupt()` — snapshotting state to the checkpointer, returning control to the sweep
+  (which moves on to the next Entry), and pausing under `thread_id = page_id` until an
+  out-of-band `Command(resume=<imdbID>)` supplies the human's pick. `omdb_details` fetches
+  details for the resolved `chosen_imdb_id` and is kept *downstream* of the interrupt: an
+  interrupt re-runs its whole node on resume, so the external OMDb call must not sit in
+  `await_human`.
 - `assemble` is the deterministic fan-in barrier (computes `sources_used`). `resolve_rt` and
   `judge` are linear post-fan-in nodes that self-guard on `status`/candidate-count.
   `resolve_rt` correlates a >1 RT candidate set against OMDb's resolved identity; `judge` is
@@ -54,6 +57,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from .firecrawl import FirecrawlClient, RTHit
@@ -209,6 +213,67 @@ async def disambiguate(state: EnrichmentState, *, llm: ChatOpenAI) -> dict:
         "best_guess_imdb_id": chosen,
         "confident": pick.confident,
         "disambiguation_reason": pick.reason,
+    }
+
+
+def route_after_disambiguate(state: EnrichmentState) -> str:
+    """Conditional route out of `disambiguate` (Phase 6b — the HITL escalation fork).
+
+    A **confident** pick goes straight to `omdb_details` (auto-resolved, no human). Anything
+    else — a genuinely ambiguous set or a fail-safe (LLM error / unusable index →
+    `confident=False`) — escalates to `await_human`, which pauses the run via `interrupt()`.
+    Routes on `confident` alone, not on `chosen_imdb_id`: an unsure pick still stashes its best
+    guess in `chosen_imdb_id` / `best_guess_imdb_id` (for the 6d timeout), but we still want a
+    human to confirm it, so its presence must not short-circuit the escalation.
+    """
+    return "omdb_details" if state.get("confident") else "await_human"
+
+
+async def await_human(state: EnrichmentState) -> dict:
+    """Pause for a human to pick the right OMDb candidate (Phase 6b — the HITL interrupt).
+
+    Reached only when `disambiguate` was not confident. `interrupt()` snapshots the graph state
+    to the checkpointer and makes `graph.ainvoke()` *return* (so the reconcile sweep moves on
+    to the next Entry, ADR 0006); the run stays paused under `thread_id = page_id` until it is
+    resumed out-of-band with the human's chosen imdbID (`Command(resume=<imdbID>)`), which is
+    what `interrupt()` then returns.
+
+    Deliberately the *only* node on the escalation branch, and it does no external work:
+    `interrupt()` re-runs its whole node from the top on resume, so the expensive OMDb
+    `details` fetch is kept downstream in `omdb_details` (the same reason the 6a search/details
+    split exists). The payload carries everything the Phase-6c Slack picker needs — the
+    candidate list + the pre-filter's best guess — so resume needs no recomputation.
+    """
+    chosen_imdb_id = interrupt(_picker_payload(state))
+    return {"chosen_imdb_id": chosen_imdb_id}
+
+
+def _picker_payload(state: EnrichmentState) -> dict:
+    """The interrupt payload — the HITL picker's data (surfaced to the Phase-6c Slack prompt).
+
+    Plain JSON-friendly shapes (not the `Candidate` objects) so the transport layer can render
+    it directly. `best_guess_imdb_id` is the pre-filter's stashed pick, used both to pre-select
+    the Slack default and by the 6d stale-interrupt auto-resolve.
+    """
+    entry = state.get("entry")
+    candidates = state.get("candidates") or []
+    return {
+        "reason": "disambiguation",
+        "page_id": state["page_id"],
+        "title": entry.title if entry else None,
+        "media_type": entry.media_type if entry else None,
+        "best_guess_imdb_id": state.get("best_guess_imdb_id"),
+        "candidates": [
+            {
+                "index": i,
+                "imdb_id": c.imdb_id,
+                "title": c.title,
+                "year": c.year,
+                "media_type": c.media_type,
+                "poster": c.poster,
+            }
+            for i, c in enumerate(candidates)
+        ],
     }
 
 
@@ -431,6 +496,7 @@ def build_graph(
     g.add_node("read_page", functools.partial(read_page, notion=notion))
     g.add_node("omdb_search", functools.partial(omdb_search, omdb=omdb_client))
     g.add_node("disambiguate", functools.partial(disambiguate, llm=disambiguation_llm))
+    g.add_node("await_human", await_human)  # Phase 6b: interrupt() — no deps to bind
     g.add_node("omdb_details", functools.partial(omdb_details, omdb=omdb_client))
     g.add_node("rt", rt_subgraph)  # compiled subgraph as a node (shared keys: entry, rt_*)
     g.add_node("assemble", assemble)
@@ -445,8 +511,11 @@ def build_graph(
     g.add_conditional_edges(
         "omdb_search", route_after_search, ["disambiguate", "omdb_details"]
     )
-    # 6a: always take the pre-filter's pick. 6b makes this conditional (unsure → escalate).
-    g.add_edge("disambiguate", "omdb_details")
+    # 6b: confident pick → details; unsure / fail-safe → pause for a human via interrupt().
+    g.add_conditional_edges(
+        "disambiguate", route_after_disambiguate, ["omdb_details", "await_human"]
+    )
+    g.add_edge("await_human", "omdb_details")  # resume lands here with the human's pick
     g.add_edge("omdb_details", "assemble")  # fan-in: barrier waits for both lanes
     g.add_edge("rt", "assemble")
     g.add_edge("assemble", "resolve_rt")  # linear post-fan-in; nodes self-guard on status

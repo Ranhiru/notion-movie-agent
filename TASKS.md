@@ -444,18 +444,47 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
         `uv run python -m notion_db_updater --enrich <page_id>` on a *Dune*-like row → prints the
         pre-filter's chosen imdb_id / confident / reason; `sqlite3 checkpoints.sqlite '.tables'`
         shows the checkpoint rows.
-        - [ ] **Deferred to 6b:** register `Entry`/`Candidate`/`EnrichedEntry` for msgpack serde
-              (LangGraph 1.2.6 warns "unregistered type … blocked in a future version"). Non-
-              breaking on the pin today; deserialization round-trips — but it's the exact state
-              6b must restore across a process restart, so fix it where restart-survival is tested.
-- [ ] **6b — interrupt() + programmatic resume + restart survival:**
-  - [ ] When the pre-filter is unsure → `interrupt()`; set `awaiting_input`; reconcile
+        - [x] **Deferred to 6b:** register `Entry`/`Candidate`/`EnrichedEntry` for msgpack serde
+              (LangGraph 1.2.6 warns "unregistered type … blocked in a future version").
+              → Fixed via **allowlist**, not type conversion: the warning fires for *any* custom
+              type (proven — the already-pydantic `EnrichedEntry` warned identically), so
+              dataclass-vs-pydantic is irrelevant. New `checkpoint.py` centralizes an
+              `open_checkpointer()` that builds the saver with
+              `JsonPlusSerializer(allowed_msgpack_modules=[(mod,name)…])` listing `Entry` /
+              `Candidate` / `RTHit` / `EnrichedEntry` (module+name tuples — bare module strings
+              silently *block*). Wired into all three saver sites (Runtime, `--enrich`,
+              `--resume`). Round-trip through disk proven by the restart test below.
+- [x] **6b — interrupt() + programmatic resume + restart survival:**
+  - [x] When the pre-filter is unsure → `interrupt()`; set `awaiting_input`; reconcile
         "moves on" to the next Entry.
-  - [ ] Resume via `graph.invoke(Command(resume=<imdbID>), thread_id=page_id)` from a test
+        → New `await_human` node calls `interrupt(_picker_payload)` — a *dedicated* node, not
+        `interrupt()` inside `disambiguate` (interrupt re-runs its whole node on resume, so the
+        LLM pick must not re-fire; same isolation rationale as the 6a search/details split).
+        `route_after_disambiguate` routes confident→`omdb_details`, else→`await_human`.
+        `_run_one` detects `__interrupt__` in the returned state, writes `awaiting_input`, and
+        returns the new `_AWAITING` tally bucket; the sweep filter (empty/pending) already skips
+        `awaiting_input`, so it naturally moves on (ADR 0006).
+  - [x] Resume via `graph.invoke(Command(resume=<imdbID>), thread_id=page_id)` from a test
         harness (no Slack yet).
-  - [ ] **Verify:** ambiguous row pauses (`awaiting_input`, `invoke` returns); manual resume
+        → `Runtime.resume(page_id, imdb_id)` (no single-flight lock — sweep-vs-resume is
+        partitioned by status, ADR 0006), exposed as `--resume PAGE_ID IMDB_ID`. `--enrich`
+        prints the picker payload + the resume command when a row pauses.
+  - [x] **Verify:** ambiguous row pauses (`awaiting_input`, `invoke` returns); manual resume
         completes it; **kill + restart the process between interrupt and resume → resume still
         works** (durable execution — the core learning target).
+        → **Offline-proven** (`ruff` + `basedpyright` clean; stubbed-client graph on a real
+        on-disk saver, whole run under warnings-as-errors so any serde warning fails): a >1
+        candidate + `confident=False` pauses at `await_human` (`__interrupt__` set, `next =
+        ('await_human',)`, best-guess stashed); `Command(resume=…)` completes it to `done` with
+        the chosen imdb_id. **Restart survival:** pausing under one saver, closing it, then
+        reopening a *fresh* saver + recompiled graph on the same `.sqlite` file reloads the
+        paused state (`entry`/`candidates` deserialize back as real `Entry`/`Candidate`) and
+        resume still finishes to `done`. Pure-logic: `route_after_disambiguate`, the
+        `awaiting_input` tally + Notion payload. **Live** (real LLM unsure-pick + a real process
+        kill between pause and resume) is owner-run — LLM/OMDb/Notion creds aren't in Claude's
+        shell env: `--enrich <ambiguous page_id>` → prints the pause + candidates, then
+        `--resume <page_id> <imdbID>` finishes it; `sqlite3 checkpoints.sqlite '.tables'` shows
+        the persisted thread.
 - [ ] **6c — Slack Bolt Socket Mode transport:**
   - [ ] Block Kit picker (≤5 candidates: title + plot + poster; ≤5 buttons; `value` encodes
         `page_id` + `imdbID`) posted to `#notion-movie-db`.

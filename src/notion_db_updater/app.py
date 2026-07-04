@@ -28,14 +28,15 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 
+from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
 from .llm import disambiguation_model, extraction_model, judge_model
-from .models import Entry
+from .models import Entry, enrichment_properties
 from .notion import NotionClient
 from .omdb import OMDbClient
 
@@ -44,6 +45,10 @@ log = logging.getLogger(__name__)
 # Returned by _run_one when the graph raised a transient error: the Entry was left in its
 # prior (pending/unset) state — distinct from a graph-written terminal status.
 _TRANSIENT = "error"
+# Returned by _run_one when the graph paused at an interrupt() (Phase 6b): the run is
+# checkpointed under thread_id = page_id and the Entry marked `awaiting_input`, awaiting an
+# out-of-band resume. Distinct from a terminal status — the sweep just moves on (ADR 0006).
+_AWAITING = "awaiting_input"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +59,11 @@ class ReconcileSummary:
     total: int = 0
     done: int = 0
     failed: int = 0
-    # graph-written "pending" — no longer produced in 6a (multi-candidate now auto-resolves
-    # via the disambiguation pre-filter); kept for the tally + Phase 6b's `awaiting_input`.
+    # graph-written "pending" — not produced since 6a (multi-candidate auto-resolves via the
+    # pre-filter, or escalates to `awaiting_input` in 6b); kept for the tally.
     pending: int = 0
+    # Phase 6b: paused at interrupt() → marked awaiting_input, awaiting an out-of-band resume.
+    awaiting_input: int = 0
     error: int = 0  # transient failure → Entry left pending for the next cron pass
 
     @classmethod
@@ -67,6 +74,7 @@ class ReconcileSummary:
             done=c["done"],
             failed=c["failed"],
             pending=c["pending"],
+            awaiting_input=c[_AWAITING],
             error=c[_TRANSIENT],
         )
 
@@ -75,7 +83,8 @@ class ReconcileSummary:
             return "dropped (a reconcile is already in progress)"
         return (
             f"{self.total} entries → {self.done} done, {self.failed} failed, "
-            f"{self.pending} pending, {self.error} transient error(s) left pending"
+            f"{self.pending} pending, {self.awaiting_input} awaiting input, "
+            f"{self.error} transient error(s) left pending"
         )
 
 
@@ -105,12 +114,12 @@ class Runtime:
 
     async def __aenter__(self) -> Runtime:
         # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
-        # across entries. WAL + .setup() lifecycle proven by spike 03. Models are bound once
-        # (ChatOpenAI is stateless per .invoke); the extraction model is shared by the RT lane.
+        # across entries. `open_checkpointer` applies the state-type allowlist + runs setup()
+        # (WAL lifecycle proven by spike 03). Models are bound once (ChatOpenAI is stateless
+        # per .invoke); the extraction model is shared by the RT lane.
         saver = await self._stack.enter_async_context(
-            AsyncSqliteSaver.from_conn_string(self._settings.CHECKPOINT_DB_PATH)
+            open_checkpointer(self._settings.CHECKPOINT_DB_PATH)
         )
-        await saver.setup()
         self._graph = build_graph(
             self._notion,
             self._omdb,
@@ -161,12 +170,13 @@ class Runtime:
         return summary
 
     async def _run_one(self, entry: Entry, sem: asyncio.Semaphore) -> str:
-        """Enrich one Entry through the graph; classify a transient failure as left-pending.
+        """Enrich one Entry through the graph; classify pause/transient outcomes for the tally.
 
-        Returns the graph's terminal status (`done` / `failed` / `pending`), or `_TRANSIENT`
-        if the run raised — in which case nothing was written and the Entry stays pending for
-        the next cron pass (ADR 0004). `failed` is only ever written by the graph, on a
-        definitive not-found.
+        Returns the graph's terminal status (`done` / `failed`), `_AWAITING` if the run paused
+        at an interrupt() for human disambiguation (Phase 6b — the Entry is marked
+        `awaiting_input` and the sweep moves on, ADR 0006), or `_TRANSIENT` if the run raised —
+        in which case nothing was written and the Entry stays pending for the next cron pass
+        (ADR 0004). `failed` is only ever written by the graph, on a definitive not-found.
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         async with sem:
@@ -182,6 +192,18 @@ class Runtime:
                         "metadata": {"page_id": entry.page_id, "origin": "sweep"},
                     },
                 )
+                if final_state.get("__interrupt__"):
+                    # Paused for human disambiguation (Phase 6b). The run is checkpointed
+                    # under thread_id = page_id; mark the Entry awaiting_input so the next
+                    # sweep skips it (the filter queries empty/pending only) and an
+                    # out-of-band resume finishes it. `update_notion` never ran → write here.
+                    await self._notion.update_entry(
+                        entry.page_id, enrichment_properties(status=_AWAITING)
+                    )
+                    log.info(
+                        "reconcile: %r (%s) awaiting human input", entry.title, entry.page_id
+                    )
+                    return _AWAITING
                 return final_state.get("status", "pending")
             except Exception:
                 log.exception(
@@ -190,6 +212,28 @@ class Runtime:
                     entry.page_id,
                 )
                 return _TRANSIENT
+
+    async def resume(self, page_id: str, chosen_imdb_id: str) -> str:
+        """Resume a paused HITL run with the human's chosen imdbID (ADR 0006 — out-of-band).
+
+        Called from *outside* the sweep — a test harness in Phase 6b, the Slack action handler
+        in 6c. Does **not** take the single-flight lock: the lock serializes sweep-vs-sweep,
+        while sweep-vs-resume is partitioned by status (the sweep queries pending; this row is
+        `awaiting_input`, so the two paths can never touch the same row). Feeds the pick into
+        the paused `await_human` node via `Command(resume=...)` on the same `thread_id =
+        page_id`; the graph runs on through `omdb_details` → … → `update_notion`, which writes
+        the terminal status. Returns that status (`done` / `failed`).
+        """
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        final_state = await self._graph.ainvoke(
+            Command(resume=chosen_imdb_id),
+            config={
+                "configurable": {"thread_id": page_id},
+                "run_name": f"resume {page_id}",
+                "metadata": {"page_id": page_id, "origin": "resume"},
+            },
+        )
+        return final_state.get("status", "pending")
 
     async def run_forever(self, interval: float | None = None) -> None:
         """In-process cron: run reconcile, sleep, repeat (ADR 0001's hourly safety net).
