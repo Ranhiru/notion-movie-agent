@@ -521,6 +521,42 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
 - [ ] **6d — 7-day stale-interrupt auto-resolve:** cron finds `awaiting_input` older than 7
       days → resume with the stored pre-filter best-guess + `confidence: low`.
   - [ ] **Verify:** with a shortened timeout, an unclicked row auto-resolves to `done`/low.
+- [ ] **6e — "None of the above" in the HITL picker (reject all candidates):** today the human
+      must pick one of the ≤5 shown OMDb candidates; if the right title isn't among them (or none
+      is correct) there is no in-Slack escape — it has to be fixed out-of-band by imdbID
+      (`--resume PAGE_ID IMDB_ID`, as done manually for *Michael* → `tt11378946`, which OMDb `?s=`
+      search never surfaced in the top 5). Add a first-class reject path.
+  - [ ] Add a "🚫 None of the above" button to `build_picker_blocks` with a distinct `action_id`
+        (e.g. `pick:none`) so it can't collide with the `pick:<i>` candidate buttons.
+  - [ ] **New graph branch out of `await_human`:** the resume value is currently always an
+        imdbID fed straight to `omdb_details`. Introduce a sentinel (e.g. `resume="__none__"`)
+        and route it *away* from `omdb_details` to a manual-resolution path — accept a
+        human-supplied IMDb link / corrected title rather than writing a wrong identity.
+  - [ ] Slack handler: on "None of the above", prompt for the correct IMDb link (follow-up
+        message or modal), extract the imdbID, and resume via the same `Command(resume=<imdbID>)`
+        path — the mechanism `--resume` already proves works for a non-candidate id.
+  - [ ] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → "None of the
+        above" → paste a link → resolves to `done` with the human's identity (repro: *Michael*).
+- [ ] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
+      `omdb_search` returns 0 candidates, the row is written terminal `failed` and dropped from
+      the sweep — but most such failures are *title-matching* misses, not "doesn't exist".
+      Normalize the title before search, and on a still-empty result escalate to the 6e human
+      path instead of `failed` (reserve `failed` for genuine not-founds). Observed from the
+      backfill (all resolved by hand to real imdbIDs):
+  - Season/qualifier suffixes OMDb can't search: `Beef Season 2` → *Beef* (`tt14403178`),
+    `Fallout (Season 2)` → *Fallout* (`tt12637874`), `The Bear (S04)` → *The Bear*
+    (`tt14452776`), `The Punisher - One Last Kill` → *The Punisher: One Last Kill* (`tt36042156`)
+  - Misspellings: `The Oddessey` → *The Odyssey* (`tt33764258`)
+  - Punctuation / spelling variants: `Your Friends and Neighbours` → *Your Friends & Neighbors*
+    (`tt30459041`), `The Man from U.N.C.L.E` → *The Man from U.N.C.L.E.* (`tt1638355`)
+  - Regional / alternate titles: `Department Q` → *Dept. Q* (`tt27995114`), `Ne Zha II` →
+    *Ne Zha 2* (`tt34956443`)
+  - [ ] Normalize before search: strip trailing `Season N` / `(SNN)` / `(Season N)` qualifiers
+        (series enrich at the series level anyway); normalize `and`↔`&` and stray punctuation.
+  - [ ] On a still-empty search, route to the 6e human path (post a picker/prompt asking for the
+        correct IMDb link) instead of writing `failed`.
+  - [ ] **Verify:** each example above ends `done` (via normalization or a human paste); a
+        genuinely nonexistent title still ends `failed`.
 
 ---
 
