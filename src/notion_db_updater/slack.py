@@ -37,6 +37,11 @@ log = logging.getLogger(__name__)
 _MAX_CANDIDATES = 5
 _BUTTON_LABEL_MAX = 70
 _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 … pick:4
+# The manual-input escape hatch (6e): deliberately outside the `pick:\d+` regex so the
+# candidate-button handler can never receive it. `block_id` carries the page_id (see below).
+_MANUAL_ACTION = "manual:submit"
+_MANUAL_BLOCK_PREFIX = "manual_input:"
+_IMDB_ID = re.compile(r"tt\d+")  # matches a full imdb.com/title/tt… URL or a bare tt… id
 
 # IMDb title page for a given imdbID — rendered as a clickable link in the picker.
 _IMDB_URL = "https://www.imdb.com/title/{}/"
@@ -76,6 +81,12 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     run. Note: OMDb `?s=` search results carry no plot, so the per-candidate plot in the
     original mockup is omitted rather than paying N extra `?i=` detail calls just to render the
     prompt; title/year/type/poster is enough to disambiguate a watchlist title.
+
+    Below the buttons is a manual-input escape hatch (6e): a `plain_text_input` for when the
+    right title isn't among the ≤5 OMDb candidates (OMDb `?s=` never surfaced it). Pasting an
+    IMDb link or bare `tt…` id resumes the *same* paused run — no graph change; the resume path
+    already accepts an arbitrary imdbID. The `page_id` rides in the input block's `block_id`
+    (input elements carry no per-action `value`), so the handler stays self-contained.
     """
     title = payload.get("title") or "(unknown title)"
     best_guess = payload.get("best_guess_imdb_id")
@@ -115,12 +126,40 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
         for i, c in enumerate(candidates)
     ]
     blocks.append({"type": "actions", "block_id": "pick_actions", "elements": buttons})
+    blocks.append(
+        {
+            "type": "input",
+            "dispatch_action": True,  # fire an action on Enter instead of a submit button
+            "block_id": f"{_MANUAL_BLOCK_PREFIX}{page_id}",
+            "label": {
+                "type": "plain_text",
+                "text": "None of the above? Paste the IMDb link or ID",
+            },
+            "element": {
+                "type": "plain_text_input",
+                "action_id": _MANUAL_ACTION,
+                "dispatch_action_config": {"trigger_actions_on": ["on_enter_pressed"]},
+                "placeholder": {
+                    "type": "plain_text",
+                    "text": "https://www.imdb.com/title/tt… or tt…",
+                },
+            },
+        }
+    )
     return blocks
 
 
 def _section_blocks(text: str) -> list[dict]:
     """A one-section mrkdwn message (used to replace the picker as it resolves)."""
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+
+def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -> list[dict]:
+    """The terminal ✅ message replacing the picker once a run resolves (button or manual)."""
+    return _section_blocks(
+        f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
+        f"_Enrichment status: *{status}*_"
+    )
 
 
 class SlackTransport:
@@ -168,11 +207,65 @@ class SlackTransport:
                 channel=channel,
                 ts=ts,
                 text=f"Resolved: {label} → {result.status}",  # notification fallback
-                blocks=_section_blocks(
-                    f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
-                    f"_Enrichment status: *{result.status}*_"
-                ),
+                blocks=_resolved_blocks(user, label, imdb_url, result.status),
                 unfurl_links=False,  # the IMDb link is for clicking, not a preview card
+                unfurl_media=False,
+            )
+
+        @self._app.action(_MANUAL_ACTION)
+        async def handle_manual(ack, body, action, client, logger) -> None:  # noqa: ANN001
+            """The manual IMDb-link input was submitted (6e) → resume with the pasted id.
+
+            The escape hatch for when the right title isn't among the ≤5 OMDb candidates. The
+            graph is still paused at the same `interrupt()`, so a pasted id resumes it exactly
+            like a candidate button — the resume path accepts any imdbID.
+            """
+            await ack()
+            channel, ts = body["channel"]["id"], body["message"]["ts"]
+            user = body.get("user", {}).get("id")
+            block_id = action.get("block_id", "")
+            page_id = block_id[len(_MANUAL_BLOCK_PREFIX) :]
+            raw = (action.get("value") or "").strip()
+            match = _IMDB_ID.search(raw)
+
+            if not page_id or not match:
+                # Message inputs have no modal-style inline validation, so nudge via an
+                # ephemeral reply and leave the picker untouched — a `chat_update` here would
+                # wipe the half-typed field and drop the candidate buttons (ADR 0006 / 6e).
+                logger.info(
+                    "slack: manual submit for page %s — no imdb id in %r", page_id, raw
+                )
+                await client.chat_postEphemeral(
+                    channel=channel,
+                    user=user,
+                    text=(
+                        "Couldn't find an IMDb id in that — paste a link like "
+                        "`https://www.imdb.com/title/tt…/` or the bare `tt…` id, "
+                        "then hit Enter."
+                    ),
+                )
+                return
+
+            imdb_id = match.group(0)
+            logger.info("slack: manual resume %s for page %s by %s", imdb_id, page_id, user)
+            # Terminal resolution — safe to replace the picker now (the input was submitted).
+            await client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=f"Resolving {imdb_id}…",
+                blocks=_section_blocks(f"⏳ <@{user}> entered *{imdb_id}* — resolving…"),
+            )
+            result = await self._runtime.resume(page_id, imdb_id)
+            label = result.title or imdb_id
+            if result.year:
+                label += f" ({result.year})"
+            imdb_url = _IMDB_URL.format(imdb_id)
+            await client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=f"Resolved: {label} → {result.status}",  # notification fallback
+                blocks=_resolved_blocks(user, label, imdb_url, result.status),
+                unfurl_links=False,
                 unfurl_media=False,
             )
 
