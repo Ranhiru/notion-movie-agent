@@ -13,6 +13,10 @@ Phase 3 — sweep the whole Watchlist (the single `reconcile()` entrypoint):
     uv run python -m notion_db_updater --reconcile --limit 1   # sweep just the first entry
     uv run python -m notion_db_updater --serve                 # in-process cron loop
 
+Phase 6d — auto-resolve stale HITL interrupts (awaiting_input past the 7-day timeout):
+    uv run python -m notion_db_updater --auto-resolve-stale                  # one pass
+    uv run python -m notion_db_updater --auto-resolve-stale --stale-timeout 0  # test path
+
 Verification (TASKS.md Phase 3): `--reconcile` on the real backfill transitions statuses;
 re-running picks up only pending/stragglers; two concurrent triggers → the second is dropped
 (single-flight); `--serve` with a short interval fires repeatedly. LangSmith shows one trace
@@ -226,6 +230,19 @@ async def _reconcile(limit: int | None) -> None:
     print(f"\nreconcile: {summary}")
 
 
+async def _auto_resolve_stale(max_age: float | None) -> None:
+    """Run one Phase-6d stale-interrupt auto-resolve pass ("resolve now").
+
+    Scans `awaiting_input` rows and auto-resolves any past the timeout with the pre-filter's
+    stored best guess (confidence=low). `max_age` (from `--stale-timeout`) overrides
+    `STALE_INTERRUPT_TIMEOUT_SECONDS` — pass a small value to verify the path without waiting
+    7 days. Reuses the full `Runtime` wiring (clients + checkpointer + one compiled graph).
+    """
+    async with Runtime() as rt:
+        summary = await rt.auto_resolve_stale(max_age=max_age)
+    print(f"\nstale-interrupt: {summary}")
+
+
 async def _resume(page_id: str, chosen_imdb_id: str) -> None:
     """Resume a paused HITL run (Phase 6b) with the human's chosen imdbID — the test harness.
 
@@ -329,6 +346,17 @@ def main() -> None:
         help="run the in-process reconcile cron until interrupted (Phase 3)",
     )
     parser.add_argument(
+        "--auto-resolve-stale",
+        action="store_true",
+        help="run one Phase-6d stale-interrupt auto-resolve pass over awaiting_input rows",
+    )
+    parser.add_argument(
+        "--stale-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="(with --auto-resolve-stale) override the 7-day timeout — small value to test",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         metavar="N",
@@ -349,6 +377,9 @@ def main() -> None:
     elif args.reconcile:
         _configure_logging("reconcile")
         asyncio.run(_reconcile(args.limit))
+    elif args.auto_resolve_stale:
+        _configure_logging("stale")
+        asyncio.run(_auto_resolve_stale(args.stale_timeout))
     elif args.resume:
         _configure_logging("resume")
         asyncio.run(_resume(args.resume[0], args.resume[1]))

@@ -518,9 +518,33 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
         `SLACK_APP_TOKEN` and the app configured for Socket Mode + Interactivity: `--serve` with
         tokens set → an ambiguous row posts a picker in `#notion-movie-db`; clicking a button
         resolves the row to `done`; `@movie-bot run` triggers a sweep.
-- [ ] **6d — 7-day stale-interrupt auto-resolve:** cron finds `awaiting_input` older than 7
+- [x] **6d — 7-day stale-interrupt auto-resolve:** cron finds `awaiting_input` older than 7
       days → resume with the stored pre-filter best-guess + `confidence: low`.
-  - [ ] **Verify:** with a shortened timeout, an unclicked row auto-resolves to `done`/low.
+      → New `Runtime.auto_resolve_stale(max_age=STALE_INTERRUPT_TIMEOUT_SECONDS)`: a *separate*
+      pass (own `NotionClient.query_awaiting_input()` filter — deliberately NOT merged into the
+      reconcile sweep filter, which would re-run paused rows and break status-partitioning).
+      Age comes from the **checkpoint's own `created_at`** (the paused thread's latest checkpoint
+      *is* the `interrupt()` snapshot → exact pause moment, and free since we read the checkpoint
+      anyway for the best guess) — not Notion's `last_edited_time`. Resumes via the existing
+      `Runtime.resume(page_id, best_guess, auto_resolved=True)`; the flag rides in on
+      `Command(resume=, update={"auto_resolved": True})` (a standalone `aupdate_state` on the
+      fan-in-interrupted graph is rejected as an "ambiguous update"), so `judge` short-circuits to
+      `confidence="low"` (trace-only, flagged for review) **without an LLM call**. Wired into the
+      cron loop (`run_forever`) after `reconcile()`, same try/except. New `--auto-resolve-stale`
+      (+ `--stale-timeout SECONDS`) CLI. **Decision:** a fail-safe escalation (LLM error / no
+      valid index) stashed no best guess → left `awaiting_input` + logged (a human can still
+      resume it), never guessed-at or `failed` (ADR 0006 "none is lost").
+  - [x] **Verify:** with a shortened timeout, an unclicked row auto-resolves to `done`/low.
+        → **Offline-proven** (`make check` clean; stubbed clients on a real on-disk saver): a
+        paused row (`confident=False`, best guess stashed) with `max_age=0` resumes to `done`,
+        `chosen_imdb_id == best_guess`, `confidence == "low"`, `auto_resolved` set, and **no LLM
+        judge call fires** (the stub raises if `JudgeVerdict` is requested); with a huge timeout
+        the same rows are left `fresh`; a no-best-guess row is left `awaiting_input` (tally
+        `no_guess`); a re-run is idempotent (resolved rows drop out of the awaiting_input query).
+        **Live** (real process, real 7-day-shortened timeout) is owner-run — creds aren't in
+        Claude's shell env: `--serve` with a small `STALE_INTERRUPT_TIMEOUT_SECONDS`, or
+        `--auto-resolve-stale --stale-timeout 0`; an unclicked `awaiting_input` row auto-resolves
+        to `done` on the next cron cycle, trace shows `origin=auto_resolve` + `confidence=low`.
 - [ ] **6e — manual IMDb input in the HITL picker (reject all candidates):** today the human
       must pick one of the ≤5 shown OMDb candidates; if the right title isn't among them (or none
       is correct) there is no in-Slack escape — it has to be fixed out-of-band by imdbID

@@ -36,6 +36,12 @@ _RECONCILE_FILTER = {
     ]
 }
 
+# Phase 6d: the stale-interrupt pass queries rows paused at HITL disambiguation. Kept
+# *separate* from the reconcile filter on purpose — folding `awaiting_input` into the sweep
+# would make it re-run paused rows and break the status-partitioning that keeps the sweep and
+# an out-of-band resume from touching the same row (ADR 0006).
+_AWAITING_INPUT_FILTER = {"property": PROP_STATUS, "select": {"equals": "awaiting_input"}}
+
 
 class NotionClient:
     """Thin async wrapper over the Notion data_sources/pages REST API.
@@ -96,9 +102,9 @@ class NotionClient:
             return resp
         raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
 
-    async def _query_page(self, cursor: str | None = None) -> dict:
-        """Run one reconcile-filter query page; return the raw Notion response."""
-        body: dict = {"filter": _RECONCILE_FILTER, "page_size": 100}
+    async def _query_page(self, filter_: dict, cursor: str | None = None) -> dict:
+        """Run one query page for the given filter; return the raw Notion response."""
+        body: dict = {"filter": filter_, "page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
         resp = await self._request(
@@ -106,22 +112,34 @@ class NotionClient:
         )
         return resp.json()
 
-    async def query_entries(self) -> list[Entry]:
-        """Return every Entry needing enrichment (Status empty OR pending).
+    async def _query_all(self, filter_: dict) -> list[Entry]:
+        """Page through every row matching `filter_` and parse each into an Entry.
 
-        Pages through the full result set (the backfill is ~100 rows); Notion caps
-        `page_size` at 100 and returns `has_more`/`next_cursor`.
+        Notion caps `page_size` at 100 and returns `has_more`/`next_cursor`; the backfill is
+        ~100 rows, so this may span a couple of pages.
         """
         entries: list[Entry] = []
         cursor: str | None = None
         while True:
-            data = await self._query_page(cursor)
+            data = await self._query_page(filter_, cursor)
             entries.extend(Entry.from_page(p) for p in data.get("results", []))
             # Guard against an infinite loop: stop if Notion claims more pages but
             # omits the cursor to fetch them.
             cursor = data.get("next_cursor")
             if not data.get("has_more") or not cursor:
                 return entries
+
+    async def query_entries(self) -> list[Entry]:
+        """Return every Entry needing enrichment (Status empty OR pending)."""
+        return await self._query_all(_RECONCILE_FILTER)
+
+    async def query_awaiting_input(self) -> list[Entry]:
+        """Return every Entry paused at HITL disambiguation (Status == awaiting_input).
+
+        The Phase 6d stale-interrupt pass (ADR 0006): the cron scans these for rows that have
+        sat unanswered past the timeout and auto-resolves them with the pre-filter's guess.
+        """
+        return await self._query_all(_AWAITING_INPUT_FILTER)
 
     async def get_entry(self, page_id: str) -> Entry:
         """Fetch and parse a single Entry by its Notion page id."""
@@ -147,4 +165,4 @@ class NotionClient:
         Separate from `query_entries()` so the parsed path stays clean; this mirrors the
         single request shape used to capture `tests/fixtures/notion_query.json`.
         """
-        return await self._query_page()
+        return await self._query_page(_RECONCILE_FILTER)
