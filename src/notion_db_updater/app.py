@@ -31,7 +31,9 @@ import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -114,6 +116,24 @@ class ResumeResult:
             title=(enriched.title if enriched else None) or values.get("omdb_title"),
             year=(enriched.year if enriched else None) or values.get("year"),
             imdb_id=values.get("imdb_id") or values.get("chosen_imdb_id"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StaleSummary:
+    """Outcome tally for one stale-interrupt auto-resolve pass (Phase 6d)."""
+
+    total: int = 0  # rows in awaiting_input at the start of the pass
+    resolved: int = 0  # aged past the timeout → auto-resolved with the best guess
+    fresh: int = 0  # still within the timeout → left for the human
+    no_guess: int = 0  # aged out but the pre-filter stashed no best guess → left, logged
+    already_done: int = 0  # checkpoint had nothing pending (Notion status lagged) → skipped
+
+    def __str__(self) -> str:
+        return (
+            f"{self.total} awaiting_input → {self.resolved} auto-resolved, "
+            f"{self.fresh} still fresh, {self.no_guess} no best-guess (left), "
+            f"{self.already_done} already resolved"
         )
 
 
@@ -263,16 +283,25 @@ class Runtime:
                 )
                 return _TRANSIENT
 
-    async def resume(self, page_id: str, chosen_imdb_id: str) -> ResumeResult:
-        """Resume a paused HITL run with the human's chosen imdbID (ADR 0006 — out-of-band).
+    async def resume(
+        self, page_id: str, chosen_imdb_id: str, *, auto_resolved: bool = False
+    ) -> ResumeResult:
+        """Resume a paused HITL run with the chosen imdbID (ADR 0006 — out-of-band).
 
         Called from *outside* the sweep — a test harness in Phase 6b, the Slack action handler
-        in 6c. Does **not** take the single-flight lock: the lock serializes sweep-vs-sweep,
-        while sweep-vs-resume is partitioned by status (the sweep queries pending; this row is
-        `awaiting_input`, so the two paths can never touch the same row). Feeds the pick into
-        the paused `await_human` node via `Command(resume=...)` on the same `thread_id =
-        page_id`; the graph runs on through `omdb_details` → … → `update_notion`, which writes
-        the terminal status. Returns a `ResumeResult` (status + resolved identity).
+        in 6c, the 7-day stale-interrupt pass in 6d. Does **not** take the single-flight lock:
+        the lock serializes sweep-vs-sweep, while sweep-vs-resume is partitioned by status (the
+        sweep queries pending; this row is `awaiting_input`, so the two paths can never touch
+        the same row). Feeds the pick into the paused `await_human` node via
+        `Command(resume=...)` on the same `thread_id = page_id`; the graph runs on through
+        `omdb_details` → … → `update_notion`, which writes the terminal status. Returns a
+        `ResumeResult` (status + resolved identity).
+
+        `auto_resolved=True` marks this as the Phase-6d timeout auto-resolve (`chosen_imdb_id`
+        is the pre-filter's stored best guess, no human confirmed it): we flag the graph state
+        so `judge` grades it `confidence=low` (trace-only, flagged for review) instead of
+        running the LLM. `origin=auto_resolve` in the trace metadata distinguishes it from a
+        human resume.
 
         A resume on an already-finished thread is a **safe no-op** (ADR 0006): if the
         checkpoint has nothing pending (`state.next == ()`) — e.g. a Slack double-click, or two
@@ -280,19 +309,126 @@ class Runtime:
         re-runs `update_notion` or double-writes Notion.
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
-        state = await self._graph.aget_state({"configurable": {"thread_id": page_id}})
+        config: RunnableConfig = {"configurable": {"thread_id": page_id}}
+        state = await self._graph.aget_state(config)
         if not state.next:
             log.info("resume: %s already resolved — no-op (double click?)", page_id)
             return ResumeResult.from_state(state.values)
+        # For the 6d timeout path, flag the state *as part of the resume* (`Command(update=…)`)
+        # so `judge` short-circuits to confidence=low. A standalone `aupdate_state` on a graph
+        # paused at the fan-in interrupt is rejected as an "ambiguous update"; folding it into
+        # the resume Command applies it cleanly without disturbing the interrupt.
+        command = (
+            Command(resume=chosen_imdb_id, update={"auto_resolved": True})
+            if auto_resolved
+            else Command(resume=chosen_imdb_id)
+        )
         final_state = await self._graph.ainvoke(
-            Command(resume=chosen_imdb_id),
+            command,
             config={
-                "configurable": {"thread_id": page_id},
+                **config,
                 "run_name": f"resume {page_id}",
-                "metadata": {"page_id": page_id, "origin": "resume"},
+                "metadata": {
+                    "page_id": page_id,
+                    "origin": "auto_resolve" if auto_resolved else "resume",
+                },
             },
         )
         return ResumeResult.from_state(final_state)
+
+    async def auto_resolve_stale(self, max_age: float | None = None) -> StaleSummary:
+        """Auto-resolve `awaiting_input` rows unanswered past the timeout (Phase 6d).
+
+        Scans every row Notion reports as `awaiting_input`, reads each paused thread's
+        checkpoint (keyed by `thread_id = page_id`), and for any that has sat longer than
+        `max_age` seconds resumes it with the disambiguation pre-filter's stored
+        `best_guess_imdb_id` at a trace-only `confidence=low` — so no Entry is ever stuck, and
+        none is lost. `max_age` defaults to `STALE_INTERRUPT_TIMEOUT_SECONDS` (7 days; shorten
+        via env to test).
+
+        Age is taken from the checkpoint's own `created_at` — the paused thread's latest
+        checkpoint *is* the `interrupt()` snapshot, so its timestamp is exactly the pause
+        moment, independent of any later Notion edit to the row (and free — we must read the
+        checkpoint anyway to recover the best guess).
+
+        A row whose escalation was a *fail-safe* (LLM error / no valid index in `disambiguate`)
+        carries no best guess: there is nothing to auto-pick, so it is left `awaiting_input`
+        and logged (a human can still resume it any time) rather than guessed-at or `failed`.
+
+        Like `resume()`, this takes no single-flight lock: it only ever touches the
+        `awaiting_input` rows, which the reconcile sweep (pending/empty only) never sees.
+        """
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        timeout = (
+            max_age if max_age is not None else self._settings.STALE_INTERRUPT_TIMEOUT_SECONDS
+        )
+        entries = await self._notion.query_awaiting_input()
+        log.info("stale-interrupt: %d awaiting_input row(s) to inspect", len(entries))
+        now = datetime.now(UTC)
+        counts: Counter[str] = Counter()
+        for entry in entries:
+            config: RunnableConfig = {"configurable": {"thread_id": entry.page_id}}
+            state = await self._graph.aget_state(config)
+            if not state.next:
+                # Checkpoint already finished (Notion status lagged) — the next reconcile /
+                # a re-resume is a no-op; nothing to do here.
+                log.info(
+                    "stale-interrupt: %r (%s) already resolved in checkpoint — skipping",
+                    entry.title,
+                    entry.page_id,
+                )
+                counts["already_done"] += 1
+                continue
+            age = self._checkpoint_age(state.created_at, now)
+            if age is not None and age < timeout:
+                counts["fresh"] += 1
+                continue
+            best_guess = state.values.get("best_guess_imdb_id")
+            if not best_guess:
+                log.warning(
+                    "stale-interrupt: %r (%s) aged out but has no best guess — left "
+                    "awaiting_input for a human",
+                    entry.title,
+                    entry.page_id,
+                )
+                counts["no_guess"] += 1
+                continue
+            log.info(
+                "stale-interrupt: auto-resolving %r (%s) with best guess %s (age %.0fs)",
+                entry.title,
+                entry.page_id,
+                best_guess,
+                age if age is not None else -1,
+            )
+            await self.resume(entry.page_id, best_guess, auto_resolved=True)
+            counts["resolved"] += 1
+        summary = StaleSummary(
+            total=len(entries),
+            resolved=counts["resolved"],
+            fresh=counts["fresh"],
+            no_guess=counts["no_guess"],
+            already_done=counts["already_done"],
+        )
+        log.info("stale-interrupt pass complete: %s", summary)
+        return summary
+
+    @staticmethod
+    def _checkpoint_age(created_at: str | None, now: datetime) -> float | None:
+        """Seconds since a checkpoint's ISO `created_at`, or None if it can't be parsed.
+
+        An unparseable/absent timestamp returns None → treated as *aged out* (resolve it)
+        rather than fresh, so a bad checkpoint can't strand a row in awaiting_input forever.
+        """
+        if not created_at:
+            return None
+        try:
+            ts = datetime.fromisoformat(created_at)
+        except ValueError:
+            log.warning("stale-interrupt: unparseable checkpoint created_at %r", created_at)
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return (now - ts).total_seconds()
 
     async def run_forever(
         self, interval: float | None = None, limit: int | None = None
@@ -315,6 +451,9 @@ class Runtime:
         while True:
             try:
                 await self.reconcile(limit=limit)
+                # Phase 6d: same cadence sweeps stale HITL interrupts (7-day timeout). Kept in
+                # the same try so a failing pass is logged and the loop continues (ADR 0009).
+                await self.auto_resolve_stale()
             except Exception:
                 log.exception("reconcile cron cycle failed — continuing")
             await asyncio.sleep(period)

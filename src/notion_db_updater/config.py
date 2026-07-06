@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # across a process restart, so it must live on a persistent path (a named volume in
     # the Phase 10 Docker deploy). `*.sqlite` is gitignored.
     CHECKPOINT_DB_PATH: str = "checkpoints.sqlite"
+    # Phase 6d: how long an `awaiting_input` row may sit unanswered before the cron
+    # auto-resolves it with the pre-filter's stored best-guess (ADR 0006 — 7 days).
+    # Shorten via env to test the auto-resolve path (mirrors RECONCILE_INTERVAL_SECONDS).
+    STALE_INTERRUPT_TIMEOUT_SECONDS: int = 7 * 24 * 3600
 
     # --- OMDb (metadata lane — Phase 2) ---
     OMDB_API_KEY: str = ""

@@ -103,6 +103,10 @@ class EnrichmentState(TypedDict):
     rt_audience: NotRequired[int | None]  # Popcornmeter — written by the RT lane (best-effort)
     status: NotRequired[str]  # done | failed | pending
     note: NotRequired[str]  # why failed / deferred — surfaced in the LangSmith trace
+    # Phase 6d: set by the 7-day stale-interrupt auto-resolve before Command(resume=best_guess)
+    # so `judge` grades an unconfirmed best-guess `confidence=low` (flagged for review) without
+    # an LLM call. Trace-only, like all Judge output — never written to Notion.
+    auto_resolved: NotRequired[bool]
     # Judge output (Phase 5) — all trace-only; NOT written to Notion (§8 unchanged)
     enriched: NotRequired[EnrichedEntry | None]  # the assembled output contract
     sources_used: NotRequired[list[str]]
@@ -399,6 +403,17 @@ async def judge(state: EnrichmentState, *, llm: ChatOpenAI) -> dict:
         return {}
 
     entry = state.get("entry")
+    if state.get("auto_resolved"):
+        # Phase 6d: the 7-day timeout picked the pre-filter's best guess with no human
+        # confirmation → low confidence by construction, flagged for review. Skip the LLM
+        # judge (the guess was never a clear match) and still build the output contract.
+        confidence, wrong_match, reason = (
+            "low",
+            False,
+            "auto-resolved after stale-interrupt timeout",
+        )
+        return _judge_result(state, entry, confidence, wrong_match, reason)
+
     prompt = (
         "You are auditing a movie/TV enrichment for a wrong match. Two independent lanes "
         "resolved this with no shared key, so they may have landed on different titles.\n\n"
@@ -429,6 +444,21 @@ async def judge(state: EnrichmentState, *, llm: ChatOpenAI) -> dict:
         log.exception("judge: verdict failed — degrading to confidence=low")
         confidence, wrong_match, reason = "low", False, "judge unavailable"
 
+    return _judge_result(state, entry, confidence, wrong_match, reason)
+
+
+def _judge_result(
+    state: EnrichmentState,
+    entry: Entry | None,
+    confidence: Confidence,
+    wrong_match: bool,
+    reason: str,
+) -> dict:
+    """Build the `EnrichedEntry` output contract + the trace-only Judge signals.
+
+    Shared by the LLM verdict path and the Phase-6d auto-resolve short-circuit, so both emit
+    the same state shape (only how `confidence`/`wrong_match`/`reason` were derived differs).
+    """
     enriched = EnrichedEntry(
         title=state.get("omdb_title") or (entry.title if entry else None) or "",
         year=state.get("year"),
