@@ -545,7 +545,7 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
         Claude's shell env: `--serve` with a small `STALE_INTERRUPT_TIMEOUT_SECONDS`, or
         `--auto-resolve-stale --stale-timeout 0`; an unclicked `awaiting_input` row auto-resolves
         to `done` on the next cron cycle, trace shows `origin=auto_resolve` + `confidence=low`.
-- [ ] **6e — manual IMDb input in the HITL picker (reject all candidates):** today the human
+- [x] **6e — manual IMDb input in the HITL picker (reject all candidates):** today the human
       must pick one of the ≤5 shown OMDb candidates; if the right title isn't among them (or none
       is correct) there is no in-Slack escape — it has to be fixed out-of-band by imdbID
       (`--resume PAGE_ID IMDB_ID`, as done manually for *Michael* → `tt11378946`, which OMDb `?s=`
@@ -555,20 +555,41 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
       `interrupt()` until a valid imdbID arrives from *either* a candidate button or the input
       field, so restart durability mid-rejection is free and the `await_human → omdb_details`
       edge is untouched. 6e is a Slack-layer-only slice.
-  - [ ] Extend `build_picker_blocks` with an `input` block under the candidate buttons:
+      → All changes in `slack.py`. The graph, `Runtime.resume`, and the `await_human` node are
+      untouched — 6e reuses the existing resume path verbatim (the same one `--resume` proved for
+      the non-candidate *Michael* id).
+  - [x] Extend `build_picker_blocks` with an `input` block under the candidate buttons:
         `plain_text_input`, `dispatch_action: true` (`trigger_actions_on: ["on_enter_pressed"]`),
         `action_id` e.g. `manual:submit` — deliberately outside the `pick:\d+` regex so the
         candidate handler can never receive it. Label: "None of the above? Paste the IMDb link".
-  - [ ] Slack handler on `manual:submit`: extract the imdbID (`tt\d+`) from the pasted text
+        → Input block appended after the `pick_actions` block; `action_id="manual:submit"` (not
+        matched by `_PICK_ACTION`). The `page_id` rides in the block's `block_id`
+        (`manual_input:<page_id>`) since input elements carry no per-action `value` — keeps the
+        handler self-contained without re-parsing the candidate buttons.
+  - [x] Slack handler on `manual:submit`: extract the imdbID (`tt\d+`) from the pasted text
         (full URL or bare id); on garbage, `ack()` + reply with a correction hint (message
         inputs have no modal-style inline validation) and leave the picker up; on a valid id,
         resume via the same `Command(resume=<imdbID>)` path — the mechanism `--resume` already
         proves works for a non-candidate id.
-  - [ ] **Caveat to respect:** `chat_update` on the picker wipes any half-typed input — keep the
+        → New `handle_manual` action handler: `_IMDB_ID = re.compile(r"tt\d+")` extracts the id
+        from a full URL or a bare id; garbage → `chat_postEphemeral` hint (no `chat_update`, so
+        the picker stays clickable); valid → `Runtime.resume(page_id, imdb_id)` then the shared
+        `_resolved_blocks` terminal message (refactored out of `handle_pick`).
+  - [x] **Caveat to respect:** `chat_update` on the picker wipes any half-typed input — keep the
         existing behavior of only updating the message on terminal resolution, never mid-wait.
-  - [ ] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → paste an IMDb
+        → The garbage path uses `chat_postEphemeral`, never `chat_update`; the only `chat_update`s
+        are post-submit (resolving… → resolved), i.e. terminal.
+  - [x] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → paste an IMDb
         link into the picker's input → resolves to `done` with the human's identity (repro:
         *Michael*); pasting garbage → error reply, picker still clickable.
+        → **Offline-proven** (`make check` clean; throwaway script driving the handler with a
+        mocked Slack client): the input block carries `dispatch_action`+`on_enter_pressed` and an
+        `action_id` outside `pick:\d+`; a full imdb.com URL *and* a bare `tt…` id both resume with
+        the extracted id; garbage → `chat_postEphemeral` fires, `resume` is NOT called and the
+        picker is NOT `chat_update`d. **Live** (a real Slack paste on a real `awaiting_input` row,
+        repro *Michael*) is owner-run — Slack tokens aren't in Claude's shell env: `--serve` with
+        tokens set → paste an IMDb link into an ambiguous row's picker → resolves to `done`;
+        pasting garbage → ephemeral hint, buttons still clickable.
 - [ ] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
       `omdb_search` returns 0 candidates, the row is written terminal `failed` and dropped from
       the sweep — but most such failures are *title-matching* misses, not "doesn't exist".
