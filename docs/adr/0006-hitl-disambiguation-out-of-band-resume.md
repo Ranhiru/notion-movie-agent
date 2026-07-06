@@ -10,10 +10,26 @@ whole node from the top on resume, so isolating it keeps the disambiguation LLM 
 `details` fetch, in `omdb_details`) from re-firing on every resume. The checkpointer
 persists the graph state (keyed by `thread_id = page_id`), the Entry is set to a new
 status **`awaiting_input`**, a Slack prompt with the candidates is posted, and the
-reconcile **moves on to the next Entry**. When the human clicks in Slack, Slack POSTs to
-a callback endpoint that resumes the graph:
+reconcile **moves on to the next Entry**. When the human answers in Slack, the action
+handler resumes the graph:
 `graph.invoke(Command(resume=<chosen imdbID>), thread_id=page_id)` — **outside** the
 reconcile sweep.
+
+## When no candidate is correct: inline manual input, not a graph branch
+
+OMDb `?s=` search sometimes never surfaces the right title in its top 5 (observed: *Michael*
+→ `tt11378946`), so the picker cannot assume the answer is on the menu. The escape hatch is
+an **inline `input` block** (`plain_text_input` with `dispatch_action`) in the same picker
+message: the human pastes an IMDb link/id instead of clicking a candidate button. Both paths
+deliver an imdbID to the *same* `Command(resume=…)` — the graph neither knows nor cares
+whether the id came from a button, the input field, or the CLI (`--resume`).
+
+The alternative — a "None of the above" button plus a `__none__` resume sentinel routed to a
+manual-resolution branch in the graph — was **rejected**: it adds a second interrupt and a
+conditional edge purely to model a conversation the Slack layer can hold on its own. With the
+inline input the graph simply *stays paused at the original `interrupt()`* until a valid
+imdbID arrives, so restart durability between "candidates are wrong" and "here's the link"
+comes for free, and the resume contract stays a single type (always an imdbID).
 
 ## How this coexists with the single-flight lock
 
@@ -45,3 +61,6 @@ double-clicks are safe.
   stuck, and none is lost.
 - Adds one status (`awaiting_input`) and one endpoint (Slack callback); everything else
   (graph, checkpointer, limiters, lock) is reused.
+- **The resume value is always an imdbID** — candidate button, manual input field, 7-day
+  auto-resolve, and CLI `--resume` all speak the same contract, so `await_human →
+  omdb_details` stays the only edge out of the interrupt.

@@ -521,22 +521,30 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
 - [ ] **6d — 7-day stale-interrupt auto-resolve:** cron finds `awaiting_input` older than 7
       days → resume with the stored pre-filter best-guess + `confidence: low`.
   - [ ] **Verify:** with a shortened timeout, an unclicked row auto-resolves to `done`/low.
-- [ ] **6e — "None of the above" in the HITL picker (reject all candidates):** today the human
+- [ ] **6e — manual IMDb input in the HITL picker (reject all candidates):** today the human
       must pick one of the ≤5 shown OMDb candidates; if the right title isn't among them (or none
       is correct) there is no in-Slack escape — it has to be fixed out-of-band by imdbID
       (`--resume PAGE_ID IMDB_ID`, as done manually for *Michael* → `tt11378946`, which OMDb `?s=`
-      search never surfaced in the top 5). Add a first-class reject path.
-  - [ ] Add a "🚫 None of the above" button to `build_picker_blocks` with a distinct `action_id`
-        (e.g. `pick:none`) so it can't collide with the `pick:<i>` candidate buttons.
-  - [ ] **New graph branch out of `await_human`:** the resume value is currently always an
-        imdbID fed straight to `omdb_details`. Introduce a sentinel (e.g. `resume="__none__"`)
-        and route it *away* from `omdb_details` to a manual-resolution path — accept a
-        human-supplied IMDb link / corrected title rather than writing a wrong identity.
-  - [ ] Slack handler: on "None of the above", prompt for the correct IMDb link (follow-up
-        message or modal), extract the imdbID, and resume via the same `Command(resume=<imdbID>)`
-        path — the mechanism `--resume` already proves works for a non-candidate id.
-  - [ ] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → "None of the
-        above" → paste a link → resolves to `done` with the human's identity (repro: *Michael*).
+      search never surfaced in the top 5). **Design of record: inline `input` block** (Slack
+      supports `plain_text_input` in messages) — NOT a "None of the above" button + follow-up
+      message/modal, and **no graph change**: the graph stays paused at the original
+      `interrupt()` until a valid imdbID arrives from *either* a candidate button or the input
+      field, so restart durability mid-rejection is free and the `await_human → omdb_details`
+      edge is untouched. 6e is a Slack-layer-only slice.
+  - [ ] Extend `build_picker_blocks` with an `input` block under the candidate buttons:
+        `plain_text_input`, `dispatch_action: true` (`trigger_actions_on: ["on_enter_pressed"]`),
+        `action_id` e.g. `manual:submit` — deliberately outside the `pick:\d+` regex so the
+        candidate handler can never receive it. Label: "None of the above? Paste the IMDb link".
+  - [ ] Slack handler on `manual:submit`: extract the imdbID (`tt\d+`) from the pasted text
+        (full URL or bare id); on garbage, `ack()` + reply with a correction hint (message
+        inputs have no modal-style inline validation) and leave the picker up; on a valid id,
+        resume via the same `Command(resume=<imdbID>)` path — the mechanism `--resume` already
+        proves works for a non-candidate id.
+  - [ ] **Caveat to respect:** `chat_update` on the picker wipes any half-typed input — keep the
+        existing behavior of only updating the message on terminal resolution, never mid-wait.
+  - [ ] **Verify:** an ambiguous row whose correct match is *not* in the top-5 → paste an IMDb
+        link into the picker's input → resolves to `done` with the human's identity (repro:
+        *Michael*); pasting garbage → error reply, picker still clickable.
 - [ ] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
       `omdb_search` returns 0 candidates, the row is written terminal `failed` and dropped from
       the sweep — but most such failures are *title-matching* misses, not "doesn't exist".
@@ -553,8 +561,8 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
     *Ne Zha 2* (`tt34956443`)
   - [ ] Normalize before search: strip trailing `Season N` / `(SNN)` / `(Season N)` qualifiers
         (series enrich at the series level anyway); normalize `and`↔`&` and stray punctuation.
-  - [ ] On a still-empty search, route to the 6e human path (post a picker/prompt asking for the
-        correct IMDb link) instead of writing `failed`.
+  - [ ] On a still-empty search, route to the 6e human path (post the picker with no candidate
+        buttons — just the manual IMDb-link input) instead of writing `failed`.
   - [ ] **Verify:** each example above ends `done` (via normalization or a human paste); a
         genuinely nonexistent title still ends `failed`.
 
@@ -566,8 +574,9 @@ Goal: make the sweep robust. ADR 0001 / 0004 / 0007. (LangSmith already on since
 
 - [ ] Per-node `RetryPolicy` (exp backoff + jitter; retries transient 429/5xx, NOT
       `ValueError`).
-- [ ] Remaining per-API limiters (`aiolimiter`): Firecrawl ~10 RPM, Tavily credit-aware;
-      process-global, shared by sweep + HITL resume. (Notion limiter landed in phase 3.)
+- [ ] Remaining per-API limiters (`aiolimiter`): Firecrawl ~10 RPM, Tavily + Exa
+      credit-aware; process-global, shared by sweep + HITL resume. (Notion limiter landed in
+      phase 3.)
 - [ ] `InMemoryRateLimiter` on judge/extraction models; confirm `max_concurrency` cap.
 - [ ] Checkpoint-per-item so one bad Entry doesn't roll back the batch.
 
@@ -576,17 +585,27 @@ LangSmith shows per-node traces + retries.
 
 ---
 
-## Phase 8 — Search fallbacks (Tavily → Exa → Perplexity)
+## Phase 8 — RT provider rotation (Firecrawl ‖ Tavily ‖ Exa, round-robin start)
 
-Goal: complete the RT ordered chain. ADR 0003.
+Goal: distribute RT search load across the three free API tiers. ADR 0003 **amended**: a
+rotated-start chain supersedes the original fixed Firecrawl-first order, and **Perplexity is
+dropped** (three rotating providers already give redundancy; one less key). Fan-out was
+rejected (burns ~3× quota per Entry — against the free-tier goal), as was single-pick-no-
+fallback (one soft miss would leave RT null until a manual re-run).
 
-- [ ] Add Tavily, Exa, Perplexity provider nodes behind Firecrawl, driven by
-      `SEARCH_PROVIDERS` config; each runs the same LLM extraction.
-- [ ] Chain logic: advance on hard fail OR soft miss; retry transient blips within a provider
-      first; **first score wins** (short-circuit the rest).
+- [ ] Add Tavily + Exa provider nodes as **full peers** of Firecrawl (search + content +
+      the same candidate shaping / LLM extraction — parity is what makes rotation safe),
+      driven by `SEARCH_PROVIDERS`. Update the config default to `firecrawl,tavily,exa` and
+      drop `PERPLEXITY_API_KEY` from `config.py` / `.env.example`.
+- [ ] **Round-robin start rotation:** a process-local counter (unpersisted — approximate
+      fairness across restarts is fine) rotates which provider goes *first* per Entry; the
+      other two remain fallbacks in rotation order.
+- [ ] Chain semantics unchanged from ADR 0003: advance on hard fail OR soft miss; retry
+      transient blips within a provider first; **first score wins** (short-circuit the rest).
 
-**Verification:** force Firecrawl to soft-miss → Tavily runs next; confirm first-score-wins
-short-circuits remaining providers. Fixtures per provider.
+**Verification:** across a 3-Entry sweep, each provider leads exactly once (visible in
+LangSmith traces); force the leading provider to soft-miss → the next in rotation runs;
+confirm first-score-wins short-circuits the rest. Fixtures per provider.
 
 ---
 
@@ -659,4 +678,4 @@ an `awaiting_input` graph **survives the restart** (volume persistence proves AD
 - Local LLM endpoint + the three `OPENAI_*_MODEL` values (each must support tool-calling;
   verified by the phase-0 structured-output spike).
 - `LANGSMITH_API_KEY` (tracing on; APAC endpoint; project `NotionMovieDBAgent`).
-- OMDb / Firecrawl / Tavily / Exa / Perplexity API keys.
+- OMDb / Firecrawl / Tavily / Exa API keys (Perplexity dropped — ADR 0003 amendment).

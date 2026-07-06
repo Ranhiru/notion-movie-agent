@@ -1,9 +1,18 @@
-# RT resolution is an ordered fallback chain, advancing on hard or soft failure
+# RT resolution is a rotated-start provider chain, advancing on hard or soft failure
 
-The Rotten Tomatoes critic score is obtained by an ordered chain —
-`Firecrawl /search (scoped to rottentomatoes.com, with content scrape) → Tavily →
-Exa → Perplexity` — modelled as a subgraph and **active by default**. The first
-provider to return a usable score wins; the rest don't run.
+The Rotten Tomatoes critic score is obtained by a chain of three search providers —
+**Firecrawl `/search` (scoped to rottentomatoes.com, with content scrape), Tavily, Exa** —
+modelled as a subgraph and **active by default**. The chain's *order rotates per Entry*
+(round-robin on a process-local counter): each Entry gets a different provider first, and
+the other two remain fallbacks in rotation order. The first provider to return a usable
+score wins; the rest don't run.
+
+**Why rotation (amended decision):** the original design was a fixed order (Firecrawl first,
+always), which concentrates ~all load on one provider. All three providers are used on
+**free API tiers**, so the primary goal is distributing quota consumption across them; the
+happy path touches exactly one provider per Entry either way, rotation just changes *which*
+one. Perplexity, originally the fourth link, is **dropped** — three rotating providers
+already give redundancy, and it's one less API key.
 
 RT is captured as **two best-effort fields** — `rt_critic` (Tomatometer) and
 `rt_audience` (Popcornmeter) — each a nullable 0–100. Neither is required; we store
@@ -16,8 +25,15 @@ two scores. The chain advances to the next provider on **either**:
 
 Transient errors are retried *within* a provider (via `RetryPolicy`) before falling
 through, so a single 429 doesn't burn a fallback. The chain short-circuits at the first
-provider returning any score; if all four come up empty, both RT fields stay `null`
+provider returning any score; if all three come up empty, both RT fields stay `null`
 (best-effort — this does not, by itself, keep an Entry from being `done`).
+
+Rotation assumes **provider parity**: each provider node must deliver the same contract
+(RT page discovery + content for score extraction + the candidate shaping below). If a
+provider proves consistently weaker, remove or reorder it via `SEARCH_PROVIDERS` config —
+rotation walks whatever list that yields. The round-robin counter is in-process and
+unpersisted; distribution being approximate across restarts is fine (the goal is spreading
+load, not exact fairness).
 
 Alongside the two scores, the winning provider also surfaces the **matched page's
 reference** — the canonical RT URL / title (and year, when shown) — into **graph state**.
@@ -37,23 +53,32 @@ below): the base design picks **one** page deterministically; an extension surfa
   and cost, but no resilience when Firecrawl misses an RT score.
 - **Advance only on hard failure (rejected):** a soft miss would stop the chain with an
   empty RT and the fallbacks would never run — defeating the point of building them.
-- **Full chain, advance on hard-or-soft (chosen).**
+- **Fixed-order chain, Firecrawl always first (superseded):** the original decision.
+  Resilient, but funnels ~all quota to Firecrawl's free tier while Tavily/Exa idle.
+- **Fan-out all providers per Entry, first score wins (rejected):** fastest and most
+  resilient, but burns ~3× quota on every Entry — directly against the free-tier goal.
+- **Single provider per Entry, no fallback (rejected):** lowest quota use, but one soft
+  miss leaves the Entry's RT null until a manual re-run — gives up the chain's resilience.
+- **Rotated-start chain, advance on hard-or-soft (chosen).**
 
-### Per-provider page selection (Phase 5+, open)
+### Per-provider page selection
 
-- **Deterministic single pick (current / base):** `pick_rt_hit` chooses the canonical
+- **Deterministic single pick (base):** `rank_rt_hits()[0]` chooses the canonical
   `/m/` or `/tv/` page, biased by `media_type`. Cheap, no LLM; right for the common case
   where one RT page obviously matches. A "soft miss" = that page yielded no score.
-- **Candidate set + Judge correlation (extension, see
-  [0008](./0008-llm-node-architecture.md)):** the provider surfaces the top-N RT title
-  pages as candidates `{rt_url, rt_title, rt_year, rt_critic, rt_audience}`; the Judge
-  picks the one matching OMDb's resolved title/year. The inline-scraped markdown for the
-  extra hits is already paid for; metadata-first correlation keeps score extraction to one
-  call. Recommended only as **escalation when >1 canonical RT page is in contention**
-  (mirrors OMDb's 0/1/many). Here a "soft miss" generalizes to "no candidate the Judge
-  accepts." Recorded as an option, not yet committed.
+- **Candidate set + Judge correlation (adopted in Phase 5c as hybrid escalation, see
+  [0008](./0008-llm-node-architecture.md)):** when **>1 canonical RT page is in
+  contention**, the provider surfaces the ranked candidates
+  `{rt_url, rt_title, rt_year, rt_markdown}` and defers extraction; the post-fan-in
+  `resolve_rt` node correlates them against OMDb's resolved title/year/plot and extracts
+  scores once from the winner. The inline-scraped markdown for the extra hits is already
+  paid for; metadata-first correlation keeps score extraction to one call. Here a "soft
+  miss" generalizes to "no candidate the correlation accepts."
 
 ## Consequences
 
-- v1 requires four search-related keys (Firecrawl, Tavily, Exa, Perplexity) plus OMDb
-  and the merge LLM — more quota/cost than the minimal path, accepted for resilience.
+- v1 requires three search-provider keys (Firecrawl, Tavily, Exa) plus OMDb and the LLM
+  roles — each individually stays within its free tier because rotation splits the
+  ~hourly sweep's load three ways.
+- Every provider node must be a full peer (search + content + candidate shaping), not a
+  thin "try this URL" fallback — parity is what makes rotation safe.

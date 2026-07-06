@@ -21,14 +21,27 @@ to Slack that carries *all* inbound interaction, so the build needs no public HT
 
 Per the picker mockup: up to **5 candidates**, each a `section` with the **title** (bold),
 **plot summary**, and the **poster image** as an `accessory` (OMDb `Poster` URL when not
-`N/A`), followed by one `actions` block with up to **5 buttons** (one per candidate).
+`N/A`), followed by one `actions` block with up to **5 buttons** (one per candidate), followed
+by an **inline manual-input escape hatch** (see [0006](./0006-hitl-disambiguation-out-of-band-resume.md)):
+an `input` block with a `plain_text_input` (`dispatch_action: true`, submit on Enter,
+`action_id` outside the `pick:\d+` namespace) labeled "None of the above? Paste the IMDb
+link" — for when the right title isn't among the candidates. **Caveat:** `chat_update` on a
+message wipes any half-typed input value, so the picker is only ever updated on terminal
+resolution, never mid-wait.
 
-## Mapping a click back to the right Entry
+## Mapping an answer back to the right Entry
 
 Each button's `value` encodes **`page_id` + chosen `imdbID`** (the `page_id` is the graph's
 `thread_id`). On click, Bolt's action handler calls
 `graph.invoke(Command(resume=<imdbID>), thread_id=<page_id>)`, resuming the correct
 interrupted run. Because resume on a finished thread is a no-op, double-clicks are safe.
+
+The manual input's `dispatch_action` event lands in a separate handler that extracts the
+imdbID (`tt\d+`) from the pasted text (full URL or bare id) and resumes through the **same**
+`Command(resume=<imdbID>)` path — on unparseable text it replies with a correction hint and
+leaves the picker up (message inputs have no modal-style inline validation). The `page_id`
+rides in the input block's `block_id`, since an `input` element has no `value` field of its
+own.
 
 ## Consequences
 
