@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     RECONCILE_CONCURRENCY: int = 1
     # In-process cron period; shorten via env for testing the scheduler.
     RECONCILE_INTERVAL_SECONDS: int = 3600
+    # Per-`ainvoke` cap on how many graph nodes run in parallel (ADR 0013, Phase 7). Bounds the
+    # fan-out lanes' concurrency *within* one Entry, on top of the sweep semaphore (across
+    # Entries). 0 = unset (let LangGraph decide); set >0 to cap intra-graph parallelism.
+    GRAPH_MAX_CONCURRENCY: int = 0
+
+    # --- transient-error resilience (ADR 0013 — Phase 7) ---
+    # Attempts (incl. the first) for the gating-node RetryPolicy and the Firecrawl client's
+    # internal retry loop. Backoff/jitter use LangGraph's RetryPolicy defaults.
+    RETRY_MAX_ATTEMPTS: int = 3
 
     # --- durable checkpointer (ADR 0006 / 0007 — Phase 6) ---
     # `AsyncSqliteSaver` file, keyed by thread_id = page_id. Persists paused HITL runs
@@ -69,6 +78,9 @@ class Settings(BaseSettings):
 
     # --- RT resolution providers (chain — Firecrawl primary in Phase 4, rest Phase 8) ---
     FIRECRAWL_API_KEY: str = ""
+    # Firecrawl `/search` rate cap, requests/minute (ADR 0013 — Phase 7). The client throttles
+    # to this via a process-global aiolimiter and retries transient failures internally.
+    FIRECRAWL_RPM: float = 10.0
     TAVILY_API_KEY: str = ""
     EXA_API_KEY: str = ""
     PERPLEXITY_API_KEY: str = ""
@@ -84,6 +96,13 @@ class Settings(BaseSettings):
     # otherwise emit unbounded <think> tokens on a large extraction prompt and never return —
     # a hung sweep. 0 = unset (let the server decide); a positive value bounds each response.
     OPENAI_MAX_TOKENS: int = 0
+    # Aggregate LLM call-rate cap across all three role models (they share one endpoint), via a
+    # single `InMemoryRateLimiter` (ADR 0013 — Phase 7). requests/sec; 0.0 = disabled (opt-in,
+    # so a local LLM isn't throttled in dev unless asked).
+    LLM_RPS: float = 0.0
+    # `ChatOpenAI` built-in transient-retry count for every role model (ADR 0013 — Phase 7);
+    # the client-layer retry that sits below the best-effort LLM-node swallows.
+    LLM_MAX_RETRIES: int = 2
 
     # --- Slack HITL transport (Socket Mode — ADR 0010; used from Phase 6) ---
     SLACK_BOT_TOKEN: str = ""

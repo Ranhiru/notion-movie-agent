@@ -37,10 +37,16 @@ from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import build_graph
-from .llm import disambiguation_model, extraction_model, judge_model
+from .llm import (
+    disambiguation_model,
+    extraction_model,
+    judge_model,
+    llm_rate_limiter,
+)
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .resilience import transient_retry_policy
 from .schema import EnrichedEntry
 from .slack import SlackTransport
 
@@ -151,14 +157,18 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
     ):
         # Checkpointed like the reconcile Runtime (thread_id = page_id), so a single-Entry run
         # writes the same checkpoint rows — the substrate Phase 6b's interrupt/resume uses.
+        # Phase 7 (ADR 0013): same retry policy + shared LLM limiter as the sweep, so
+        # `--enrich`/`--resume` behave identically to a reconcile run.
+        limiter = llm_rate_limiter(settings)
         graph = build_graph(
             notion,
             omdb,
             firecrawl,
-            extraction_model(settings),
-            judge_model(settings),
-            disambiguation_model(settings),
+            extraction_model(settings, limiter),
+            judge_model(settings, limiter),
+            disambiguation_model(settings, limiter),
             checkpointer=saver,
+            retry_policy=transient_retry_policy(settings.RETRY_MAX_ATTEMPTS),
         )
         print(f"enriching page_id = {page_id}\n")
         final_state = await graph.ainvoke(

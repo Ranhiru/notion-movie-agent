@@ -41,10 +41,16 @@ from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
 from .graph import NOT_FOUND, build_graph
-from .llm import disambiguation_model, extraction_model, judge_model
+from .llm import (
+    disambiguation_model,
+    extraction_model,
+    judge_model,
+    llm_rate_limiter,
+)
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .resilience import transient_retry_policy
 
 log = logging.getLogger(__name__)
 
@@ -182,14 +188,18 @@ class Runtime:
         saver = await self._stack.enter_async_context(
             open_checkpointer(self._settings.CHECKPOINT_DB_PATH)
         )
+        # Phase 7 (ADR 0013): one shared LLM rate limiter for all three role models (aggregate
+        # cap on the single endpoint), and the transient-retry policy for the gating nodes.
+        limiter = llm_rate_limiter(self._settings)
         self._graph = build_graph(
             self._notion,
             self._omdb,
             self._firecrawl,
-            extraction_model(self._settings),
-            judge_model(self._settings),
-            disambiguation_model(self._settings),
+            extraction_model(self._settings, limiter),
+            judge_model(self._settings, limiter),
+            disambiguation_model(self._settings, limiter),
             checkpointer=saver,
+            retry_policy=transient_retry_policy(self._settings.RETRY_MAX_ATTEMPTS),
         )
         return self
 
@@ -226,10 +236,36 @@ class Runtime:
             entries = entries[:limit]
         log.info("reconcile: %d entries to enrich", len(entries))
         sem = asyncio.Semaphore(self._concurrency)
-        statuses = await asyncio.gather(*(self._run_one(e, sem) for e in entries))
+        # `return_exceptions=True` so one Entry's unexpected escape (or a CancelledError) can't
+        # cancel the whole gather and abort its siblings (ADR 0013 — batch isolation). _run_one
+        # already catches `Exception`; this backstops anything that slips past it. Per-Entry
+        # state is independently checkpointed (thread_id = page_id), so this only guards the
+        # *scheduling* of the batch, never a shared rollback.
+        results = await asyncio.gather(
+            *(self._run_one(e, sem) for e in entries), return_exceptions=True
+        )
+        statuses = [self._classify_result(e, r) for e, r in zip(entries, results, strict=True)]
         summary = ReconcileSummary.from_statuses(statuses)
         log.info("reconcile complete: %s", summary)
         return summary
+
+    def _classify_result(self, entry: Entry, result: str | BaseException) -> str:
+        """Map a `gather(return_exceptions=True)` result to a tally status (ADR 0013).
+
+        A returned string is `_run_one`'s own classification (`done`/`failed`/`_AWAITING`/…). A
+        returned exception means something escaped `_run_one`'s own `except` — treat it like a
+        transient error (Entry left untouched → stays pending for the cron) so one bad Entry
+        doesn't sink the pass.
+        """
+        if isinstance(result, BaseException):
+            log.error(
+                "reconcile: unhandled error escaped _run_one for %r (%s) — counted transient",
+                entry.title,
+                entry.page_id,
+                exc_info=result,
+            )
+            return _TRANSIENT
+        return result
 
     async def _run_one(self, entry: Entry, sem: asyncio.Semaphore) -> str:
         """Enrich one Entry through the graph; classify pause/transient outcomes for the tally.
@@ -243,16 +279,20 @@ class Runtime:
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         async with sem:
             try:
-                final_state = await self._graph.ainvoke(
-                    {"page_id": entry.page_id},
+                config: RunnableConfig = {
                     # thread_id = page_id keys the checkpoint (ADR 0006/0007), so a Phase-6b
                     # paused run resumes on this same key. run_name names the LangSmith trace;
                     # `origin` foreshadows the Phase 9 Slack `/add` path (ADR 0001).
-                    config={
-                        "configurable": {"thread_id": entry.page_id},
-                        "run_name": entry.title or "(blank Entry)",
-                        "metadata": {"page_id": entry.page_id, "origin": "sweep"},
-                    },
+                    "configurable": {"thread_id": entry.page_id},
+                    "run_name": entry.title or "(blank Entry)",
+                    "metadata": {"page_id": entry.page_id, "origin": "sweep"},
+                }
+                # Phase 7 (ADR 0013): cap intra-graph parallel-node execution (fan-out lanes)
+                # on top of the across-Entry sweep semaphore. 0 = unset → let LangGraph decide.
+                if self._settings.GRAPH_MAX_CONCURRENCY > 0:
+                    config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
+                final_state = await self._graph.ainvoke(
+                    {"page_id": entry.page_id}, config=config
                 )
                 interrupts = final_state.get("__interrupt__")
                 if interrupts:

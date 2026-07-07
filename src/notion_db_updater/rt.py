@@ -18,9 +18,12 @@ before extracting once from the winner.
 **RT is best-effort and must never block `done` (ADR 0004).** This lane therefore *swallows*
 its own failures: a soft miss (no RT page) or a hard failure (Firecrawl 5xx, timeout) both
 resolve to null scores, never a raised exception. Contrast the OMDb lane, where a transient
-error propagates and leaves the Entry `pending` for the next cron pass. Known Phase-4 cost:
-with no `RetryPolicy` (Phase 7) or fallback providers (Phase 8) yet, a *transient* Firecrawl
-error becomes a permanently-null RT on an otherwise-`done` row until a manual re-run.
+error propagates and leaves the Entry `pending` for the next cron pass. Phase 7 (ADR 0013)
+softens the transient case: `FirecrawlClient` now retries transient blips (429 / 5xx /
+timeout) *internally*, below this swallow — so a momentary Firecrawl hiccup no longer
+permanently nulls RT on an otherwise-`done` row. A retry that still exhausts (or fallback
+providers, Phase 8) is the remaining backstop; a node-level `RetryPolicy` is deliberately
+*not* used here, since its exhaustion would re-raise and break "RT never blocks `done`".
 """
 
 from __future__ import annotations
