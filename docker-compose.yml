@@ -1,0 +1,100 @@
+# Phase 10 (ADR 0009 / 0007) — the only Docker phase. One always-on container running
+# `--serve` (in-process cron + Slack Socket Mode), kept up by `restart: always`.
+#
+#   Secrets  →  file-mounted from ./secrets/* (generate with `make secrets` from your .env).
+#   State    →  a NAMED VOLUME holds the SQLite checkpointer so paused HITL runs survive a
+#               restart (ADR 0007). Never a bind mount of the repo — that would ship the DB.
+#   Network  →  no `ports:` — Socket Mode is an outbound WebSocket; there is no inbound HTTP.
+#
+# Run:  make secrets  &&  docker compose up --build
+
+services:
+  agent:
+    build: .
+    restart: always
+
+    # Non-secret config only (safe to keep in the compose file / `docker inspect`). Secrets
+    # come from the `secrets:` block below, bridged into env by entrypoint.sh.
+    environment:
+      # Durable checkpointer on the named volume (ADR 0007 — must be persistent).
+      CHECKPOINT_DB_PATH: /data/checkpoints.sqlite
+
+      # OpenAI-compatible endpoint, read from .env/env like the rest. A remote endpoint
+      # (e.g. OpenRouter https://openrouter.ai/api/v1) works as-is. For a HOST-local LLM,
+      # `localhost` won't reach the host from inside the container: use
+      # http://host.docker.internal:8888/v1 — and on Linux (not Docker Desktop) also add
+      #   extra_hosts: ["host.docker.internal:host-gateway"]
+      # to this service so that name resolves.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_EXTRACTION_MODEL: ${OPENAI_EXTRACTION_MODEL:-}
+      OPENAI_DISAMBIGUATION_MODEL: ${OPENAI_DISAMBIGUATION_MODEL:-}
+      OPENAI_JUDGE_MODEL: ${OPENAI_JUDGE_MODEL:-}
+      OPENAI_MAX_TOKENS: ${OPENAI_MAX_TOKENS:-8192}
+      LLM_RPS: ${LLM_RPS:-0}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+
+      # Notion (the data source id is not a secret — RESEARCH §8).
+      NOTION_WATCHLIST_DATA_SOURCE_ID: ${NOTION_WATCHLIST_DATA_SOURCE_ID:-ffcdcd68-0449-461d-be8e-0af9b71f9d5f}
+      NOTION_RPS: ${NOTION_RPS:-3}
+
+      # Reconcile sweep + resilience knobs (ADR 0001 / 0013).
+      RECONCILE_CONCURRENCY: ${RECONCILE_CONCURRENCY:-1}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-3600}
+      GRAPH_MAX_CONCURRENCY: ${GRAPH_MAX_CONCURRENCY:-0}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      STALE_INTERRUPT_TIMEOUT_SECONDS: ${STALE_INTERRUPT_TIMEOUT_SECONDS:-604800}
+
+      # RT search providers (ADR 0003) + their per-minute caps (ADR 0013).
+      SEARCH_PROVIDERS: ${SEARCH_PROVIDERS:-firecrawl,tavily,exa}
+      FIRECRAWL_RPM: ${FIRECRAWL_RPM:-10}
+      TAVILY_RPM: ${TAVILY_RPM:-10}
+      EXA_RPM: ${EXA_RPM:-10}
+
+      # Slack channel for the HITL picker (the bot/app *tokens* are secrets, below).
+      SLACK_CHANNEL: ${SLACK_CHANNEL:-#notion-movie-db}
+
+      # LangSmith tracing — only the API key is a secret (below); the rest are plain config.
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-true}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://apac.api.smith.langchain.com}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-NotionMovieDBAgent}
+
+    # Named volume for the SQLite checkpointer (ADR 0007). Survives container recreation, so a
+    # paused `awaiting_input` graph resumes after a restart.
+    volumes:
+      - checkpoint-data:/data
+
+    # File-mounted secrets → /run/secrets/<NAME>; entrypoint.sh exports them as env vars. The
+    # secret name must equal the env var the code reads. Generate the files with `make secrets`.
+    secrets:
+      - NOTION_MOVIE_DB_TOKEN
+      - OMDB_API_KEY
+      - FIRECRAWL_API_KEY
+      - TAVILY_API_KEY
+      - EXA_API_KEY
+      - OPENAI_API_KEY
+      - SLACK_BOT_TOKEN
+      - SLACK_APP_TOKEN
+      - LANGSMITH_API_KEY
+
+volumes:
+  checkpoint-data:
+
+secrets:
+  NOTION_MOVIE_DB_TOKEN:
+    file: ./secrets/NOTION_MOVIE_DB_TOKEN
+  OMDB_API_KEY:
+    file: ./secrets/OMDB_API_KEY
+  FIRECRAWL_API_KEY:
+    file: ./secrets/FIRECRAWL_API_KEY
+  TAVILY_API_KEY:
+    file: ./secrets/TAVILY_API_KEY
+  EXA_API_KEY:
+    file: ./secrets/EXA_API_KEY
+  OPENAI_API_KEY:
+    file: ./secrets/OPENAI_API_KEY
+  SLACK_BOT_TOKEN:
+    file: ./secrets/SLACK_BOT_TOKEN
+  SLACK_APP_TOKEN:
+    file: ./secrets/SLACK_APP_TOKEN
+  LANGSMITH_API_KEY:
+    file: ./secrets/LANGSMITH_API_KEY

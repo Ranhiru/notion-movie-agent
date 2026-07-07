@@ -1,0 +1,35 @@
+# Keep the build context (and image) small and secret-free. Mirrors .gitignore plus the
+# things that must never enter the image even though they aren't git-ignored.
+
+# Secrets — never copy into the image (Compose mounts them at runtime instead).
+.env
+.env.example
+secrets/
+
+# The local checkpointer DB is ~40MB and would both bloat the image AND shadow the /data
+# volume. It belongs on the named volume, created fresh at runtime.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Python / uv build artifacts — the image builds its own venv from uv.lock.
+.venv/
+__pycache__/
+*.py[cod]
+
+# VCS, tooling, and dev-only material.
+.git/
+.githooks/
+.ruff_cache/
+.python-version
+
+# Per-run logs (the container logs to stdout / a fresh file at runtime).
+logs/
+
+# Not needed at runtime.
+tests/
+spikes/
+docs/
+flow.png
+*.md
+!README.md
