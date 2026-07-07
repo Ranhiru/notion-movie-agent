@@ -45,7 +45,12 @@ WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
 COPY --chown=appuser:appuser src ./src
 COPY --chown=appuser:appuser entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
+# /app is created root-owned by WORKDIR; the app (running as appuser) writes a per-run file
+# under /app/logs at startup (it also logs to stdout → `docker logs`). Create it writable now,
+# or `_configure_logging` crashes the boot with PermissionError.
+RUN chmod +x ./entrypoint.sh \
+    && mkdir -p /app/logs \
+    && chown appuser:appuser /app/logs
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
