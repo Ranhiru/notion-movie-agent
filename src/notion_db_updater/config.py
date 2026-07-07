@@ -95,6 +95,16 @@ class Settings(BaseSettings):
     OPENAI_EXTRACTION_MODEL: str = ""
     OPENAI_DISAMBIGUATION_MODEL: str = ""
     OPENAI_JUDGE_MODEL: str = ""
+    # OpenRouter unified reasoning control, per role (ADR 0011 amended). Empty = omit the
+    # `reasoning` field entirely, which is the safe default: a local llama.cpp/unsloth server
+    # rejects an unknown field, and only OpenRouter interprets it. These are temperature=0
+    # extraction/classification calls, so the mechanical roles want reasoning off/minimal
+    # (latency + the unbounded-<think> hang OPENAI_MAX_TOKENS guards against are pure downside
+    # here); only the judge's plausibility check earns a small budget. Values:
+    # none|minimal|low|medium|high (OpenRouter effort levels).
+    OPENAI_EXTRACTION_REASONING_EFFORT: str = ""
+    OPENAI_DISAMBIGUATION_REASONING_EFFORT: str = ""
+    OPENAI_JUDGE_REASONING_EFFORT: str = ""
     # Per-request output cap for every role model. Reasoning models (e.g. gemma-4-12B) can
     # otherwise emit unbounded <think> tokens on a large extraction prompt and never return —
     # a hung sweep. 0 = unset (let the server decide); a positive value bounds each response.
