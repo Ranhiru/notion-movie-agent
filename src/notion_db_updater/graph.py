@@ -3,12 +3,12 @@
 Built as a LangGraph `StateGraph` (not loose functions) from the start so later phases bolt
 on without a port. The lane splits after `read_page` and rejoins at `assemble`:
 
-                ┌─ omdb_search ─(≤1)───────────────────────────────┐
-                │       │ (>1)                                      │
-    read_page ──┤   disambiguate ─(confident)─────→ omdb_details ───┤
-                │       │ (unsure / fail-safe)           ↑          │
-                │   await_human ──(interrupt() ↔ resume)─┘          │
-                └─ rt ─────────────────────────────────────────────┴─→ assemble
+                ┌─ omdb_search ─(1 / blank)─────────────────────────┐
+                │       │ (>1)          │ (0 — 6f)                   │
+    read_page ──┤   disambiguate ─(confident)─────→ omdb_details ────┤
+                │       │ (unsure / fail-safe)          ↑            │
+                │   await_human ──(interrupt() ↔ resume)┘            │
+                └─ rt ──────────────────────────────────────────────┴─→ assemble
                                                     → resolve_rt → judge → update_notion → END
 
 - **Fan-out** = two edges out of `read_page`; **fan-in** = two edges into `assemble`, which
@@ -18,9 +18,14 @@ on without a port. The lane splits after `read_page` and rejoins at `assemble`:
 - The two lanes write **disjoint** state channels (omdb → status + imdb/plot/genre + identity;
   rt → rt_* scores/identity/candidates), so the concurrent fan-out needs no reducer.
 - **OMDb disambiguation (ADR 0008 role 2):** `omdb_search` surfaces the full OMDb candidate
-  list; `route_after_search` routes >1 candidates to the LLM `disambiguate` pre-filter, ≤1
-  straight to `omdb_details`. `disambiguate` picks the best candidate and self-assesses
+  list; `route_after_search` routes >1 candidates to the LLM `disambiguate` pre-filter, exactly
+  1 straight to `omdb_details`. `disambiguate` picks the best candidate and self-assesses
   `confident`.
+- **Phase 6f — unmatchable titles:** `omdb_search` retries `normalize_title` fallbacks on a
+  miss; a *still*-empty result is escalated (0 candidates → `await_human`), not written
+  `failed`, so a human can paste the imdbID search never surfaced. A genuinely nonexistent
+  title reaches `failed` only when the 6d timeout resumes the candidate-less pause with
+  `NOT_FOUND`.
 - **Phase 6b — HITL escalation (ADR 0006):** `route_after_disambiguate` takes a *confident*
   pick straight to `omdb_details`; an unsure pick (or a fail-safe) goes to `await_human`, which
   calls `interrupt()` — snapshotting state to the checkpointer, returning control to the sweep
@@ -63,11 +68,16 @@ from pydantic import BaseModel, Field
 from .firecrawl import FirecrawlClient, RTHit
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
-from .omdb import Candidate, OMDbClient, details_fields
+from .omdb import Candidate, OMDbClient, details_fields, normalize_title
 from .rt import build_rt_subgraph, extract_rt_page, synopsis_region
 from .schema import Confidence, EnrichedEntry, normalize_media_type
 
 log = logging.getLogger(__name__)
+
+# Sentinel resume value for the 6f not-found escalation: an `await_human` pause with no OMDb
+# candidates, resumed to a terminal `failed` (a genuinely nonexistent title, presumed so once
+# it ages out unanswered — the 6d stale-interrupt pass). Distinct from any real imdbID.
+NOT_FOUND = "__not_found__"
 
 
 class EnrichmentState(TypedDict):
@@ -126,11 +136,15 @@ async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
 async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
     """Search OMDb for the Entry's candidates — the head of the OMDb fan-out lane.
 
-    Resolves the trivial cases inline: 0 → `failed` (definitive not-found, ADR 0004); exactly
-    1 → the trivial pick, stashed in `chosen_imdb_id` (no LLM needed). A >1 set is carried for
-    the `disambiguate` pre-filter (`route_after_search` decides). Details are fetched
-    *separately* in `omdb_details`, after the pick is settled — so the OMDb `details` call
-    never sits in a node that a Phase-6b `interrupt()` would re-run on resume.
+    Searches the title as written; on a miss, retries each `normalize_title` fallback variant
+    (season suffix stripped, `and`↔`&`, punctuation dropped — Phase 6f) until one returns
+    candidates. Then resolves the trivial cases inline: exactly 1 → the trivial pick, stashed
+    in `chosen_imdb_id` (no LLM); >1 → carried for the `disambiguate` pre-filter. A
+    **still-empty** result is *not* written `failed` here (6f): it carries an empty list so
+    `route_after_search` escalates to the human picker (the miss is far more often a
+    title-matching gap than a genuine not-found). Details are fetched *separately* in
+    `omdb_details`, after the pick is settled — so the OMDb `details` call never sits in a node
+    that a Phase-6b `interrupt()` would re-run on resume.
     """
     if state.get("status") == "failed":
         return {}  # read_page already resolved this (blank Entry) → omdb_details will no-op
@@ -138,9 +152,17 @@ async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
     entry = state.get("entry")
     assert entry is not None and entry.title is not None  # guaranteed by read_page
     candidates = await omdb.search(entry.title, entry.media_type)
+    if not candidates:
+        for variant in normalize_title(entry.title):
+            candidates = await omdb.search(variant, entry.media_type)
+            if candidates:
+                log.info("omdb_search: %r matched via normalized %r", entry.title, variant)
+                break
 
     if not candidates:
-        return {"candidates": candidates, "status": "failed", "note": "omdb: not found"}
+        # 6f: don't `failed` here — route_after_search sends an empty list to await_human so a
+        # human can supply the imdbID OMDb search never surfaced (the 6e manual-input path).
+        return {"candidates": [], "note": "omdb: no match — escalating to human"}
     if len(candidates) == 1:
         return {"candidates": candidates, "chosen_imdb_id": candidates[0].imdb_id}
     return {"candidates": candidates}  # >1 → route_after_search sends this to disambiguate
@@ -149,13 +171,21 @@ async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
 def route_after_search(state: EnrichmentState) -> str:
     """Conditional route out of `omdb_search` (ADR 0008 role 2 — the first conditional edge).
 
-    >1 candidates → the LLM `disambiguate` pre-filter. The 0-candidate (not-found / blank) and
-    1-candidate cases both go straight to `omdb_details`, which fetches details for
-    `chosen_imdb_id` or no-ops when there is none — so the OMDb lane always terminates at
-    `omdb_details`, keeping the fan-in a clean two-edge barrier.
+    - A **blank Entry** (`read_page` already set `status=failed`) → `omdb_details`, which
+      no-ops so the `failed` stands (the OMDb lane still terminates at `omdb_details`).
+    - `>1` candidates → the LLM `disambiguate` pre-filter.
+    - exactly `1` → `omdb_details` (fetch the trivial pick).
+    - `0` after normalization (Phase 6f) → `await_human`: the miss is escalated to the manual
+      picker rather than written `failed`, so a human can supply the imdbID search never found.
     """
+    if state.get("status") == "failed":
+        return "omdb_details"  # blank Entry — passthrough, keeps the failed status
     candidates = state.get("candidates") or []
-    return "disambiguate" if len(candidates) > 1 else "omdb_details"
+    if len(candidates) > 1:
+        return "disambiguate"
+    if len(candidates) == 1:
+        return "omdb_details"
+    return "await_human"  # 6f: 0 candidates → escalate to the human picker, not `failed`
 
 
 class DisambiguationPick(BaseModel):
@@ -247,8 +277,15 @@ async def await_human(state: EnrichmentState) -> dict:
     `details` fetch is kept downstream in `omdb_details` (the same reason the 6a search/details
     split exists). The payload carries everything the Phase-6c Slack picker needs — the
     candidate list + the pre-filter's best guess — so resume needs no recomputation.
+
+    Reached from *two* forks: `disambiguate` (an unsure >1-candidate set) and, for Phase 6f, a
+    0-candidate not-found. A resume of `NOT_FOUND` (the 6d timeout on a candidate-less pause →
+    a presumed genuine not-found) resolves to a terminal `failed`; any other value is the
+    human's chosen imdbID.
     """
     chosen_imdb_id = interrupt(_picker_payload(state))
+    if chosen_imdb_id == NOT_FOUND:
+        return {"status": "failed", "note": "no OMDb match — unclaimed past timeout (6f)"}
     return {"chosen_imdb_id": chosen_imdb_id}
 
 
@@ -262,7 +299,9 @@ def _picker_payload(state: EnrichmentState) -> dict:
     entry = state.get("entry")
     candidates = state.get("candidates") or []
     return {
-        "reason": "disambiguation",
+        # 6f: an empty candidate set is the not-found escalation (manual-input-only picker);
+        # a non-empty set is the classic >1-candidate disambiguation.
+        "reason": "not_found" if not candidates else "disambiguation",
         "page_id": state["page_id"],
         "title": entry.title if entry else None,
         "media_type": entry.media_type if entry else None,
@@ -537,9 +576,9 @@ def build_graph(
     g.add_edge(START, "read_page")
     g.add_edge("read_page", "omdb_search")  # fan-out: OMDb lane
     g.add_edge("read_page", "rt")  # fan-out: RT lane (parallel)
-    # >1 candidates → the LLM pre-filter; ≤1 → straight to details (ADR 0008 role 2).
+    # >1 candidates → the LLM pre-filter; 1 / blank → details; 0-after-normalize → human (6f).
     g.add_conditional_edges(
-        "omdb_search", route_after_search, ["disambiguate", "omdb_details"]
+        "omdb_search", route_after_search, ["disambiguate", "omdb_details", "await_human"]
     )
     # 6b: confident pick → details; unsure / fail-safe → pause for a human via interrupt().
     g.add_conditional_edges(

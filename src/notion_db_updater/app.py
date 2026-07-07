@@ -40,7 +40,7 @@ from langgraph.types import Command
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .firecrawl import FirecrawlClient
-from .graph import build_graph
+from .graph import NOT_FOUND, build_graph
 from .llm import disambiguation_model, extraction_model, judge_model
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
@@ -126,14 +126,15 @@ class StaleSummary:
     total: int = 0  # rows in awaiting_input at the start of the pass
     resolved: int = 0  # aged past the timeout → auto-resolved with the best guess
     fresh: int = 0  # still within the timeout → left for the human
-    no_guess: int = 0  # aged out but the pre-filter stashed no best guess → left, logged
+    no_guess: int = 0  # aged out, had candidates but no best guess (LLM fail-safe) → left
+    not_found: int = 0  # aged out, 0-candidate not-found escalation (6f) → resolved `failed`
     already_done: int = 0  # checkpoint had nothing pending (Notion status lagged) → skipped
 
     def __str__(self) -> str:
         return (
             f"{self.total} awaiting_input → {self.resolved} auto-resolved, "
             f"{self.fresh} still fresh, {self.no_guess} no best-guess (left), "
-            f"{self.already_done} already resolved"
+            f"{self.not_found} not-found → failed, {self.already_done} already resolved"
         )
 
 
@@ -385,6 +386,20 @@ class Runtime:
                 continue
             best_guess = state.values.get("best_guess_imdb_id")
             if not best_guess:
+                # No stashed pick. Two shapes, distinguished by whether OMDb returned anything:
+                #   - 0 candidates → the 6f not-found escalation: nobody claimed it past the
+                #     timeout → presume genuinely nonexistent → resolve terminal `failed`.
+                #   - >0 candidates → a disambiguate LLM fail-safe: real candidates exist, we
+                #     just never got a confident pick → leave awaiting_input for a human (6d).
+                if not state.values.get("candidates"):
+                    log.info(
+                        "stale-interrupt: %r (%s) not-found, unclaimed past timeout → failed",
+                        entry.title,
+                        entry.page_id,
+                    )
+                    await self.resume(entry.page_id, NOT_FOUND, auto_resolved=True)
+                    counts["not_found"] += 1
+                    continue
                 log.warning(
                     "stale-interrupt: %r (%s) aged out but has no best guess — left "
                     "awaiting_input for a human",
@@ -407,6 +422,7 @@ class Runtime:
             resolved=counts["resolved"],
             fresh=counts["fresh"],
             no_guess=counts["no_guess"],
+            not_found=counts["not_found"],
             already_done=counts["already_done"],
         )
         log.info("stale-interrupt pass complete: %s", summary)
