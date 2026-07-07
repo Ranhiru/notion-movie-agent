@@ -20,16 +20,20 @@ import aiosqlite
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-# Every custom type carried in `EnrichmentState` that the msgpack serde would otherwise flag
-# as "unregistered". Module + class-name tuples (the granularity langgraph's allowlist wants —
-# bare module strings silently *block* rather than allow). Add a row here whenever a new
-# non-stdlib type joins the graph state, or a restart-resume will fail to deserialize it.
-_ALLOWED_MSGPACK_MODULES = [
-    ("notion_db_updater.models", "Entry"),
-    ("notion_db_updater.omdb", "Candidate"),
-    ("notion_db_updater.firecrawl", "RTHit"),
-    ("notion_db_updater.schema", "EnrichedEntry"),
-]
+from .models import Entry
+from .omdb import Candidate
+from .schema import EnrichedEntry
+from .search import RTHit
+
+# Every custom type carried in `EnrichmentState` that the msgpack serde would otherwise flag as
+# "unregistered" — the (module, class-name) tuples langgraph's allowlist wants (bare module
+# strings silently *block* rather than allow). Derived from the live classes via
+# `__module__`/`__qualname__` rather than hardcoded strings, so a type that *moves* modules
+# (as `RTHit` did firecrawl → search in Phase 8 — a stale hardcoded tuple there silently
+# blocked deserialization and crashed `resolve_rt` on resume) keeps its allowlist entry.
+# Add a class here whenever a new non-stdlib type joins the graph state.
+_ALLOWED_TYPES = (Entry, Candidate, RTHit, EnrichedEntry)
+_ALLOWED_MSGPACK_MODULES = [(t.__module__, t.__qualname__) for t in _ALLOWED_TYPES]
 
 
 def checkpoint_serde() -> JsonPlusSerializer:

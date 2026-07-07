@@ -18,7 +18,7 @@ import httpx
 from aiolimiter import AsyncLimiter
 
 from .config import NOTION_VERSION, Settings
-from .models import PROP_STATUS, Entry
+from .models import PROP_STATUS, PROP_TITLE, Entry, enrichment_properties
 
 _API = "https://api.notion.com/v1"
 
@@ -144,6 +144,44 @@ class NotionClient:
     async def get_entry(self, page_id: str) -> Entry:
         """Fetch and parse a single Entry by its Notion page id."""
         resp = await self._request("GET", f"/pages/{page_id}")
+        return Entry.from_page(resp.json())
+
+    async def find_by_title(self, title: str) -> Entry | None:
+        """Best-effort dedupe (Phase 9 / ADR 0012): an existing Entry with this exact title.
+
+        Queries with a title `contains` filter (Notion text filters are case-insensitive) —
+        deliberately with *no* status filter, since a `done` row (which the reconcile filter
+        skips) must still count as a duplicate. `contains` can over-match a substring
+        (*Dune* ⊂ *Dune: Part Two*), so the final match requires case-insensitive **exact**
+        equality: this catches an exact re-add but not variant spellings, exactly as ADR 0012
+        scopes dedupe. Returns the first exact match, or None.
+        """
+        key = title.strip().lower()
+        if not key:
+            return None
+        filter_ = {"property": PROP_TITLE, "title": {"contains": title.strip()}}
+        for entry in await self._query_all(filter_):
+            if (entry.title or "").strip().lower() == key:
+                return entry
+        return None
+
+    async def create_entry(self, title: str) -> Entry:
+        """Create a new Watchlist page (Phase 9 / ADR 0012): Entry only, `Type` blank, pending.
+
+        The `/add` path originates a row exactly as a human would — just a Title and
+        `Enrichment Status = pending` — then enriches that `page_id` out-of-band through the
+        same graph. `Type` is left blank on purpose (search OMDb unfiltered, resolve
+        `media_type` via the 1/many + disambiguation logic, then backfill it on write-back).
+
+        This is the one Notion API shape spike 01 didn't exercise (it proved query + PATCH):
+        `POST /v1/pages` with a `2025-09-03` **data_source** parent. Returns the created Entry.
+        """
+        body = {
+            "parent": {"type": "data_source_id", "data_source_id": self._data_source_id},
+            "properties": enrichment_properties(status="pending")
+            | {PROP_TITLE: {"title": [{"text": {"content": title.strip()}}]}},
+        }
+        resp = await self._request("POST", "/pages", json=body)
         return Entry.from_page(resp.json())
 
     async def update_entry(self, page_id: str, properties: dict) -> Entry:

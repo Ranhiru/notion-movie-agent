@@ -60,6 +60,17 @@ def _rich_text(props: dict, prop: str) -> str | None:
     return text or None
 
 
+# Reverse of `schema.normalize_media_type`: the contract's {movie, tv} domain → the Notion
+# `Type` select's option names. Used by the Phase-9 `/add` path, the one flow where the agent
+# backfills `Type` (a Notion-origin row has it human-filled; a `slack` row starts blank).
+_NOTION_TYPE = {"movie": "Movie", "tv": "TV Show"}
+
+
+def notion_type_value(media_type: str | None) -> str | None:
+    """Map a contract `media_type` ("movie" | "tv") to the Notion `Type` option, or None."""
+    return _NOTION_TYPE.get(media_type or "")
+
+
 def enrichment_properties(
     *,
     imdb_rating: float | None = None,
@@ -67,13 +78,17 @@ def enrichment_properties(
     genre: str | None = None,
     rt_critic: int | None = None,
     rt_audience: int | None = None,
+    notion_type: str | None = None,
     status: str,
 ) -> dict:
     """Serialize enrichment results into a Notion `properties` payload (the write-back of §8).
 
     Only the fields that were actually found are included (partial-data writes per ADR 0004);
     `Enrichment Status` is always set. RT scores are best-effort `number` fields (ADR 0003) —
-    a null RT is simply omitted, never blocking `done`. Shapes proven live by
+    a null RT is simply omitted, never blocking `done`. `notion_type` (a `Type` option name) is
+    written only for the Phase-9 `/add` path, which backfills `Type` from the resolved
+    `media_type`; it is None (omitted) for a Notion-origin sweep row, whose `Type` is
+    human-filled and never overwritten. Shapes proven live by
     `spikes/01_notion_data_source.py`: number, rich_text, select.
     """
     props: dict = {PROP_STATUS: {"select": {"name": status}}}
@@ -87,6 +102,8 @@ def enrichment_properties(
         props[PROP_RT_CRITIC] = {"number": rt_critic}
     if rt_audience is not None:
         props[PROP_RT_AUDIENCE] = {"number": rt_audience}
+    if notion_type is not None:
+        props[PROP_TYPE] = {"select": {"name": notion_type}}
     return props
 
 

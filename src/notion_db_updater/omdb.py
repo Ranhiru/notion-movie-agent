@@ -34,14 +34,21 @@ _SEASON_SUFFIX = re.compile(
     r"\s*[\(\[]?\s*(?:season\s*\d+|s\d{1,2})\s*[\)\]]?\s*$", re.IGNORECASE
 )
 
+# A trailing release year the user appended ("Justice League 2017", "Dune (2021)"). OMDb's
+# `?s=` search can't parse a year out of the title string, so it returns 0 — a common `/add`
+# miss. Stripped as a fallback; the year still lives in the Entry title, so the disambiguation
+# pre-filter keeps it to pick the right year among the (now multi-year) candidates.
+_TRAILING_YEAR = re.compile(r"\s*[\(\[]?\s*(?:19|20)\d{2}\s*[\)\]]?\s*$")
+
 
 def normalize_title(title: str) -> list[str]:
     """Ordered fallback query variants for a title OMDb `?s=` couldn't match (Phase 6f).
 
-    Conservative, *mechanical* rewrites only — the ones the backfill showed OMDb search trips
-    over: a trailing season qualifier ("Beef Season 2" → "Beef"), `and`↔`&` ("… and …" ↔
-    "… & …"), and stray punctuation ("The Man from U.N.C.L.E" → "The Man from U N C L E").
-    Returned in try-order; the caller searches each until one returns candidates.
+    Conservative, *mechanical* rewrites only — the ones the backfill / live use showed OMDb
+    search trips over: a trailing season qualifier ("Beef Season 2" → "Beef"), a trailing
+    release year ("Justice League 2017" → "Justice League"), `and`↔`&` ("… and …" ↔ "… & …"),
+    and stray punctuation ("The Man from U.N.C.L.E" → "The Man from U N C L E"). Returned in
+    try-order; the caller searches each until one returns candidates.
 
     Deliberately *not* a spell/abbreviation fixer: misspellings ("The Oddessey"), abbreviations
     ("Dept. Q"), and roman numerals ("Ne Zha II") can't be repaired mechanically and fall
@@ -61,7 +68,9 @@ def normalize_title(title: str) -> list[str]:
 
     stripped = _SEASON_SUFFIX.sub("", original)
     add(stripped)
-    for base in (original, stripped):
+    year_stripped = _TRAILING_YEAR.sub("", original)
+    add(year_stripped)
+    for base in (original, stripped, year_stripped):
         add(re.sub(r"\s+and\s+", " & ", base, flags=re.IGNORECASE))
         add(re.sub(r"\s*&\s*", " and ", base))
         add(re.sub(r"[.\-:_/]+", " ", base))

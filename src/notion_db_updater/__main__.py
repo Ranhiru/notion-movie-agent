@@ -17,6 +17,9 @@ Phase 6d — auto-resolve stale HITL interrupts (awaiting_input past the 7-day t
     uv run python -m notion_db_updater --auto-resolve-stale                  # one pass
     uv run python -m notion_db_updater --auto-resolve-stale --stale-timeout 0  # test path
 
+Phase 9 — originate an Entry from the CLI (stands in for the Slack `/add` command):
+    uv run python -m notion_db_updater --add "Dune"          # create + enrich out-of-band
+
 Verification (TASKS.md Phase 3): `--reconcile` on the real backfill transitions statuses;
 re-running picks up only pending/stragglers; two concurrent triggers → the second is dropped
 (single-flight); `--serve` with a short interval fires repeatedly. LangSmith shows one trace
@@ -233,6 +236,34 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
             await _capture_omdb_fixtures(omdb, entry.title)
 
 
+async def _add(title: str) -> None:
+    """Phase 9 (ADR 0012): originate an Entry from the CLI — stands in for the Slack `/add`.
+
+    Dedupes, creates the page, and enriches it out-of-band exactly as the slash handler does,
+    minus Slack (no completion ping / picker — a pause just prints the resume hint). Lets the
+    create-then-enrich path be exercised without Slack tokens (as `--enrich`/`--resume` stand
+    in for the HITL transport in earlier phases).
+    """
+    async with Runtime() as rt:
+        existing = await rt.find_duplicate(title)
+        if existing:
+            print(
+                f"already on the watchlist: {existing.title!r} "
+                f"(status: {existing.status}) — nothing created"
+            )
+            return
+        outcome = await rt.create_and_enrich(title)
+    print(f"\ncreated {outcome.page_id} for {title!r}")
+    if outcome.status == "awaiting_input":
+        print("  → PAUSED (awaiting_input) — resume with the chosen imdbID:")
+        print(f"  resume: python -m notion_db_updater --resume {outcome.page_id} <imdbID>")
+    else:
+        label = outcome.title or title
+        if outcome.year:
+            label += f" ({outcome.year})"
+        print(f"  {label} → {outcome.status}")
+
+
 async def _reconcile(limit: int | None) -> None:
     """Run one reconcile sweep over the Watchlist ("run now"); `limit` caps it for testing."""
     async with Runtime() as rt:
@@ -287,8 +318,9 @@ async def _serve(limit: int | None = None) -> None:
         if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
             slack = SlackTransport(settings, rt)
             rt.set_notifier(slack.post_picker)
+            rt.bind_completion_notifier(slack.post_completion)  # Phase 9 /add completion ping
             tasks.append(slack.start())
-            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention run)")
+            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention run + /add)")
         else:
             log.info("serve: Slack tokens unset — cron only (no HITL picker)")
         await asyncio.gather(*tasks)
@@ -346,6 +378,11 @@ def main() -> None:
         help="resume a paused HITL run (Phase 6b) with the chosen imdbID — the manual picker",
     )
     parser.add_argument(
+        "--add",
+        metavar="TITLE",
+        help="originate an Entry from the CLI and enrich it (Phase 9 — stands in for /add)",
+    )
+    parser.add_argument(
         "--reconcile",
         action="store_true",
         help="run one reconcile sweep over the whole Watchlist (Phase 3 'run now')",
@@ -384,6 +421,9 @@ def main() -> None:
             asyncio.run(_serve(args.limit))
         except KeyboardInterrupt:
             print("\nstopped.")
+    elif args.add:
+        _configure_logging("add")
+        asyncio.run(_add(args.add))
     elif args.reconcile:
         _configure_logging("reconcile")
         asyncio.run(_reconcile(args.limit))

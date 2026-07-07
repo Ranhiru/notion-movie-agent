@@ -749,34 +749,143 @@ Goal: a `/add <name>` slash command that originates an Entry from Slack, runs th
 search/disambiguation/enrichment, and reports back. **Additional** entry point — the
 Notion-origin path is unchanged. ADR 0012 (reuses 0006 / 0010 / 0001 / 0004).
 
-- [ ] **Slash command transport:** register `/add` in the Slack app; confirm Socket Mode
-      delivers `command` events. Handler **`ack()`s within 3 s** (ephemeral "Adding *X*…"),
-      then does all work in a background task.
-- [ ] **Pre-create dedupe:** query the Watchlist for an existing Entry matching the typed
-      string (case-insensitive). On a hit → reply "already in your watchlist (status: …)",
-      create nothing.
-- [ ] **Create page:** `POST` a new Watchlist page (Entry only, `Type` blank, `Enrichment
-      Status = pending`) → `page_id`; idempotent shape reused from phase 2/3.
-- [ ] **Origin in graph state:** add `origin` ∈ {`sweep`, `slack`} + Slack notify context
-      (channel/user) to the graph state; default `sweep`. Slack path sets `slack` + context.
-- [ ] **Out-of-band enrich + in-flight guard:** add `page_id` to a process-global in-flight
-      set; `graph.invoke(thread_id=page_id)` **without** the single-flight lock; remove on
-      return. The reconcile sweep **skips** any `page_id` in the set (crash → set lost, row
-      still `pending` → cron reclaims; ADR 0004 self-heal preserved).
-- [ ] **Type backfill:** search OMDb unfiltered; on resolution, backfill the Notion `Type`
-      select from `media_type` (agent now writes `Type` for `slack`-origin rows).
-- [ ] **Disambiguation reuse:** unsure → existing HITL picker to `#notion-movie-db`, verbatim
-      (button `value` = `page_id` + `imdbID`; resume identical). No new picker code.
-- [ ] **Terminal notify node:** add a final node on both `done` and `failed` paths; if
-      `origin == 'slack'` post the completion (or not-found) message via **`chat_postMessage`**
-      (not the slash `response_url` — it expires), else no-op. Fires on the initial run, the
-      Slack-click resume, and the 7-day cron auto-resolve alike.
+Target topology (one new terminal node; the sweep path is untouched):
 
-**Verification:** `/add Dune` → row created → enriched → completion ping with IMDb/RT/genre;
-`/add` an ambiguous title → picker in `#notion-movie-db` → click → ping fires after resume;
-`/add` a known existing Entry → dedupe reply, no new row; `/add` gibberish → not-found ping,
-row `failed`; trigger a cron sweep while an `/add` enrich is in flight → sweep skips that
-`page_id` (no double enrichment). Fixture: a Slack `command` payload.
+    … → update_notion → notify → END
+
+`notify` no-ops for `origin == "sweep"` and posts a completion `chat_postMessage` for
+`origin == "slack"`. It sits *after* `update_notion` (Notion is source of truth; Slack is a
+ping) and fires on every terminal path — the initial invoke, a Slack-click resume, and the
+6d auto-resolve alike — because all three flow through `update_notion → notify`.
+
+**Decisions of record (this phase):**
+- **Completion pings go to the `/add` channel; the disambiguation picker stays fixed to
+  `#notion-movie-db`.** The picker is reused *verbatim* (no new picker code → fixed
+  `SLACK_CHANNEL`, ADR 0012); completions reply where the user typed `/add`
+  (`command.channel_id`). Accepted caveat: an `/add` typed in a DM gets its picker in
+  `#notion-movie-db` (realistically `/add` is used in-channel).
+- **`origin` + notify context are set at invoke time in the initial state dict**, so they are
+  checkpointed and survive interrupt/resume/restart (durable, ADR 0012). Resume / auto-resolve
+  don't re-supply them — they're already in the checkpoint. The sweep passes neither → `origin`
+  defaults to `sweep` and `notify` no-ops.
+- **The `notify` node is late-bound** via a mutable `CompletionNotifier` holder injected at
+  compile time (the graph compiles in `Runtime.__aenter__`, *before* `SlackTransport` exists —
+  the same mutual-reference constraint the picker notifier already has). Unbound (CLI / no
+  Slack) → no-op. Best-effort: it swallows Slack errors so a ping failure never fails an
+  already-written Entry.
+- **In-flight guard is a process-global `set[str]` on `Runtime`**, shared with the sweep, which
+  skips any `page_id` in it. Crash-safe by construction: the set vanishes on crash but the row
+  is still `pending`, so the next cron reclaims it (ADR 0004 self-heal — no new Notion status).
+- **`/add` gibberish escalates to the candidate-less picker first** (Phase 6f: `omdb_search` no
+  longer writes `failed` on 0 results). The not-found ping fires only when the row ultimately
+  resolves `failed` (a `NOT_FOUND` resume or the 7-day timeout) — TASKS's "gibberish → failed"
+  is the *eventual* state, consistent with the notify node firing on the auto-resolve.
+- **Dedupe is a title-`contains` query + client-side case-insensitive exact match** — catches
+  exact re-adds, not variant spellings (*Dune* vs *Dune: Part Two*), per ADR 0012. No status
+  filter (a `done` row must still count as a dupe).
+
+### 9a — graph plumbing: `origin` + notify context + `notify` node + Type backfill (no Slack)
+
+- [x] `EnrichmentState` gains `origin` / `notify_channel` / `notify_user` (all `NotRequired`;
+      absent → `sweep`). New `CompletionNotifier` mutable holder (`.bind(post)` / `.notify(…)`),
+      unbound → no-op. New `notify` node bound to it: guard on `origin == "slack"`, build a
+      done/failed message from `status` + `enriched`, post best-effort (swallow Slack errors).
+      Rewire `update_notion → notify → END`; `build_graph` gains a `completion_notifier` param.
+      → All in `graph.py`. `notify` sits after `update_notion` (Notion is source of truth); the
+      done ping is IMDb/RT/genre + IMDb link, the failed ping a not-found notice. `origin` +
+      notify context ride in on the **initial state dict** (checkpointed → durable across
+      interrupt/resume/restart, ADR 0012), so `notify` fires on the initial run, a resume, and
+      the 6d auto-resolve alike.
+      - [x] **Fan-in barrier fix (surfaced by 9a):** the pre-existing fan-in at `assemble`
+            actually **double-fired** the whole post-fan-in tail — the OMDb lane is structurally
+            longer than the single-node `rt` lane, so its two edges reach `assemble` in different
+            supersteps and (without a barrier) LangGraph re-runs the join per arriving edge.
+            Latent before Phase 9 (idempotent `update_notion`; trace-only `judge` — though it
+            silently ran the judge LLM **twice**), but `notify` would double-post the Slack ping.
+            Fixed with `add_node("assemble", …, defer=True)` → a true barrier; the tail now runs
+            exactly once (also halves the judge LLM call across all phases). Proven offline on
+            both the happy path and the paused→resume path (every node once).
+- [x] **Type backfill:** extend `enrichment_properties` with an optional `notion_type` param
+      (writes `PROP_TYPE` select) + a `notion_type_value(media_type)` reverse-map
+      (`movie`→"Movie", `tv`→"TV Show"). `update_notion` writes `Type` **only** for a resolved
+      (`enriched`) `slack`-origin row; sweep rows write no `Type` (§8 behavior unchanged).
+      → `models.py`. Backfill keyed off `enriched.media_type` (final at `update_notion`, post-
+      judge); a Notion-origin sweep row's human-filled `Type` is never overwritten.
+- [x] **Verify (offline):** sweep-origin run → `notify` no-ops, no `Type` written; slack-origin
+      run with an *unbound* notifier → no-op, no crash; `notion_type_value` round-trips; graph
+      compiles with `update_notion → notify → END`.
+      → **Offline-proven** (`make check` clean; scratchpad script on a real on-disk saver,
+      warnings-as-errors): sweep row → `done`, 0 pings, no `Type` prop; slack row → `done` +
+      exactly 1 ping to the `/add` channel (mentions user + title) + `Type=Movie` backfilled;
+      unbound notifier → still `done`, no crash.
+
+### 9b — Notion create + dedupe + `create_and_enrich` + in-flight guard + `--add` CLI (no Slack)
+
+- [x] `NotionClient.create_entry(title)` (`POST /v1/pages`, parent
+      `{"type":"data_source_id","data_source_id":…}`, Title + `Status=pending`) — **the one new
+      Notion API shape** (spike 01 proved only query + PATCH); live-check it first.
+      `NotionClient.find_by_title(title)` (title-`contains` filter, no status filter, client-side
+      case-insensitive exact match).
+      → `notion.py`. `create_entry` reuses `enrichment_properties(status="pending")` for the
+      idempotent shape (phase 2/3). `find_by_title` requires case-insensitive **exact** equality
+      after the `contains` prefilter, so *Dune* ≠ *Dune: Part Two* (ADR 0012 dedupe scope). The
+      `data_source_id` parent is the sole un-spiked shape → **owner live-check first.**
+- [x] `Runtime._inflight: set[str]`; `_sweep` filters out any `page_id in self._inflight`.
+      `Runtime.find_duplicate(text)` → `find_by_title`. `Runtime.create_and_enrich(title, *,
+      channel, user)`: create page → add `page_id` to `_inflight` → `ainvoke({"page_id",
+      "origin":"slack", "notify_channel", "notify_user"})` **without** the single-flight lock →
+      `finally` discard from `_inflight`. Factor the `_run_one` interrupt handling into a shared
+      helper (write `awaiting_input` + call the picker notifier) so a paused `/add` behaves like
+      a swept one.
+      → `app.py`. The `_inflight` discard is in a `finally` wrapping the *whole* invoke +
+      pause-handling, so the row's terminal/`awaiting_input` write lands **before** it leaves
+      the guard — closing the window where the sweep could see it still `pending`. Shared
+      `_handle_pause(entry, final_state)` used by both `_run_one` and `create_and_enrich`.
+- [x] `--add "<title>"` CLI drives `create_and_enrich` without Slack (stands in for the slash
+      command, as `--enrich`/`--resume` do for earlier phases); prints the outcome.
+      → `__main__.py` `--add TITLE`: dedupe → create+enrich → print `done`/`failed`, or the
+      `--resume` hint when it pauses. No Slack (unbound notifier → no ping / picker).
+- [x] **Verify (offline, stubbed clients):** dedupe hit → creates nothing; create→enrich runs
+      out-of-band → `done` with `Type` backfilled; a concurrent `_sweep` skips a `page_id` in
+      `_inflight`; a simulated crash (page left in `_inflight`, row still `pending`) → a fresh
+      sweep reclaims it; a paused `/add` writes `awaiting_input`.
+      → **Offline-proven** (same script): dedupe hit → `create_entry` not called + variant
+      rejected; create→enrich → `done`, `Type=Movie`, `_inflight` empty after return; a
+      page manually held in `_inflight` → sweep `total=0`, row untouched (crash-safe: a fresh
+      process has an empty set → the still-`pending` row is reclaimed); an ambiguous `/add` →
+      `awaiting_input` + picker notifier fired + `_inflight` empty after the pause.
+
+### 9c — Slack `/add` slash command transport + completion-notifier binding
+
+- [x] Register `@app.command("/add")`: empty text → usage hint; else `ack("Adding *X*…")` (≤3 s
+      ephemeral) then spawn a tracked background task → `find_duplicate` (post "already on your
+      watchlist (status: …)" and stop) else `create_and_enrich` in a try/except (failure reply
+      on error). Completion / not-found feedback comes from the graph `notify` node.
+      → `slack.py`. Background tasks held in `self._tasks` (strong refs; discarded on done).
+      `_add_flow` posts everything via `chat_postMessage` (never the expiring `response_url`).
+      A missing `channel_id` (defensive) short-circuits the ack. **Completion channel decision
+      of record:** the `/add` channel; the picker stays fixed to `#notion-movie-db` (verbatim
+      reuse).
+- [x] `_serve` binds the `CompletionNotifier` to `slack.post_completion` after wiring the picker
+      notifier (`Runtime.bind_completion_notifier`).
+      → `__main__.py`. `post_completion` suppresses unfurls so the IMDb link stays compact.
+- [x] **Verify:** offline — command handler acks + spawns; dedupe reply posted (client mocked);
+      completion notifier posts a done/failed message on terminal. **Live (owner-run):**
+      `/add Dune` → row created → enriched → completion ping with IMDb/RT/genre; `/add` an
+      ambiguous title → picker in `#notion-movie-db` → click → ping after resume; `/add` an
+      existing Entry → dedupe reply, no new row; `/add` gibberish → candidate-less picker, then
+      failed → not-found ping after the (shortened) timeout; a cron sweep mid-`/add` → sweep
+      skips that `page_id` (no double enrichment). Fixture: a Slack `command` payload.
+      → **Offline-proven** (`make check` clean; scratchpad script, Slack client mocked):
+      `SlackTransport` constructs with fake tokens + registers `/add`; a new title →
+      `create_and_enrich` called, no immediate post (ping is the `notify` node); a dedupe hit →
+      reply naming the status, `create_and_enrich` **not** called; a create failure → a
+      best-effort error reply, no crash; `post_completion` posts to the channel with unfurls
+      off. Fixture captured: `tests/fixtures/slack_add_command.json` (documented `command`
+      shape). **Live is owner-run** (Slack tokens + the `/add` command registered for Socket
+      Mode aren't in Claude's shell env): `--serve` with tokens set → run the five `/add`
+      scenarios above; a genuinely nonexistent title escalates to the candidate-less picker and
+      only pings `failed` once the (shortened) `STALE_INTERRUPT_TIMEOUT_SECONDS` fires.
 
 ---
 
