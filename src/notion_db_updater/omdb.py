@@ -28,6 +28,46 @@ def _omdb_type(media_type: str | None) -> str | None:
     return {"Movie": "movie", "TV Show": "series"}.get(media_type or "")
 
 
+# Trailing season / qualifier that OMDb's title search chokes on — a watchlist row is often
+# written per-season ("Beef Season 2", "The Bear (S04)") but OMDb indexes the *series*.
+_SEASON_SUFFIX = re.compile(
+    r"\s*[\(\[]?\s*(?:season\s*\d+|s\d{1,2})\s*[\)\]]?\s*$", re.IGNORECASE
+)
+
+
+def normalize_title(title: str) -> list[str]:
+    """Ordered fallback query variants for a title OMDb `?s=` couldn't match (Phase 6f).
+
+    Conservative, *mechanical* rewrites only — the ones the backfill showed OMDb search trips
+    over: a trailing season qualifier ("Beef Season 2" → "Beef"), `and`↔`&` ("… and …" ↔
+    "… & …"), and stray punctuation ("The Man from U.N.C.L.E" → "The Man from U N C L E").
+    Returned in try-order; the caller searches each until one returns candidates.
+
+    Deliberately *not* a spell/abbreviation fixer: misspellings ("The Oddessey"), abbreviations
+    ("Dept. Q"), and roman numerals ("Ne Zha II") can't be repaired mechanically and fall
+    through to the human picker (the 6f escalation). Excludes the (whitespace-normalized)
+    original and any duplicates.
+    """
+    original = re.sub(r"\s+", " ", title).strip()
+    seen = {original.lower()}
+    variants: list[str] = []
+
+    def add(candidate: str) -> None:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        key = candidate.lower()
+        if candidate and key not in seen:
+            seen.add(key)
+            variants.append(candidate)
+
+    stripped = _SEASON_SUFFIX.sub("", original)
+    add(stripped)
+    for base in (original, stripped):
+        add(re.sub(r"\s+and\s+", " & ", base, flags=re.IGNORECASE))
+        add(re.sub(r"\s*&\s*", " and ", base))
+        add(re.sub(r"[.\-:_/]+", " ", base))
+    return variants
+
+
 def _clean(value: str | None) -> str | None:
     """OMDb string field → its value, or None when missing / the literal "N/A"."""
     if value is None:

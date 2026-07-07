@@ -29,3 +29,17 @@ The reconcile query picks up only `pending` (or unset) Entries.
   reserved for definitive core failure only.
 - Always write whatever partial data was obtained (idempotent upsert by `page_id`)
   before setting status, so a status of `done`/`failed` never discards found data.
+
+## Amendment (Phase 6f) — a 0-result escalates before it `fail`s
+
+An OMDb 0-result is *most often* a title-matching miss (a season suffix, `and`/`&`,
+punctuation, a misspelling, a regional title), not a genuine "doesn't exist". So the
+definitive-not-found path is now: `omdb_search` first retries mechanical
+`normalize_title` fallbacks; a still-empty result is **not** written `failed` — it is
+escalated to the HITL picker ([0006](./0006-hitl-disambiguation-out-of-band-resume.md),
+manual-input-only) so a human can supply the imdbID search never surfaced. `failed`
+still means "definitively not-found", but the determination is now human-confirmed:
+either a human declines to resolve it, or — for an unclaimed escalation — the 7-day
+stale-interrupt timeout resumes it to `failed` (a `NOT_FOUND` sentinel). This *tightens*
+"definitive" rather than loosening it; a blank Entry and a transient error are unchanged
+(blank → `failed` at `read_page`; transient → left `pending`).

@@ -590,7 +590,7 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
         repro *Michael*) is owner-run — Slack tokens aren't in Claude's shell env: `--serve` with
         tokens set → paste an IMDb link into an ambiguous row's picker → resolves to `done`;
         pasting garbage → ephemeral hint, buttons still clickable.
-- [ ] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
+- [x] **6f — unmatchable / malformed titles → escalate, don't silently `failed`:** when
       `omdb_search` returns 0 candidates, the row is written terminal `failed` and dropped from
       the sweep — but most such failures are *title-matching* misses, not "doesn't exist".
       Normalize the title before search, and on a still-empty result escalate to the 6e human
@@ -604,12 +604,43 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
     (`tt30459041`), `The Man from U.N.C.L.E` → *The Man from U.N.C.L.E.* (`tt1638355`)
   - Regional / alternate titles: `Department Q` → *Dept. Q* (`tt27995114`), `Ne Zha II` →
     *Ne Zha 2* (`tt34956443`)
-  - [ ] Normalize before search: strip trailing `Season N` / `(SNN)` / `(Season N)` qualifiers
+  - [x] Normalize before search: strip trailing `Season N` / `(SNN)` / `(Season N)` qualifiers
         (series enrich at the series level anyway); normalize `and`↔`&` and stray punctuation.
-  - [ ] On a still-empty search, route to the 6e human path (post the picker with no candidate
+        → `omdb.normalize_title(title) -> list[str]` (pure): ordered *mechanical* fallback
+        variants (season suffix stripped, `and`↔`&`, punctuation → spaces), excluding the
+        original + dupes. `omdb_search` searches the title as written, then each variant until one
+        returns candidates (logs which). Deliberately not a spell/abbrev fixer — misspellings
+        (*The Oddessey*), abbreviations (*Dept. Q*), roman numerals (*Ne Zha II*) fall through to
+        the human path.
+  - [x] On a still-empty search, route to the 6e human path (post the picker with no candidate
         buttons — just the manual IMDb-link input) instead of writing `failed`.
-  - [ ] **Verify:** each example above ends `done` (via normalization or a human paste); a
+        → `omdb_search` no longer sets `failed` on a still-empty result — it carries an empty
+        candidate list; `route_after_search` sends `0` candidates → `await_human` (blank Entry
+        still → `omdb_details` passthrough, keeps `failed`). `_picker_payload` sets
+        `reason="not_found"` for the candidate-less case; `build_picker_blocks` drops the (invalid)
+        empty `actions` block and shows a "Couldn't find …" header, leaving 6e's manual input as
+        the sole control. **Genuine not-found → `failed` via the 6d timeout** (decision of
+        record): `await_human` resolves a `NOT_FOUND` sentinel resume to terminal `failed`, and
+        `auto_resolve_stale` now splits a no-best-guess stale row by candidate presence —
+        0 candidates (6f not-found) → resume `NOT_FOUND` → `failed` (new `not_found` tally);
+        >0 candidates (disambiguate LLM fail-safe) → left `awaiting_input` (`no_guess`, 6d
+        original). Slack-layer only for the picker; graph + 6d touched for routing/terminal.
+  - [x] **Verify:** each example above ends `done` (via normalization or a human paste); a
         genuinely nonexistent title still ends `failed`.
+        → **Offline-proven** (`make check` clean; two throwaway scripts on a real on-disk saver,
+        warnings-as-errors): `normalize_title` yields the expected variant for every backfill
+        example; `Beef Season 2` matches via the `Beef` fallback → `done`; a searched-empty title
+        pauses at `await_human` (`reason=not_found`, candidate-less payload, *not* `failed`); a
+        `NOT_FOUND` resume → `failed` written to Notion; a non-candidate imdbID paste → `done`
+        (repro *Michael*); a blank Entry still → `failed` without searching or pausing; the
+        candidate-less picker renders no `actions` block, a "Couldn't find" header, and keeps the
+        manual input. Stale pass (`max_age=0`): a 0-candidate row → `failed` (`not_found`), a
+        2-candidate fail-safe row → left `awaiting_input` (`no_guess`), untouched in Notion.
+        **Live** (real OMDb/LLM/Notion; the backfill examples) is owner-run — creds aren't in
+        Claude's shell env: `--reconcile` → season/`&`/punctuation rows resolve via normalization;
+        a misspelling/regional title escalates to a candidate-less picker (paste the imdbID →
+        `done`); gibberish escalates then, with a shortened `STALE_INTERRUPT_TIMEOUT_SECONDS`,
+        auto-resolves to `failed`.
 
 ---
 

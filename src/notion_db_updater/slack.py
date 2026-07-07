@@ -87,17 +87,22 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     IMDb link or bare `tt…` id resumes the *same* paused run — no graph change; the resume path
     already accepts an arbitrary imdbID. The `page_id` rides in the input block's `block_id`
     (input elements carry no per-action `value`), so the handler stays self-contained.
+
+    A **candidate-less** payload is the Phase-6f not-found escalation (OMDb returned nothing
+    even after title normalization): the header shifts to a "couldn't find" prompt and the
+    candidate `actions` block is dropped (an empty `elements` array is invalid Block Kit),
+    leaving the manual-input field as the sole control.
     """
     title = payload.get("title") or "(unknown title)"
     best_guess = payload.get("best_guess_imdb_id")
     candidates = (payload.get("candidates") or [])[:_MAX_CANDIDATES]
 
-    blocks: list[dict] = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Which _{title}_ did you mean?*"},
-        }
-    ]
+    header = (
+        f"*Which _{title}_ did you mean?*"
+        if candidates
+        else f"*Couldn't find _{title}_ on OMDb* — paste the IMDb link or ID below."
+    )
+    blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}]
     for c in candidates:
         label = c.get("title") or "(untitled)"
         bits = f"*{label}*"
@@ -125,7 +130,9 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
         }
         for i, c in enumerate(candidates)
     ]
-    blocks.append({"type": "actions", "block_id": "pick_actions", "elements": buttons})
+    # 6f: a not-found escalation has no candidates → skip the (invalid) empty actions block.
+    if buttons:
+        blocks.append({"type": "actions", "block_id": "pick_actions", "elements": buttons})
     blocks.append(
         {
             "type": "input",
