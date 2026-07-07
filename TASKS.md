@@ -908,9 +908,10 @@ Goal: the only Docker phase. ADR 0009 / 0007.
   trailing newline; `$(cat)` in the entrypoint strips it anyway). `secrets/` is gitignored.
   Non-secret config (intervals, RPMs, models, LangSmith endpoint/project, data-source id) rides
   in via compose `environment:` with `${VAR:-default}` (Compose auto-reads `.env` for interp).
-- **The LLM endpoint is on the host.** `localhost:8888` inside the container is the container
-  itself, so compose rewrites `OPENAI_BASE_URL` → `http://host.docker.internal:8888/v1` and adds
-  `extra_hosts: ["host.docker.internal:host-gateway"]` (auto on Docker Desktop; needed on Linux).
+- **`OPENAI_BASE_URL` is read from env** like the rest (dev uses a remote endpoint, e.g.
+  OpenRouter). A host-local LLM would instead need `http://host.docker.internal:8888/v1` (and
+  `extra_hosts: ["host.docker.internal:host-gateway"]` on Linux), since `localhost` inside the
+  container is the container itself — documented in the compose comment, not wired by default.
 - **Volume ownership:** the image creates `/data` owned by the non-root `appuser`; Docker seeds a
   fresh named volume from the image path's ownership on first mount, so the checkpointer can write.
 - **`.dockerignore` excludes the local `checkpoints.sqlite`** (~40MB) — it must not bloat the
@@ -921,8 +922,8 @@ Goal: the only Docker phase. ADR 0009 / 0007.
       runtime), `uv sync --frozen --no-dev` from `uv.lock` (reproducible; dep layer cached
       separately from `src/`), non-root `appuser`, venv on `PATH` (no `uv run` at runtime).
       `ENTRYPOINT ["./entrypoint.sh"]` → the secret bridge → `python -m notion_db_updater --serve`.
-      `docker-compose.yml`: single `agent` service, `restart: always`, **no ports**, `extra_hosts`
-      for the host LLM. `.dockerignore` keeps the context small + secret-free.
+      `docker-compose.yml`: single `agent` service, `restart: always`, **no ports**, `OPENAI_BASE_URL`
+      + all config from env. `.dockerignore` keeps the context small + secret-free.
 - [x] **Compose secrets** (file-mounted) for all keys; no secrets in the image/compose file.
       → 9 file-mounted secrets (`NOTION_MOVIE_DB_TOKEN`, `OMDB_API_KEY`, `FIRECRAWL/TAVILY/EXA_API_KEY`,
       `OPENAI_API_KEY`, `SLACK_BOT/APP_TOKEN`, `LANGSMITH_API_KEY`) sourced from `./secrets/*`
@@ -935,7 +936,7 @@ Goal: the only Docker phase. ADR 0009 / 0007.
 **Verification:** `docker compose up`; cron fires on schedule; kill the container → restarts;
 an `awaiting_input` graph **survives the restart** (volume persistence proves ADR 0007).
 → **Build + config proven by Claude** (no creds needed): `docker compose config` validates the
-merged spec (9 secrets, named volume, no ports, host-gateway) and `docker build` builds the image
+merged spec (9 secrets, named volume, no ports) and `docker build` builds the image
 clean to the `--serve` entrypoint. **Live `docker compose up` is owner-run** (secrets/creds +
 host LLM aren't in Claude's shell env): `make secrets && docker compose up --build` → cron logs
 fire; `docker kill` → `restart: always` recovers; create an ambiguous Entry → `awaiting_input`

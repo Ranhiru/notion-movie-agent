@@ -42,10 +42,11 @@ docker compose up --build # start the always-on agent
   rotating a key. `entrypoint.sh` bridges `/run/secrets/*` into env vars on boot.
 - **State** (the SQLite checkpointer) lives on the **named volume** `checkpoint-data`, so a
   paused `awaiting_input` HITL run survives a container restart (ADR 0007).
-- **The LLM endpoint** runs on the host — compose points `OPENAI_BASE_URL` at
-  `http://host.docker.internal:8888/v1` (auto on Docker Desktop; `extra_hosts: host-gateway`
-  covers Linux). Non-secret tuning (intervals, RPMs, models, LangSmith project) is read from
-  `.env`/env via compose `environment:` with sensible defaults.
+- **Config** — `OPENAI_BASE_URL` and all non-secret tuning (intervals, RPMs, models, LangSmith
+  project) are read from `.env`/env via compose `environment:` with sensible defaults. A remote
+  LLM endpoint (e.g. OpenRouter) works as-is; for a host-local LLM use
+  `http://host.docker.internal:8888/v1` (and on Linux add
+  `extra_hosts: ["host.docker.internal:host-gateway"]` to the service).
 
 Verify durability: create an ambiguous Entry → it goes `awaiting_input` → `docker compose
 restart` mid-wait → the paused graph resumes from the volume-backed `.sqlite`.

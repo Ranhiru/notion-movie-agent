@@ -19,10 +19,13 @@ services:
       # Durable checkpointer on the named volume (ADR 0007 — must be persistent).
       CHECKPOINT_DB_PATH: /data/checkpoints.sqlite
 
-      # The LLM runs on the HOST (dev: http://localhost:8888/v1). Inside the container
-      # `localhost` is the container itself, so reach the host via host.docker.internal
-      # (see extra_hosts below). Point this at wherever your OpenAI-compatible endpoint lives.
-      OPENAI_BASE_URL: http://host.docker.internal:8888/v1
+      # OpenAI-compatible endpoint, read from .env/env like the rest. A remote endpoint
+      # (e.g. OpenRouter https://openrouter.ai/api/v1) works as-is. For a HOST-local LLM,
+      # `localhost` won't reach the host from inside the container: use
+      # http://host.docker.internal:8888/v1 — and on Linux (not Docker Desktop) also add
+      #   extra_hosts: ["host.docker.internal:host-gateway"]
+      # to this service so that name resolves.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_EXTRACTION_MODEL: ${OPENAI_EXTRACTION_MODEL:-}
       OPENAI_DISAMBIGUATION_MODEL: ${OPENAI_DISAMBIGUATION_MODEL:-}
       OPENAI_JUDGE_MODEL: ${OPENAI_JUDGE_MODEL:-}
@@ -54,11 +57,6 @@ services:
       LANGSMITH_TRACING: ${LANGSMITH_TRACING:-true}
       LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://apac.api.smith.langchain.com}
       LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-NotionMovieDBAgent}
-
-    # Reach the host's LLM endpoint from inside the container. host.docker.internal resolves
-    # automatically on Docker Desktop (macOS/Windows); this mapping makes it work on Linux too.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
     # Named volume for the SQLite checkpointer (ADR 0007). Survives container recreation, so a
     # paused `awaiting_input` graph resumes after a restart.

@@ -26,5 +26,5 @@ hooks: ## Install the git hooks (points core.hooksPath at .githooks)
 	git config core.hooksPath .githooks
 	@echo "core.hooksPath -> .githooks  (pre-push now runs 'make check')"
 
-secrets: ## Phase 10: project .env's secret keys into secrets/* for docker compose
+secrets: ## Phase 10: project every .env key into secrets/* for docker compose
 	sh scripts/gen-secrets.sh
