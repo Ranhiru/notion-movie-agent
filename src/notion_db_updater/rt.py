@@ -2,14 +2,15 @@
 
 The Rotten Tomatoes lane, modelled as its own compiled `StateGraph` and embedded as a single
 node (`rt`) in the parent enrichment graph. Embedding the *compiled subgraph* (rather than a
-flat function) is deliberate: it nests in LangSmith/Studio so the lane's internals are visible,
-and it's the structure Phase 8 grows into the full provider chain (Firecrawl → Tavily → Exa →
-Perplexity) by adding sibling provider nodes + conditional edges.
+flat function) is deliberate: it nests in LangSmith/Studio so the lane's internals are visible.
 
-**Firecrawl only** (fallback providers are Phase 8), two nodes:
-  firecrawl_provider → extract
-The provider discovers + scrapes the RT pages, surfacing ranked canonical candidates (each with
-inline markdown + identity). `extract` applies **hybrid escalation** (Phase 5): the common
+Two nodes:
+  rt_search → extract
+`rt_search` takes any injected `SearchClient` (ADR 0003, amended): the Phase 8 provider chain
+(Firecrawl ‖ Tavily ‖ Exa, round-robin) is a `RoundRobinSearchClient` composite passed here,
+so the chain grows *behind* this node — no sibling provider nodes, no topology change. The
+search client discovers + scrapes the RT pages, surfacing ranked canonical candidates (each
+with inline markdown + identity). `extract` applies **hybrid escalation** (Phase 5): the common
 single-match case is extracted inline (`with_structured_output` → `{plot, rt_critic,
 rt_audience}`); a >1 ambiguous set is deferred to the parent `resolve_rt` node, which
 correlates it against OMDb's identity (title/year **+ plot vs each candidate's synopsis**)
@@ -36,8 +37,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
-from .firecrawl import FirecrawlClient, RTHit
 from .models import Entry
+from .search import RTHit, SearchClient
 
 log = logging.getLogger(__name__)
 
@@ -150,20 +151,22 @@ async def extract_rt_page(llm: ChatOpenAI, markdown: str | None) -> RTPage:
     return page
 
 
-async def firecrawl_provider(state: RTState, *, firecrawl: FirecrawlClient) -> dict:
+async def rt_search(state: RTState, *, search: SearchClient) -> dict:
     """Discover + scrape the Entry's RT pages → ranked candidates. Best-effort: never raises.
 
-    Skips a blank Entry (`title is None`) so we don't search for "". A soft miss (no RT page)
-    or any Firecrawl error both resolve to an empty candidate list, so the lane degrades to
-    null scores rather than failing the Entry (ADR 0004).
+    Provider-agnostic (ADR 0003, amended): `search` is any `SearchClient` — a single provider
+    (Firecrawl / Tavily / Exa) or the round-robin composite — so the rotation chain grows
+    without changing this node. Skips a blank Entry (`title is None`) so we don't search "".
+    A soft miss (no RT page) or any provider error both resolve to an empty candidate list, so
+    the lane degrades to null scores rather than failing the Entry (ADR 0004).
     """
     entry = state.get("entry")
     if entry is None or entry.title is None:
         return {"rt_candidates": []}
     try:
-        candidates = await firecrawl.search_rt_candidates(entry.title, entry.media_type)
+        candidates = await search.search_rt_candidates(entry.title, entry.media_type)
     except Exception:  # noqa: BLE001 — RT must never block `done`; degrade to null scores
-        log.exception("rt: firecrawl failed for %r — degrading to null RT", entry.title)
+        log.exception("rt: search failed for %r — degrading to null RT", entry.title)
         candidates = []
     return {"rt_candidates": candidates}
 
@@ -195,17 +198,17 @@ async def extract(state: RTState, *, llm: ChatOpenAI) -> dict:
     }
 
 
-def build_rt_subgraph(firecrawl: FirecrawlClient, llm: ChatOpenAI):
-    """Compile `firecrawl_provider → extract` with the client + model bound into the nodes.
+def build_rt_subgraph(search: SearchClient, llm: ChatOpenAI):
+    """Compile `rt_search → extract` with the search client + model bound into the nodes.
 
-    Returned compiled graph is embedded as the `rt` node of the parent graph (see `graph.py`).
+    `search` is any `SearchClient` (ADR 0003, amended): a single provider or the round-robin
+    composite — the subgraph is provider-agnostic. Returned compiled graph is embedded as the
+    `rt` node of the parent graph (see `graph.py`).
     """
     g = StateGraph(RTState)
-    g.add_node(
-        "firecrawl_provider", functools.partial(firecrawl_provider, firecrawl=firecrawl)
-    )
+    g.add_node("rt_search", functools.partial(rt_search, search=search))
     g.add_node("extract", functools.partial(extract, llm=llm))
-    g.add_edge(START, "firecrawl_provider")
-    g.add_edge("firecrawl_provider", "extract")
+    g.add_edge(START, "rt_search")
+    g.add_edge("rt_search", "extract")
     g.add_edge("extract", END)
     return g.compile()

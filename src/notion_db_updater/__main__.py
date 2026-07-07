@@ -141,7 +141,7 @@ async def _generate_graph() -> None:
             judge_model(settings),
             disambiguation_model(settings),
         )
-        # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
+        # xray=True expands the RT subgraph inline (rt_search → extract) rather than
         # rendering `rt` as one opaque node — the point of the nested-lane visualization.
         graph.get_graph(xray=True).draw_mermaid_png(output_file_path="flow.png")
     print("wrote flow.png")
