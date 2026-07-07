@@ -684,29 +684,62 @@ layer (zero canonical candidates); a found-but-scoreless page ends the lane with
 Fan-out was rejected (burns ~3× quota per Entry — against the free-tier goal), as was
 single-pick-no-fallback (one soft miss would leave RT null until a manual re-run).
 
-- [ ] **Seam (pulled forward, pre-Phase-8):** new `search.py` with the `SearchClient`
+- [x] **Seam (pulled forward, pre-Phase-8):** new `search.py` with the `SearchClient`
       Protocol (`search_rt_candidates(title, media_type) -> list[RTHit]`, search-only — no
       lifecycle), `RTHit`, and the provider-agnostic ranking/slug helpers moved out of
       `firecrawl.py`. Rename the subgraph node + function `firecrawl_provider` → `rt_search`
       (parallel to `omdb_search`); `build_rt_subgraph` / `build_graph` take
       `search: SearchClient` instead of `firecrawl: FirecrawlClient`. `Runtime` still
       constructs/closes the concrete client. Pure refactor — zero behavior change.
-- [ ] Add `TavilyClient` + `ExaClient` as **full `SearchClient` peers** of Firecrawl
+      → `search.py` created (`RTHit`, `runtime_checkable SearchClient`, `rank_rt_hits` /
+      `pick_rt_hit` / `_slug_year` / `hits_to_rt`). Node + function `firecrawl_provider` →
+      `rt_search`; `build_rt_subgraph` / `build_graph` take `search: SearchClient`. `FirecrawlClient`
+      satisfies the Protocol structurally (proven via `isinstance`). Committed on its own (Commit 1).
+- [x] Add `TavilyClient` + `ExaClient` as **full `SearchClient` peers** of Firecrawl
       (search + inline content + the same candidate shaping — markdown-bearing `RTHit`s;
       parity is what makes rotation safe). Update the config default to
       `firecrawl,tavily,exa` and drop `PERPLEXITY_API_KEY` from `config.py` / `.env.example`.
-- [ ] **`RoundRobinSearchClient` composite** (itself a `SearchClient`), built from
+      → `tavily.py` (`/search`, `include_domains` + `include_raw_content`) + `exa.py` (`/search`,
+      `includeDomains` + `contents.text`), both thin httpx clients mirroring `FirecrawlClient`
+      (process-global `aiolimiter`, `aclose`). Retry centralized: `search.post_json` + `_retry_delay`
+      are the shared transient-retry loop all three providers use (Firecrawl refactored onto it).
+      Config default now `firecrawl,tavily,exa`; `PERPLEXITY_API_KEY` dropped; `TAVILY_RPM`/`EXA_RPM`
+      added. **Content-format caveat surfaced:** Tavily `raw_content` / Exa `text` are plaintext,
+      not Firecrawl markdown — the `rt.py` score/synopsis markers survive in text, but that parity
+      is the owner-run live check.
+- [x] **`RoundRobinSearchClient` composite** (itself a `SearchClient`), built from
       `SEARCH_PROVIDERS`: a process-local counter (unpersisted — approximate fairness across
       restarts is fine) rotates which provider goes *first* per Entry; the others remain
       fallbacks in rotation order. Advance on hard fail OR zero candidates; retry transient
       blips within a provider first; **first candidate wins** (short-circuit the rest). Log
       the winning provider per Entry (the graph shows one `rt_search` span, so the log line
       is the observability).
-- [ ] `Runtime` wires the composite when >1 provider is configured, the bare client when 1.
+      → `search.RoundRobinSearchClient`: `_next` cursor rotates the lead; iterates in rotation
+      order, advancing on a raised provider (hard fail — transient retries already exhausted in
+      `post_json`) OR an empty candidate list (soft miss); first non-empty wins + logs the winner;
+      all-empty → `[]` (best-effort null RT). Lifecycle stays on the concrete children.
+- [x] `Runtime` wires the composite when >1 provider is configured, the bare client when 1.
+      → New `providers.build_search_client(settings)` async-context-manager factory (maps provider
+      names → concrete clients, kept out of `search.py` to avoid the import cycle): bare client for
+      1, `RoundRobinSearchClient` for >1, unknown names skipped (fall back to bare Firecrawl),
+      closes every client on exit. Wired into `Runtime.__aenter__` (via the `AsyncExitStack`) and
+      the `--enrich`/`--generate-graph` CLI paths.
 
 **Verification:** across a 3-Entry sweep, each provider leads exactly once (winning-provider
 log lines); force the leading provider to hard-fail and to return zero candidates → the next
 in rotation runs; confirm first-candidate-wins short-circuits the rest. Fixtures per provider.
+→ **Offline-proven** (`make check` clean; scratchpad verify script, 20/20): rotation leads
+a→b→c across 3 entries then wraps; advance on hard-fail *and* zero-candidate with 'c' winning;
+first-candidate short-circuits (fallbacks untouched); all-empty → `[]`; composite + fakes
+satisfy `SearchClient`; `TavilyClient`/`ExaClient` map their response shapes → 1 canonical
+`RTHit` (drop `/reviews` deep link) with score markers preserved in the content; `build_search_client`
+yields composite (3) / bare (1) / firecrawl-fallback (unknown) and the graph compiles with each.
+Fixtures captured: `tests/fixtures/tavily_rt_search.json` + `exa_rt_search.json` (documented API
+shapes, illustrative content). **Live is owner-run** (Firecrawl/Tavily/Exa keys aren't in Claude's
+shell env): a 3-Entry `--reconcile` → each provider's "won for …" log line once; force the lead
+to hard-fail / return zero → the next in rotation runs; confirm each provider's plaintext content
+still carries the RT score markers `rt.py` anchors on. **Also drop `perplexity` from your local
+`.env` `SEARCH_PROVIDERS`** (skipped gracefully with a warning otherwise).
 
 ---
 

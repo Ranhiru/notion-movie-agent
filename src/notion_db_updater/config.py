@@ -76,15 +76,18 @@ class Settings(BaseSettings):
     # --- OMDb (metadata lane — Phase 2) ---
     OMDB_API_KEY: str = ""
 
-    # --- RT resolution providers (chain — Firecrawl primary in Phase 4, rest Phase 8) ---
+    # --- RT resolution providers (rotated-start chain — ADR 0003 amended; Phase 8) ---
+    # Firecrawl ‖ Tavily ‖ Exa are full SearchClient peers; RoundRobinSearchClient rotates
+    # which leads per Entry to spread load across their free tiers. Each has a per-minute cap
+    # (ADR 0013 — process-global aiolimiter + internal transient retry). Perplexity was dropped
+    # (three rotating providers already give redundancy — ADR 0003 amendment).
     FIRECRAWL_API_KEY: str = ""
-    # Firecrawl `/search` rate cap, requests/minute (ADR 0013 — Phase 7). The client throttles
-    # to this via a process-global aiolimiter and retries transient failures internally.
     FIRECRAWL_RPM: float = 10.0
     TAVILY_API_KEY: str = ""
+    TAVILY_RPM: float = 10.0
     EXA_API_KEY: str = ""
-    PERPLEXITY_API_KEY: str = ""
-    SEARCH_PROVIDERS: str = "firecrawl,tavily,exa,perplexity"
+    EXA_RPM: float = 10.0
+    SEARCH_PROVIDERS: str = "firecrawl,tavily,exa"
 
     # --- LLM endpoint (OpenAI-compatible — ADR 0011; used from Phase 4) ---
     OPENAI_BASE_URL: str = ""

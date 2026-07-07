@@ -39,7 +39,6 @@ from langgraph.types import Command
 
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
-from .firecrawl import FirecrawlClient
 from .graph import NOT_FOUND, build_graph
 from .llm import (
     disambiguation_model,
@@ -50,6 +49,7 @@ from .llm import (
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .providers import build_search_client
 from .resilience import transient_retry_policy
 
 log = logging.getLogger(__name__)
@@ -158,7 +158,6 @@ class Runtime:
         self._settings = settings or get_settings()
         self._notion = NotionClient(self._settings)
         self._omdb = OMDbClient(self._settings)
-        self._firecrawl = FirecrawlClient(self._settings)
         self._concurrency = self._settings.RECONCILE_CONCURRENCY
         # Single-flight: only one reconcile runs at a time (ADR 0001).
         self._lock = asyncio.Lock()
@@ -188,13 +187,16 @@ class Runtime:
         saver = await self._stack.enter_async_context(
             open_checkpointer(self._settings.CHECKPOINT_DB_PATH)
         )
+        # Phase 8 (ADR 0003): the RT search strategy — a bare provider or the round-robin
+        # composite — built from SEARCH_PROVIDERS; the exit stack closes its clients on aclose.
+        search = await self._stack.enter_async_context(build_search_client(self._settings))
         # Phase 7 (ADR 0013): one shared LLM rate limiter for all three role models (aggregate
         # cap on the single endpoint), and the transient-retry policy for the gating nodes.
         limiter = llm_rate_limiter(self._settings)
         self._graph = build_graph(
             self._notion,
             self._omdb,
-            self._firecrawl,
+            search,
             extraction_model(self._settings, limiter),
             judge_model(self._settings, limiter),
             disambiguation_model(self._settings, limiter),
@@ -207,10 +209,11 @@ class Runtime:
         await self.aclose()
 
     async def aclose(self) -> None:
-        await self._stack.aclose()  # closes the checkpointer's sqlite connection
+        # The exit stack closes the checkpointer's sqlite connection *and* the RT search
+        # clients (opened via build_search_client in __aenter__).
+        await self._stack.aclose()
         await self._notion.aclose()
         await self._omdb.aclose()
-        await self._firecrawl.aclose()
 
     async def reconcile(self, limit: int | None = None) -> ReconcileSummary:
         """Run one reconcile sweep, unless one is already in progress (then drop).

@@ -21,10 +21,19 @@ The concrete clients (`FirecrawlClient`, and the Phase 8 `TavilyClient` / `ExaCl
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
+
+import httpx
+from aiolimiter import AsyncLimiter
+
+from .resilience import TRANSIENT_STATUS
+
+log = logging.getLogger(__name__)
 
 # RT slugs often carry a disambiguating year suffix: /m/parasite_2019, /tv/dune_prophecy.
 _SLUG_YEAR = re.compile(r"_(\d{4})$")
@@ -125,3 +134,104 @@ def hits_to_rt(ranked: list[dict]) -> list[RTHit]:
         )
         for h in ranked
     ]
+
+
+def _retry_delay(exc: httpx.HTTPStatusError | None, attempt: int) -> float:
+    """Seconds to wait before the next retry: server `Retry-After` on a 429, else backoff.
+
+    Exponential backoff (`0.5·2^attempt`, capped at 30s) mirrors the node RetryPolicy's
+    defaults; a 429's `Retry-After` header wins when present (honored like `NotionClient`).
+    """
+    if exc is not None and exc.response.status_code == 429:
+        try:
+            return float(exc.response.headers.get("Retry-After", "1"))
+        except ValueError:
+            pass
+    return min(0.5 * 2**attempt, 30.0)
+
+
+async def post_json(
+    client: httpx.AsyncClient,
+    path: str,
+    body: dict,
+    *,
+    limiter: AsyncLimiter,
+    max_retries: int,
+) -> dict:
+    """POST `body` to `path`, acquiring `limiter`, with the shared transient-retry loop.
+
+    The one place every search provider's "retry within the provider" lives (ADR 0003 / 0013):
+    each attempt takes a limiter slot (process-global throttle); a **transient** failure
+    (429 / 5xx / transport) is retried up to `max_retries`, honoring `Retry-After` on a 429 and
+    exponential backoff otherwise. A non-transient error (a 4xx, a parse failure) or exhausted
+    retries raises — the RT subgraph swallows that as best-effort (ADR 0004), so a transient
+    blip never leaks up to fail the Entry. Structurally mirrors `NotionClient._request`.
+    """
+    for attempt in range(max_retries):
+        try:
+            async with limiter:
+                resp = await client.post(path, json=body)
+            resp.raise_for_status()
+        except httpx.TransportError:
+            if attempt + 1 >= max_retries:
+                raise
+            await asyncio.sleep(_retry_delay(None, attempt))
+            continue
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in TRANSIENT_STATUS or attempt + 1 >= max_retries:
+                raise
+            await asyncio.sleep(_retry_delay(exc, attempt))
+            continue
+        return resp.json()
+    raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
+
+
+class RoundRobinSearchClient:
+    """A `SearchClient` that rotates a start over a chain of provider clients (ADR 0003).
+
+    Built from the ordered `SEARCH_PROVIDERS` list. Distributes RT-search load across the free
+    tiers: a process-local counter rotates *which provider goes first* per Entry; the rest
+    remain fallbacks in rotation order. The chain advances to the next provider on **either** a
+    hard failure (the provider raised — a non-transient error, or transient retries exhausted
+    inside `post_json`) **or** a soft miss (it returned zero candidates). The **first provider
+    to surface ≥1 candidate wins and short-circuits the rest**; if all come up empty, the RT
+    lane gets an empty list (best-effort null RT — does not block `done`).
+
+    The counter is in-process and unpersisted: approximate distribution across restarts is fine
+    (the goal is spreading load, not exact fairness). The graph shows one `rt_search` span, so
+    the per-Entry "which provider won" is surfaced via the log line here, not a LangSmith node.
+
+    Lifecycle stays on the concrete children (constructed + closed by `Runtime`); this is a
+    pure strategy wrapper over them.
+    """
+
+    def __init__(self, providers: list[tuple[str, SearchClient]]) -> None:
+        if not providers:
+            raise ValueError("RoundRobinSearchClient needs at least one provider")
+        self._providers = providers
+        self._next = 0  # rotation cursor: index of the provider that leads the next Entry
+
+    async def search_rt_candidates(
+        self, title: str, media_type: str | None = None
+    ) -> list[RTHit]:
+        n = len(self._providers)
+        start = self._next % n
+        self._next = (self._next + 1) % n  # advance the lead for the next Entry
+        order = [self._providers[(start + i) % n] for i in range(n)]
+        for name, client in order:
+            try:
+                candidates = await client.search_rt_candidates(title, media_type)
+            except Exception:  # noqa: BLE001 — a provider hard-fail advances the chain
+                log.warning("rt_search: provider %s failed for %r — trying next", name, title)
+                continue
+            if candidates:
+                log.info(
+                    "rt_search: provider %s won for %r (%d candidate(s))",
+                    name,
+                    title,
+                    len(candidates),
+                )
+                return candidates
+            log.info("rt_search: provider %s soft-missed for %r — trying next", name, title)
+        log.info("rt_search: all providers came up empty for %r — null RT", title)
+        return []
