@@ -42,3 +42,19 @@ that does.
 
 - Develop against a free local model; switch to OpenRouter by changing two env vars.
 - Three model knobs in `.env`; experimentation is a config change, not a code change.
+
+## Amendment — per-role reasoning effort (2026)
+
+The 2026 hosted "flash/mini/nano" tiers are **reasoning-first** — Gemini 3.x Flash and the
+GPT-5.x line default to internal thinking. For our `temperature=0` extract/pick/audit calls
+that thinking is pure cost + latency, and an unbounded think-stream re-opens the exact hung-
+sweep failure `OPENAI_MAX_TOKENS` exists to bound. So each role gains an
+`OPENAI_*_REASONING_EFFORT` knob, sent to OpenRouter as `extra_body={"reasoning": {"effort": …}}`.
+
+- **Empty = omit the field** (the default). A local llama.cpp/unsloth server rejects an unknown
+  `reasoning` field, so the knob is opt-in and only meaningful against OpenRouter.
+- Mechanical roles (extraction, disambiguation) → `none`/`minimal`; the judge's plausibility
+  check earns `low`. This *is* the "cheap model for extraction, stronger for the judge" split
+  from above, now also expressed as reasoning budget, not just model choice.
+- Recommended OpenRouter models: `openai/gpt-5.4-nano` for extraction/disambiguation,
+  `google/gemini-3-flash-preview` for the judge (see `.env.example`).
