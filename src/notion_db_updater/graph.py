@@ -9,12 +9,16 @@ on without a port. The lane splits after `read_page` and rejoins at `assemble`:
                 │       │ (unsure / fail-safe)          ↑            │
                 │   await_human ──(interrupt() ↔ resume)┘            │
                 └─ rt ──────────────────────────────────────────────┴─→ assemble
-                                                    → resolve_rt → judge → update_notion → END
+                                    → resolve_rt → judge → update_notion → notify → END
 
-- **Fan-out** = two edges out of `read_page`; **fan-in** = two edges into `assemble`, which
-  LangGraph holds until *both* lanes complete (a barrier — proven in spike 02). The OMDb lane
-  is now variable-length (and can *pause*) but always terminates at `omdb_details`, so the
-  fan-in stays a clean two-edge join (no conditional edge lands on `assemble`).
+- **Fan-out** = two edges out of `read_page`; **fan-in** = two edges into `assemble`. The OMDb
+  lane is variable-length (and can *pause*) but always terminates at `omdb_details`, so the
+  fan-in stays a clean two-edge join (no conditional edge lands on `assemble`). Because that
+  lane is structurally *longer* than the single-node `rt` lane, its two edges reach `assemble`
+  in different supersteps; `assemble` is declared `defer=True` so LangGraph holds it as a
+  **true barrier** until *both* lanes finish and runs the post-fan-in tail (resolve_rt → judge
+  → update_notion → notify) exactly once (without defer the join re-fires per arriving edge —
+  latent before Phase 9's `notify`, which must post the Slack ping only once).
 - The two lanes write **disjoint** state channels (omdb → status + imdb/plot/genre + identity;
   rt → rt_* scores/identity/candidates), so the concurrent fan-out needs no reducer.
 - **OMDb disambiguation (ADR 0008 role 2):** `omdb_search` surfaces the full OMDb candidate
@@ -39,6 +43,11 @@ on without a port. The lane splits after `read_page` and rejoins at `assemble`:
   `resolve_rt` correlates a >1 RT candidate set against OMDb's resolved identity; `judge` is
   the LLM-as-judge, building the `EnrichedEntry` output contract and emitting a trace-only
   `confidence` (ADR 0008).
+- **Phase 9 — Slack `/add` (ADR 0012):** `notify` is a terminal node after `update_notion`. It
+  no-ops for a Notion-origin sweep row and posts a Slack completion ping for a `slack`-origin
+  `/add` run (durable notify context in state → fires on the initial run, a resume, or the 6d
+  auto-resolve alike). The `/add` create-then-enrich orchestration itself lives out-of-band in
+  `Runtime` (app.py); the graph is reused unchanged apart from this terminal ping.
 
 Transient OMDb errors still propagate (nothing written → Entry stays pending; RetryPolicy is
 Phase 7). The RT lane, `resolve_rt`, and `judge` all swallow their own errors (best-effort;
@@ -56,6 +65,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import Awaitable, Callable
 from typing import NotRequired, TypedDict
 
 from langchain_openai import ChatOpenAI
@@ -65,7 +75,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, Field
 
-from .models import Entry, enrichment_properties
+from .models import Entry, enrichment_properties, notion_type_value
 from .notion import NotionClient
 from .omdb import Candidate, OMDbClient, details_fields, normalize_title
 from .rt import build_rt_subgraph, extract_rt_page, synopsis_region
@@ -78,6 +88,33 @@ log = logging.getLogger(__name__)
 # candidates, resumed to a terminal `failed` (a genuinely nonexistent title, presumed so once
 # it ages out unanswered — the 6d stale-interrupt pass). Distinct from any real imdbID.
 NOT_FOUND = "__not_found__"
+
+# The `/add` origin value; a Notion-origin sweep row leaves `origin` unset (treated as sweep).
+SLACK_ORIGIN = "slack"
+
+
+class CompletionNotifier:
+    """Late-bound Slack completion poster injected into the `notify` graph node (Phase 9).
+
+    The graph is compiled in `Runtime.__aenter__`, *before* `SlackTransport` exists (the two
+    are mutually referential — the same constraint the picker notifier has). So the notifier is
+    bound into the node at compile time as this empty holder, and `_serve` populates its `post`
+    callable once Slack is wired. Unbound (CLI / no Slack) → a no-op, so a `slack`-origin run
+    driven from `--add` or a Slack-less process simply skips the ping.
+    """
+
+    def __init__(self) -> None:
+        # (channel, text) → coroutine that posts to Slack. None until _serve binds it.
+        self._post: Callable[[str, str], Awaitable[None]] | None = None
+
+    def bind(self, post: Callable[[str, str], Awaitable[None]]) -> None:
+        self._post = post
+
+    async def notify(self, channel: str, text: str) -> None:
+        if self._post is None:
+            log.info("notify: no Slack notifier bound — skipping completion ping")
+            return
+        await self._post(channel, text)
 
 
 class EnrichmentState(TypedDict):
@@ -113,6 +150,13 @@ class EnrichmentState(TypedDict):
     rt_audience: NotRequired[int | None]  # Popcornmeter — written by the RT lane (best-effort)
     status: NotRequired[str]  # done | failed | pending
     note: NotRequired[str]  # why failed / deferred — surfaced in the LangSmith trace
+    # Phase 9 (ADR 0012): the second entry point. `origin` distinguishes a Slack `/add` run
+    # from the Notion sweep; the notify context is the Slack target for the terminal `notify`.
+    # Set in the initial state dict at invoke time (not via Command), so all three are
+    # checkpointed and survive the interrupt/resume/restart. Absent → treated as a sweep row.
+    origin: NotRequired[str]  # "slack" for /add; unset/other → sweep (notify no-ops)
+    notify_channel: NotRequired[str | None]  # Slack channel to post the completion ping to
+    notify_user: NotRequired[str | None]  # Slack user who ran /add (for the @mention)
     # Phase 6d: set by the 7-day stale-interrupt auto-resolve before Command(resume=best_guess)
     # so `judge` grades an unconfirmed best-guess `confidence=low` (flagged for review) without
     # an LLM call. Trace-only, like all Judge output — never written to Notion.
@@ -526,17 +570,80 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
 
     RT scores are written alongside IMDb/plot/genre but are null-safe: a soft-miss RT simply
     isn't written and never changes the OMDb-decided status (ADR 0004 — RT can't block `done`).
+
+    Phase 9 (ADR 0012): for a resolved `slack`-origin row (a `/add`), the agent also backfills
+    the Notion `Type` select from the resolved `media_type` — a Notion-origin sweep row has
+    `Type` human-filled, so we never overwrite it (`notion_type` stays None there).
     """
+    enriched = state.get("enriched")
+    notion_type = (
+        notion_type_value(enriched.media_type)
+        if state.get("origin") == SLACK_ORIGIN and enriched is not None
+        else None
+    )
     props = enrichment_properties(
         imdb_rating=state.get("imdb_rating"),
         plot=state.get("plot"),
         genre=state.get("genre"),
         rt_critic=state.get("rt_critic"),
         rt_audience=state.get("rt_audience"),
+        notion_type=notion_type,
         status=state.get("status", "pending"),
     )
     entry = await notion.update_entry(state["page_id"], props)
     return {"entry": entry}
+
+
+def _completion_message(state: EnrichmentState) -> str | None:
+    """Build the Slack completion ping for a resolved `/add` run, or None if there's nothing.
+
+    `done` → the enrichment summary (IMDb / RT / genre); `failed` → a not-found notice. Any
+    other terminal status (shouldn't happen on a resolved run) yields None → no ping.
+    """
+    user = state.get("notify_user")
+    who = f"<@{user}> " if user else ""
+    status = state.get("status")
+    enriched = state.get("enriched")
+    entry = state.get("entry")
+    title = (enriched.title if enriched else None) or (entry.title if entry else None) or "it"
+    if status == "done" and enriched is not None:
+        year = f" ({enriched.year})" if enriched.year else ""
+        imdb = f"IMDb {enriched.imdb_rating}" if enriched.imdb_rating is not None else "IMDb —"
+        rt = f"RT {enriched.rt_critic}/{enriched.rt_audience}"
+        genre = f" · _{enriched.genre}_" if enriched.genre else ""
+        link = (
+            f"  <https://www.imdb.com/title/{enriched.imdb_id}/|↗>" if enriched.imdb_id else ""
+        )
+        return f"✅ {who}added *{title}*{year} — {imdb} · {rt}{genre}{link}"
+    if status == "failed":
+        return f"❌ {who}couldn't find *{title}* — marked failed."
+    return None
+
+
+async def notify(state: EnrichmentState, *, notifier: CompletionNotifier) -> dict:
+    """Terminal node (Phase 9 / ADR 0012): post a Slack completion ping for a `/add` run.
+
+    No-ops for a Notion-origin sweep row (`origin != "slack"`) — the vast majority of runs.
+    For a `slack`-origin run it posts the done/failed summary to the stored `notify_channel`
+    via `chat_postMessage` (not the slash `response_url`, which expires — a run may only reach
+    here days later, after a Slack disambiguation click or the 6d auto-resolve). Best-effort:
+    a Slack failure is swallowed so a ping never fails an Entry already written to Notion
+    (`update_notion` ran first). Runs after `update_notion` on *every* terminal path, so it
+    fires on the initial invoke, a resume, and the auto-resolve alike.
+    """
+    if state.get("origin") != SLACK_ORIGIN:
+        return {}
+    channel = state.get("notify_channel")
+    if not channel:
+        return {}
+    message = _completion_message(state)
+    if message is None:
+        return {}
+    try:
+        await notifier.notify(channel, message)
+    except Exception:  # noqa: BLE001 — best-effort ping; never fail a written Entry over Slack
+        log.exception("notify: failed to post completion ping for %s", state["page_id"])
+    return {}
 
 
 def build_graph(
@@ -548,6 +655,7 @@ def build_graph(
     disambiguation_llm: ChatOpenAI,
     checkpointer: BaseCheckpointSaver | None = None,
     retry_policy: RetryPolicy | None = None,
+    completion_notifier: CompletionNotifier | None = None,
 ) -> CompiledStateGraph:
     """Compile the fan-out/fan-in enrichment graph with clients + models bound into the nodes.
 
@@ -555,6 +663,9 @@ def build_graph(
     in LangSmith/Studio and grows into Phase 8's provider chain in place. `judge_llm` drives
     both the post-fan-in `resolve_rt` correlation and the `judge` node (Phase 5);
     `disambiguation_llm` drives the Phase-6a `disambiguate` pre-filter (ADR 0008 role 2).
+
+    `completion_notifier` (Phase 9 / ADR 0012) is the late-bound Slack poster the terminal
+    `notify` node uses for `/add` runs; pass `None` (CLI / no Slack) for a no-op node.
 
     `checkpointer` is an `AsyncSqliteSaver` (ADR 0006 / 0007) when durable execution is wanted
     (the reconcile Runtime, and single-Entry `--enrich`/`--resume`); pass `None` for pure
@@ -589,13 +700,27 @@ def build_graph(
         retry_policy=retry_policy,
     )
     g.add_node("rt", rt_subgraph)  # compiled subgraph as a node (shared keys: entry, rt_*)
-    g.add_node("assemble", assemble)
+    # `defer=True` makes `assemble` a *true* fan-in barrier: the OMDb lane is structurally
+    # longer than the RT lane (omdb_search → [disambiguate] → omdb_details vs a single `rt`
+    # node), so the two edges into `assemble` land in *different* supersteps. Without defer,
+    # LangGraph's Pregel model fires `assemble` once per arriving edge — running the whole
+    # post-fan-in tail (resolve_rt → judge → update_notion → notify) *twice*. That was latent
+    # before Phase 9 (idempotent `update_notion`, trace-only `judge` — though it did silently
+    # double the judge LLM call), but the Phase-9 `notify` node would double-post the Slack
+    # ping. `defer` holds `assemble` until every task that can reach it is done → runs once.
+    g.add_node("assemble", assemble, defer=True)
     g.add_node("resolve_rt", functools.partial(resolve_rt, llm=judge_llm))
     g.add_node("judge", functools.partial(judge, llm=judge_llm))
     g.add_node(
         "update_notion",
         functools.partial(update_notion, notion=notion),
         retry_policy=retry_policy,
+    )
+    # Phase 9: terminal notify node. No RetryPolicy — it's best-effort (swallows its own Slack
+    # errors); a node-level retry would serve no purpose. No-op notifier when Slack is absent.
+    g.add_node(
+        "notify",
+        functools.partial(notify, notifier=completion_notifier or CompletionNotifier()),
     )
 
     g.add_edge(START, "read_page")
@@ -615,6 +740,9 @@ def build_graph(
     g.add_edge("assemble", "resolve_rt")  # linear post-fan-in; nodes self-guard on status
     g.add_edge("resolve_rt", "judge")
     g.add_edge("judge", "update_notion")
-    g.add_edge("update_notion", END)
+    g.add_edge(
+        "update_notion", "notify"
+    )  # Phase 9: terminal Slack ping (no-op for sweep rows)
+    g.add_edge("notify", END)
 
     return g.compile(checkpointer=checkpointer)

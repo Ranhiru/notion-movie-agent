@@ -1,0 +1,16 @@
+{
+  "_comment": "Illustrative Slack `/add` slash-command payload delivered over Socket Mode (Phase 9 / ADR 0012). The handler reads `text` (the title), `channel_id` (where to post the completion ping), and `user_id` (for the @mention). `response_url` is deliberately NOT used — it expires ~30 min / 5 uses, and a run can sit in HITL for days; completions go via chat_postMessage instead.",
+  "token": "verification-token",
+  "team_id": "T0001",
+  "team_domain": "revity",
+  "channel_id": "C0NOTIONMOVIE",
+  "channel_name": "notion-movie-db",
+  "user_id": "U0EXAMPLE",
+  "user_name": "jude",
+  "command": "/add",
+  "text": "Dune",
+  "api_app_id": "A0EXAMPLE",
+  "is_enterprise_install": "false",
+  "response_url": "https://hooks.slack.com/commands/T0001/1234567890/expiring-token",
+  "trigger_id": "1234567890.0987654321.abcdef"
+}

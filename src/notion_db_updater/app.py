@@ -39,7 +39,7 @@ from langgraph.types import Command
 
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
-from .graph import NOT_FOUND, build_graph
+from .graph import NOT_FOUND, SLACK_ORIGIN, CompletionNotifier, build_graph
 from .llm import (
     disambiguation_model,
     extraction_model,
@@ -126,6 +126,22 @@ class ResumeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AddOutcome:
+    """Result of a Slack `/add` create-then-enrich (Phase 9 / ADR 0012).
+
+    `status` is the terminal graph status (`done` / `failed`) or `awaiting_input` when the run
+    paused for human disambiguation — enough for the `--add` CLI / the slash handler to report
+    what happened to the freshly-created `page_id`. The completion *ping* itself is posted by
+    the graph's `notify` node, not from here (a paused run resolves much later).
+    """
+
+    page_id: str
+    status: str
+    title: str | None = None
+    year: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StaleSummary:
     """Outcome tally for one stale-interrupt auto-resolve pass (Phase 6d)."""
 
@@ -169,6 +185,12 @@ class Runtime:
         # Optional interrupt notifier (Phase 6c): set to `SlackTransport.post_picker` so a
         # paused run posts its candidate picker to Slack. Left None (no notification) for CLI.
         self._notifier: Callable[[str, dict], Awaitable[None]] | None = None
+        # Phase 9 (ADR 0012): the terminal `notify` node's late-bound Slack poster (bound by
+        # `_serve` once the transport exists) and the process-global in-flight guard — page_ids
+        # currently being enriched out-of-band by a `/add`, which the sweep must skip so a
+        # concurrent cron doesn't double-enrich the same still-`pending` row.
+        self._completion_notifier = CompletionNotifier()
+        self._inflight: set[str] = set()
 
     def set_notifier(self, notifier: Callable[[str, dict], Awaitable[None]]) -> None:
         """Register the interrupt notifier (`page_id`, payload) → posts the HITL picker.
@@ -178,6 +200,15 @@ class Runtime:
         the two are wired after the Runtime is entered.
         """
         self._notifier = notifier
+
+    def bind_completion_notifier(self, post: Callable[[str, str], Awaitable[None]]) -> None:
+        """Bind the Slack completion poster the terminal `notify` node uses (Phase 9).
+
+        Wired by `_serve` to `SlackTransport.post_completion` after the transport is built (the
+        graph — and its `notify` node's holder — is already compiled by then). Until bound, the
+        node no-ops, so a Slack-less process or a `--add` CLI run simply skips the ping.
+        """
+        self._completion_notifier.bind(post)
 
     async def __aenter__(self) -> Runtime:
         # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
@@ -202,6 +233,7 @@ class Runtime:
             disambiguation_model(self._settings, limiter),
             checkpointer=saver,
             retry_policy=transient_retry_policy(self._settings.RETRY_MAX_ATTEMPTS),
+            completion_notifier=self._completion_notifier,  # Phase 9 terminal notify node
         )
         return self
 
@@ -234,6 +266,17 @@ class Runtime:
 
     async def _sweep(self, limit: int | None = None) -> ReconcileSummary:
         entries = await self._notion.query_entries()
+        # Phase 9 (ADR 0012): skip any row a `/add` is enriching out-of-band right now — it's
+        # still `pending` (its terminal write hasn't landed), so it matches the sweep filter,
+        # but re-enriching it would double external-API spend (the hazard ADR 0001 prevents).
+        # Crash-safe: on a crash the set vanishes and the row is still `pending`, so the next
+        # cron reclaims it (ADR 0004 self-heal — no `enriching` Notion status needed).
+        if self._inflight:
+            before = len(entries)
+            entries = [e for e in entries if e.page_id not in self._inflight]
+            skipped = before - len(entries)
+            if skipped:
+                log.info("reconcile: skipping %d entry(ies) enriching out-of-band", skipped)
         if limit is not None:
             log.info("reconcile: %d entries match; limiting to first %d", len(entries), limit)
             entries = entries[:limit]
@@ -297,26 +340,7 @@ class Runtime:
                 final_state = await self._graph.ainvoke(
                     {"page_id": entry.page_id}, config=config
                 )
-                interrupts = final_state.get("__interrupt__")
-                if interrupts:
-                    # Paused for human disambiguation (Phase 6b). The run is checkpointed
-                    # under thread_id = page_id; mark the Entry awaiting_input so the next
-                    # sweep skips it (the filter queries empty/pending only) and an
-                    # out-of-band resume finishes it. `update_notion` never ran → write here.
-                    await self._notion.update_entry(
-                        entry.page_id, enrichment_properties(status=_AWAITING)
-                    )
-                    # Post the HITL picker (Phase 6c), if a notifier is wired. Best-effort: a
-                    # Slack failure must not fail the sweep — the row stays awaiting_input and
-                    # the next `@movie-bot run` (or manual --enrich) can re-prompt.
-                    if self._notifier is not None:
-                        try:
-                            await self._notifier(entry.page_id, interrupts[0].value)
-                        except Exception:
-                            log.exception("reconcile: failed to notify for %s", entry.page_id)
-                    log.info(
-                        "reconcile: %r (%s) awaiting human input", entry.title, entry.page_id
-                    )
+                if await self._handle_pause(entry, final_state):
                     return _AWAITING
                 return final_state.get("status", "pending")
             except Exception:
@@ -326,6 +350,87 @@ class Runtime:
                     entry.page_id,
                 )
                 return _TRANSIENT
+
+    async def _handle_pause(self, entry: Entry, final_state: dict) -> bool:
+        """If a run paused at `interrupt()`: mark awaiting_input + post the picker. → paused?
+
+        Shared by the reconcile sweep (`_run_one`) and the Phase-9 out-of-band `/add`
+        (`create_and_enrich`), so a `/add` that turns ambiguous pauses and prompts in Slack
+        exactly like a swept row (ADR 0006 / 0012). The run is checkpointed under
+        `thread_id = page_id`; `update_notion` never ran, so we write `awaiting_input` here so
+        the next sweep skips it (the filter queries empty/pending only) and an out-of-band
+        resume finishes it. Posting the picker is best-effort — a Slack failure must not fail
+        the caller; the row stays awaiting_input for the next `@movie-bot run` / `--enrich`.
+        Returns True when it handled a pause, False for a terminal run.
+        """
+        interrupts = final_state.get("__interrupt__")
+        if not interrupts:
+            return False
+        await self._notion.update_entry(entry.page_id, enrichment_properties(status=_AWAITING))
+        if self._notifier is not None:
+            try:
+                await self._notifier(entry.page_id, interrupts[0].value)
+            except Exception:
+                log.exception("failed to post HITL picker for %s", entry.page_id)
+        log.info("%r (%s) awaiting human input", entry.title, entry.page_id)
+        return True
+
+    async def find_duplicate(self, title: str) -> Entry | None:
+        """Best-effort pre-create dedupe for `/add` (Phase 9): an existing Entry, or None."""
+        return await self._notion.find_by_title(title)
+
+    async def create_and_enrich(
+        self, title: str, *, channel: str | None = None, user: str | None = None
+    ) -> AddOutcome:
+        """Create a Watchlist page from `/add` and enrich it out-of-band (Phase 9 / ADR 0012).
+
+        Creates the page (Entry only, `pending`), then runs the *same* enrichment graph on its
+        `page_id` — but **without** the single-flight lock (the lock serializes sweep-vs-sweep;
+        this is an interactive, one-page run). Instead the `page_id` is held in the in-flight
+        guard for the whole run so a concurrent cron sweep skips it (`_sweep`), closing the
+        double-enrich hazard ADR 0012 calls out. `origin=slack` + the notify context ride in on
+        the initial state (checkpointed → durable across the interrupt/resume), so the terminal
+        `notify` node posts the completion ping — even if the run only resolves days later.
+
+        Returns an `AddOutcome`; a run that turns ambiguous pauses at `interrupt()`
+        (`awaiting_input`) and posts the HITL picker via `_handle_pause`, resolved later by a
+        Slack click / the 6d timeout — same as a swept row.
+        """
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        entry = await self._notion.create_entry(title)
+        page_id = entry.page_id
+        log.info("add: created page %s for %r — enriching out-of-band", page_id, title)
+        # Hold the page_id in-flight until its terminal/awaiting_input write lands (inside
+        # _handle_pause or update_notion), so the sweep never sees it while still `pending`.
+        self._inflight.add(page_id)
+        try:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": page_id},
+                "run_name": title,
+                "metadata": {"page_id": page_id, "origin": SLACK_ORIGIN},
+            }
+            if self._settings.GRAPH_MAX_CONCURRENCY > 0:
+                config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
+            final_state = await self._graph.ainvoke(
+                {
+                    "page_id": page_id,
+                    "origin": SLACK_ORIGIN,
+                    "notify_channel": channel,
+                    "notify_user": user,
+                },
+                config=config,
+            )
+            if await self._handle_pause(entry, final_state):
+                return AddOutcome(page_id=page_id, status=_AWAITING, title=title)
+            result = ResumeResult.from_state(final_state)
+            return AddOutcome(
+                page_id=page_id,
+                status=result.status,
+                title=result.title or title,
+                year=result.year,
+            )
+        finally:
+            self._inflight.discard(page_id)
 
     async def resume(
         self, page_id: str, chosen_imdb_id: str, *, auto_resolved: bool = False
