@@ -1,0 +1,17 @@
+{
+  "_comment": "Exa POST /search response shape (includeDomains=[rottentomatoes.com], contents={text:true}) for 'Dune: Part Two'. ExaClient maps results[].{url,title,text} → the shared {url,title,markdown} dicts → rank_rt_hits keeps the canonical /m/ page and drops the /reviews deep link. text carries the RT score markers the rt.py extractor anchors on. Captured-shape fixture (documented API shape + illustrative content, NOT a live snapshot — owner captures a real one live per TASKS Phase 8).",
+  "requestId": "b1c2d3e4",
+  "results": [
+    {
+      "title": "Dune: Part Two - Rotten Tomatoes",
+      "url": "https://www.rottentomatoes.com/m/dune_part_two",
+      "publishedDate": "2024-03-01",
+      "text": "Dune: Part Two\n\nTomatometer 92%\n\nPopcornmeter 95%\n\nMovie Info\n\nPaul Atreides unites with the Fremen to wage war against House Harkonnen."
+    },
+    {
+      "title": "Dune: Part Two - Reviews - Rotten Tomatoes",
+      "url": "https://www.rottentomatoes.com/m/dune_part_two/reviews",
+      "text": "Dune: Part Two - Critic Reviews\n\nAll critics ..."
+    }
+  ]
+}

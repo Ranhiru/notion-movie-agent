@@ -65,12 +65,12 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, Field
 
-from .firecrawl import FirecrawlClient, RTHit
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
 from .omdb import Candidate, OMDbClient, details_fields, normalize_title
 from .rt import build_rt_subgraph, extract_rt_page, synopsis_region
 from .schema import Confidence, EnrichedEntry, normalize_media_type
+from .search import RTHit, SearchClient
 
 log = logging.getLogger(__name__)
 
@@ -542,7 +542,7 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
 def build_graph(
     notion: NotionClient,
     omdb_client: OMDbClient,
-    firecrawl: FirecrawlClient,
+    search: SearchClient,
     extraction_llm: ChatOpenAI,
     judge_llm: ChatOpenAI,
     disambiguation_llm: ChatOpenAI,
@@ -569,7 +569,7 @@ def build_graph(
     internally, below its swallow; a node RetryPolicy's exhaustion-raise would break "RT never
     blocks `done`") nor `await_human` / `assemble` (no external calls). `None` → no retries.
     """
-    rt_subgraph = build_rt_subgraph(firecrawl, extraction_llm)
+    rt_subgraph = build_rt_subgraph(search, extraction_llm)
 
     g = StateGraph(EnrichmentState)
     # Gating nodes carry the RetryPolicy (ADR 0013); best-effort / no-IO nodes don't.

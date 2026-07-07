@@ -21,17 +21,13 @@ this); the spike's 4/4 was *with* year.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
-from dataclasses import dataclass
-from urllib.parse import urlparse
 
 import httpx
 from aiolimiter import AsyncLimiter
 
 from .config import Settings
-from .resilience import TRANSIENT_STATUS
+from .search import RTHit, hits_to_rt, post_json, rank_rt_hits
 
 log = logging.getLogger(__name__)
 
@@ -39,66 +35,6 @@ _API = "https://api.firecrawl.dev/v2"
 
 # maxAge (ms): serve from Firecrawl's cache if the page was scraped < 1 week ago.
 _WEEK_MS = 7 * 24 * 60 * 60 * 1000
-
-# RT slugs often carry a disambiguating year suffix: /m/parasite_2019, /tv/dune_prophecy.
-_SLUG_YEAR = re.compile(r"_(\d{4})$")
-
-
-@dataclass(frozen=True, slots=True)
-class RTHit:
-    """One canonical Rotten Tomatoes title page discovered by the RT lane.
-
-    Carries the page *identity* (`url`, `title`, `year`) the Judge needs to correlate against
-    OMDb's resolved identity (ADR 0003 / 0008), plus the `markdown` Firecrawl scraped inline
-    (already paid for) so score extraction can run without a second fetch. `year` is parsed
-    from the RT slug (`/m/parasite_2019`) when present, else None.
-    """
-
-    url: str
-    title: str
-    year: int | None
-    markdown: str | None
-
-
-def _slug_year(url: str) -> int | None:
-    """Parse the trailing `_YYYY` year off an RT slug, or None when absent."""
-    slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
-    match = _SLUG_YEAR.search(slug)
-    return int(match.group(1)) if match else None
-
-
-def rank_rt_hits(hits: list[dict], media_type: str | None = None) -> list[dict]:
-    """Rank the canonical Rotten Tomatoes title pages among search hits, best first.
-
-    Keeps only bare `/m/<slug>` or `/tv/<slug>` pages (2 path segments), dropping deep links
-    like `/m/<slug>/reviews`. When `media_type` is known, biases toward the matching path
-    (`Movie` → `/m/`, `TV Show` → `/tv/`) — the parallel RT lane's only disambiguator, since it
-    has no year. Returns the ranked list (empty on a soft miss); Phase 5's `resolve_rt`
-    correlates the top-N against OMDb's identity when more than one is in contention.
-    """
-    preferred = {"Movie": "/m/", "TV Show": "/tv/"}.get(media_type or "")
-    scored: list[tuple[int, dict]] = []
-    for h in hits:
-        parsed = urlparse(h.get("url", ""))
-        path = parsed.path
-        if not parsed.netloc.lower().endswith("rottentomatoes.com"):
-            continue
-        if not (path.startswith("/m/") or path.startswith("/tv/")):
-            continue
-        canonical = path.rstrip("/").count("/") == 2  # /m/slug, not /m/slug/reviews
-        if not canonical:
-            continue  # only canonical title pages are candidates (deep links can't score)
-        on_type = preferred is not None and path.startswith(preferred)
-        # Lower rank sorts first: matching media type wins.
-        scored.append((0 if on_type else 1, h))
-    scored.sort(key=lambda t: t[0])
-    return [h for _, h in scored]
-
-
-def pick_rt_hit(hits: list[dict], media_type: str | None = None) -> dict | None:
-    """The single best canonical RT page (deterministic fast path), or None on a soft miss."""
-    ranked = rank_rt_hits(hits, media_type)
-    return ranked[0] if ranked else None
 
 
 class FirecrawlClient:
@@ -134,30 +70,13 @@ class FirecrawlClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    @staticmethod
-    def _retry_delay(exc: httpx.HTTPStatusError | None, attempt: int) -> float:
-        """Seconds to wait before the next retry: server `Retry-After` on a 429, else backoff.
-
-        Exponential backoff (`0.5·2^attempt`, capped at 30s) mirrors the node RetryPolicy's
-        defaults; a 429's `Retry-After` header wins when present (honored like `NotionClient`).
-        """
-        if exc is not None and exc.response.status_code == 429:
-            try:
-                return float(exc.response.headers.get("Retry-After", "1"))
-            except ValueError:
-                pass
-        return min(0.5 * 2**attempt, 30.0)
-
     async def _search(self, query: str, limit: int = 5) -> list[dict]:
         """POST /v2/search, scraping each hit to markdown inline.
 
-        v2 groups results by source (`sources: ["web"]` → `{"data": {"web": [...]}}`). Each
-        attempt acquires a limiter slot (≤ FIRECRAWL_RPM/min); a **transient** failure (429 /
-        5xx / transport) is retried up to `RETRY_MAX_ATTEMPTS`, honoring `Retry-After` on 429
-        with exponential backoff otherwise. A non-transient error (a 4xx, a parse failure) or
-        exhausted retries raises — the RT subgraph swallows that as best-effort (ADR 0004 /
-        0013), so this "retry within the provider" never leaks a transient blip up to fail the
-        Entry. Structurally mirrors `NotionClient._request`.
+        v2 groups results by source (`sources: ["web"]` → `{"data": {"web": [...]}}`). The
+        request goes through the shared `post_json` transient-retry loop (429 / 5xx / transport
+        retried within the provider, honoring `Retry-After`); a non-transient error or exhaust
+        raises, which the RT subgraph swallows as best-effort (ADR 0004 / 0013).
         """
         body = {
             "query": query,
@@ -169,34 +88,22 @@ class FirecrawlClient:
                 "maxAge": _WEEK_MS,
             },
         }
-        for attempt in range(self._max_retries):
-            try:
-                async with self._limiter:
-                    resp = await self._client.post("/search", json=body)
-                resp.raise_for_status()
-            except httpx.TransportError:
-                if attempt + 1 >= self._max_retries:
-                    raise
-                await asyncio.sleep(self._retry_delay(None, attempt))
-                continue
-            except httpx.HTTPStatusError as exc:
-                if (
-                    exc.response.status_code not in TRANSIENT_STATUS
-                    or attempt + 1 >= self._max_retries
-                ):
-                    raise
-                await asyncio.sleep(self._retry_delay(exc, attempt))
-                continue
-            hits = resp.json().get("data", {}).get("web") or []
-            return [
-                {
-                    "url": h.get("url", ""),
-                    "title": h.get("title", ""),
-                    "markdown": h.get("markdown", ""),
-                }
-                for h in hits
-            ]
-        raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
+        data = await post_json(
+            self._client,
+            "/search",
+            body,
+            limiter=self._limiter,
+            max_retries=self._max_retries,
+        )
+        hits = data.get("data", {}).get("web") or []
+        return [
+            {
+                "url": h.get("url", ""),
+                "title": h.get("title", ""),
+                "markdown": h.get("markdown", ""),
+            }
+            for h in hits
+        ]
 
     async def search_rt_candidates(
         self, title: str, media_type: str | None = None
@@ -215,12 +122,4 @@ class FirecrawlClient:
         ranked = rank_rt_hits(hits, media_type)
         if not ranked:
             log.info("firecrawl: no RT page for %r in %d hits — soft miss", title, len(hits))
-        return [
-            RTHit(
-                url=h.get("url", ""),
-                title=h.get("title", ""),
-                year=_slug_year(h.get("url", "")),
-                markdown=h.get("markdown") or None,
-            )
-            for h in ranked
-        ]
+        return hits_to_rt(ranked)

@@ -35,7 +35,6 @@ from pathlib import Path
 from .app import Runtime
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
-from .firecrawl import FirecrawlClient
 from .graph import build_graph
 from .llm import (
     disambiguation_model,
@@ -46,6 +45,7 @@ from .llm import (
 from .models import EXPECTED_PROPERTIES, Entry
 from .notion import NotionClient
 from .omdb import OMDbClient
+from .providers import build_search_client
 from .resilience import transient_retry_policy
 from .schema import EnrichedEntry
 from .slack import SlackTransport
@@ -131,17 +131,17 @@ async def _generate_graph() -> None:
     async with (
         NotionClient(settings) as notion,
         OMDbClient(settings) as omdb,
-        FirecrawlClient(settings) as firecrawl,
+        build_search_client(settings) as search,
     ):
         graph = build_graph(
             notion,
             omdb,
-            firecrawl,
+            search,
             extraction_model(settings),
             judge_model(settings),
             disambiguation_model(settings),
         )
-        # xray=True expands the RT subgraph inline (firecrawl_provider → extract) rather than
+        # xray=True expands the RT subgraph inline (rt_search → extract) rather than
         # rendering `rt` as one opaque node — the point of the nested-lane visualization.
         graph.get_graph(xray=True).draw_mermaid_png(output_file_path="flow.png")
     print("wrote flow.png")
@@ -152,7 +152,7 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
     async with (
         NotionClient(settings) as notion,
         OMDbClient(settings) as omdb,
-        FirecrawlClient(settings) as firecrawl,
+        build_search_client(settings) as search,
         open_checkpointer(settings.CHECKPOINT_DB_PATH) as saver,
     ):
         # Checkpointed like the reconcile Runtime (thread_id = page_id), so a single-Entry run
@@ -163,7 +163,7 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
         graph = build_graph(
             notion,
             omdb,
-            firecrawl,
+            search,
             extraction_model(settings, limiter),
             judge_model(settings, limiter),
             disambiguation_model(settings, limiter),

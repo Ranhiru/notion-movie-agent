@@ -1,0 +1,21 @@
+{
+  "_comment": "Tavily POST /search response shape (include_domains=[rottentomatoes.com], include_raw_content=true) for 'Dune: Part Two'. TavilyClient maps results[].{url,title,raw_content} → the shared {url,title,markdown} dicts → rank_rt_hits keeps the canonical /m/ page and drops the /reviews deep link. raw_content carries the RT score markers (Tomatometer/Popcornmeter) the rt.py extractor anchors on. Captured-shape fixture (documented API shape + illustrative content, NOT a live snapshot — owner captures a real one live per TASKS Phase 8).",
+  "query": "Dune: Part Two",
+  "results": [
+    {
+      "title": "Dune: Part Two - Rotten Tomatoes",
+      "url": "https://www.rottentomatoes.com/m/dune_part_two",
+      "content": "Dune: Part Two movie reviews & Metacritic score...",
+      "raw_content": "# Dune: Part Two\n\nTomatometer 92%\n\nPopcornmeter 95%\n\nMovie Info\n\nPaul Atreides unites with the Fremen to wage war against House Harkonnen.",
+      "score": 0.98
+    },
+    {
+      "title": "Dune: Part Two - Reviews - Rotten Tomatoes",
+      "url": "https://www.rottentomatoes.com/m/dune_part_two/reviews",
+      "content": "All critics reviews for Dune: Part Two...",
+      "raw_content": "# Dune: Part Two - Critic Reviews\n\nAll critics ...",
+      "score": 0.71
+    }
+  ],
+  "response_time": 1.42
+}
