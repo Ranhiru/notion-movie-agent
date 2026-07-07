@@ -13,17 +13,36 @@ local model by `spikes/04_local_llm_structured_output.py`).
 
 from __future__ import annotations
 
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_openai import ChatOpenAI
 
 from .config import Settings
 
 
-def extraction_model(settings: Settings) -> ChatOpenAI:
+def llm_rate_limiter(settings: Settings) -> InMemoryRateLimiter | None:
+    """One shared `InMemoryRateLimiter` for all three role models, or None when disabled.
+
+    The three models point at the *same* `OPENAI_BASE_URL`, so a single limiter instance passed
+    into all of them caps the **aggregate** call rate to that endpoint (ADR 0013 — Phase 7).
+    Returns None when `LLM_RPS == 0` (the opt-in default) so no throttle is attached.
+
+    `max_bucket_size=1` disallows a burst — the local LLM is the bottleneck, so we want steady
+    spacing, not a saved-up burst that overruns it.
+    """
+    if settings.LLM_RPS <= 0:
+        return None
+    return InMemoryRateLimiter(requests_per_second=settings.LLM_RPS, max_bucket_size=1)
+
+
+def extraction_model(
+    settings: Settings, rate_limiter: InMemoryRateLimiter | None = None
+) -> ChatOpenAI:
     """The RT-extraction model (`OPENAI_EXTRACTION_MODEL`) — Phase 4's first LLM node.
 
     Bound once at startup and reused across entries; `ChatOpenAI` is stateless per `.invoke`.
     Phase 5 (`judge_model`) and Phase 6 (`disambiguation_model`) add sibling factories that
-    differ only in which `OPENAI_*_MODEL` they read.
+    differ only in which `OPENAI_*_MODEL` they read. `rate_limiter` (Phase 7) is the shared
+    `llm_rate_limiter` — pass the *same* instance to all three so the aggregate rate is capped.
     """
     return ChatOpenAI(
         base_url=settings.OPENAI_BASE_URL,
@@ -34,10 +53,16 @@ def extraction_model(settings: Settings) -> ChatOpenAI:
         # sweep. `max_completion_tokens` is the ChatOpenAI field alias for `max_tokens`; 0 in
         # config → None → omit the cap (server default). ADR 0011.
         max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,
+        # Phase 7 (ADR 0013): client-layer transient retry, below the best-effort LLM-node
+        # swallows; and the shared aggregate rate limiter (None → unthrottled).
+        max_retries=settings.LLM_MAX_RETRIES,
+        rate_limiter=rate_limiter,
     )
 
 
-def judge_model(settings: Settings) -> ChatOpenAI:
+def judge_model(
+    settings: Settings, rate_limiter: InMemoryRateLimiter | None = None
+) -> ChatOpenAI:
     """The judge model (`OPENAI_JUDGE_MODEL`) — Phase 5's LLM-as-judge (ADR 0008, role 3).
 
     Also drives Phase 5's `resolve_rt` correlation (same identity-judgment role family). A
@@ -50,10 +75,14 @@ def judge_model(settings: Settings) -> ChatOpenAI:
         model=settings.OPENAI_JUDGE_MODEL,
         temperature=0,
         max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,  # see extraction_model
+        max_retries=settings.LLM_MAX_RETRIES,  # see extraction_model (ADR 0013)
+        rate_limiter=rate_limiter,
     )
 
 
-def disambiguation_model(settings: Settings) -> ChatOpenAI:
+def disambiguation_model(
+    settings: Settings, rate_limiter: InMemoryRateLimiter | None = None
+) -> ChatOpenAI:
     """The disambiguation pre-filter model (`OPENAI_DISAMBIGUATION_MODEL`) — Phase 6a, role 2.
 
     Picks the best OMDb candidate when search returns >1 and self-reports whether the pick is
@@ -66,4 +95,6 @@ def disambiguation_model(settings: Settings) -> ChatOpenAI:
         model=settings.OPENAI_DISAMBIGUATION_MODEL,
         temperature=0,
         max_completion_tokens=settings.OPENAI_MAX_TOKENS or None,  # see extraction_model
+        max_retries=settings.LLM_MAX_RETRIES,  # see extraction_model (ADR 0013)
+        rate_limiter=rate_limiter,
     )

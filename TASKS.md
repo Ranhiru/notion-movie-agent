@@ -646,18 +646,29 @@ Goal: conditional routing + `interrupt()` + durable resume + Slack. ADR 0006 / 0
 
 ## Phase 7 — Resilience
 
-Goal: make the sweep robust. ADR 0001 / 0004 / 0007. (LangSmith already on since phase 1.)
+Goal: make the sweep robust. ADR 0001 / 0004 / 0007, **new ADR 0013** (retry in two layers +
+three-layer backpressure). (LangSmith already on since phase 1.)
 
-- [ ] Per-node `RetryPolicy` (exp backoff + jitter; retries transient 429/5xx, NOT
-      `ValueError`).
-- [ ] Remaining per-API limiters (`aiolimiter`): Firecrawl ~10 RPM, Tavily + Exa
-      credit-aware; process-global, shared by sweep + HITL resume. (Notion limiter landed in
-      phase 3.)
-- [ ] `InMemoryRateLimiter` on judge/extraction models; confirm `max_concurrency` cap.
-- [ ] Checkpoint-per-item so one bad Entry doesn't roll back the batch.
+- [x] Per-node `RetryPolicy` (exp backoff + jitter; retries transient 429/5xx, NOT `ValueError`)
+      — one `is_transient` predicate in new `resilience.py`, applied via `build_graph` to the
+      **gating nodes only** (`read_page` / `omdb_search` / `omdb_details` / `update_notion`).
+      Best-effort nodes (RT lane, LLM) deliberately retry *client-side* instead, since a node
+      RetryPolicy's exhaustion re-raises and would break "RT never blocks `done`" (ADR 0013).
+- [x] Remaining per-API limiters (`aiolimiter`): Firecrawl `FIRECRAWL_RPM` (~10/min), process-
+      global (per-client instance), shared by sweep + HITL resume, alongside its internal
+      transient retry (honors `Retry-After`). (Notion limiter landed in phase 3; **Tavily + Exa
+      limiters land with those clients in Phase 8** — they don't exist yet.)
+- [x] Shared `InMemoryRateLimiter` (`LLM_RPS`, 0 = off) across all three role models (aggregate
+      cap on the one endpoint) + `LLM_MAX_RETRIES`; `max_concurrency` capped per `ainvoke` via
+      `GRAPH_MAX_CONCURRENCY` on top of the sweep semaphore.
+- [x] Batch isolation: `_sweep` gathers with `return_exceptions=True` (one bad Entry can't cancel
+      its siblings); per-Entry checkpoints (`thread_id = page_id`) already isolate state.
 
-**Verification:** induce/stub a 429 → retry + backoff, not a crash; confirm limiter caps RPS;
-LangSmith shows per-node traces + retries.
+**Verification:** offline — `is_transient` true for 429/5xx/transport, false for `ValueError` /
+404 / `ValidationError`; `FirecrawlClient` retries a stubbed 503 then succeeds, raises a 404
+without retry, and the RT lane swallows an exhausted 503 to null RT (best-effort intact); gating
+nodes carry a RetryPolicy, others don't. Live (owner-run) — induce a 429/5xx on OMDb → retry +
+backoff then `pending`, not a crash; LangSmith shows per-node retries; limiter caps RPM.
 
 ---
 

@@ -62,7 +62,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import interrupt
+from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, Field
 
 from .firecrawl import FirecrawlClient, RTHit
@@ -547,6 +547,7 @@ def build_graph(
     judge_llm: ChatOpenAI,
     disambiguation_llm: ChatOpenAI,
     checkpointer: BaseCheckpointSaver | None = None,
+    retry_policy: RetryPolicy | None = None,
 ) -> CompiledStateGraph:
     """Compile the fan-out/fan-in enrichment graph with clients + models bound into the nodes.
 
@@ -558,20 +559,44 @@ def build_graph(
     `checkpointer` is an `AsyncSqliteSaver` (ADR 0006 / 0007) when durable execution is wanted
     (the reconcile Runtime, and single-Entry `--enrich`/`--resume`); pass `None` for pure
     topology work (e.g. drawing the graph), where no state is persisted.
+
+    `retry_policy` (Phase 7 / ADR 0013) is applied **only to the gating nodes** — `read_page`,
+    `omdb_search`, `omdb_details`, `update_notion` — whose external calls raise on a transient
+    error that *should* be retried, then (if exhausted) re-raised to leave the Entry `pending`
+    for the cron (ADR 0004). It is deliberately **not** on the LLM nodes (`disambiguate` /
+    `resolve_rt` / `judge` swallow their own errors and fail safe; `ChatOpenAI` retries
+    transient blips at the client layer) nor the `rt` subgraph (best-effort — Firecrawl retries
+    internally, below its swallow; a node RetryPolicy's exhaustion-raise would break "RT never
+    blocks `done`") nor `await_human` / `assemble` (no external calls). `None` → no retries.
     """
     rt_subgraph = build_rt_subgraph(firecrawl, extraction_llm)
 
     g = StateGraph(EnrichmentState)
-    g.add_node("read_page", functools.partial(read_page, notion=notion))
-    g.add_node("omdb_search", functools.partial(omdb_search, omdb=omdb_client))
+    # Gating nodes carry the RetryPolicy (ADR 0013); best-effort / no-IO nodes don't.
+    g.add_node(
+        "read_page", functools.partial(read_page, notion=notion), retry_policy=retry_policy
+    )
+    g.add_node(
+        "omdb_search",
+        functools.partial(omdb_search, omdb=omdb_client),
+        retry_policy=retry_policy,
+    )
     g.add_node("disambiguate", functools.partial(disambiguate, llm=disambiguation_llm))
     g.add_node("await_human", await_human)  # Phase 6b: interrupt() — no deps to bind
-    g.add_node("omdb_details", functools.partial(omdb_details, omdb=omdb_client))
+    g.add_node(
+        "omdb_details",
+        functools.partial(omdb_details, omdb=omdb_client),
+        retry_policy=retry_policy,
+    )
     g.add_node("rt", rt_subgraph)  # compiled subgraph as a node (shared keys: entry, rt_*)
     g.add_node("assemble", assemble)
     g.add_node("resolve_rt", functools.partial(resolve_rt, llm=judge_llm))
     g.add_node("judge", functools.partial(judge, llm=judge_llm))
-    g.add_node("update_notion", functools.partial(update_notion, notion=notion))
+    g.add_node(
+        "update_notion",
+        functools.partial(update_notion, notion=notion),
+        retry_policy=retry_policy,
+    )
 
     g.add_edge(START, "read_page")
     g.add_edge("read_page", "omdb_search")  # fan-out: OMDb lane
