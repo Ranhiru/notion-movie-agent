@@ -893,12 +893,53 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
 
 Goal: the only Docker phase. ADR 0009 / 0007.
 
-- [ ] `Dockerfile` (uv-based) + `docker-compose.yml` with `restart: always`.
-- [ ] **Compose secrets** (file-mounted) for all keys; no secrets in the image/compose file.
-- [ ] **Named volume** for the SQLite checkpointer `.sqlite`.
+**Decisions of record (this phase):**
+- **The always-on process is `--serve`** (in-process cron + Slack Socket Mode). No inbound HTTP
+  (Socket Mode is an *outbound* WebSocket, ADR 0009) → the compose service exposes **no ports**.
+- **Secret injection = entrypoint bridge, not `secrets_dir`.** Compose mounts secrets as
+  *files* at `/run/secrets/<NAME>`; `entrypoint.sh` reads each and `export`s it as an env var
+  before exec-ing the app. This is chosen over pydantic's `secrets_dir` because LangChain /
+  LangSmith read `LANGSMITH_*` **directly from `os.environ`** (bypassing the `Settings` object,
+  see `config.py`), so the value must reach the env, not just the typed settings — the bridge
+  reproduces exactly what `load_dotenv` does from `.env` in dev, with **zero app-code changes**
+  (Phase 10 stays a pure deploy concern).
+- **`.env` stays the single source of truth in dev.** `make secrets` (`scripts/gen-secrets.sh`)
+  *projects* the 9 secret keys out of `.env` into `secrets/*` (one file each, `printf` — no
+  trailing newline; `$(cat)` in the entrypoint strips it anyway). `secrets/` is gitignored.
+  Non-secret config (intervals, RPMs, models, LangSmith endpoint/project, data-source id) rides
+  in via compose `environment:` with `${VAR:-default}` (Compose auto-reads `.env` for interp).
+- **The LLM endpoint is on the host.** `localhost:8888` inside the container is the container
+  itself, so compose rewrites `OPENAI_BASE_URL` → `http://host.docker.internal:8888/v1` and adds
+  `extra_hosts: ["host.docker.internal:host-gateway"]` (auto on Docker Desktop; needed on Linux).
+- **Volume ownership:** the image creates `/data` owned by the non-root `appuser`; Docker seeds a
+  fresh named volume from the image path's ownership on first mount, so the checkpointer can write.
+- **`.dockerignore` excludes the local `checkpoints.sqlite`** (~40MB) — it must not bloat the
+  image or shadow the `/data` volume; the DB is created fresh on the volume at runtime.
+
+- [x] `Dockerfile` (uv-based) + `docker-compose.yml` with `restart: always`.
+      → Multi-stage uv build (`ghcr.io/astral-sh/uv:python3.13-bookworm-slim` → `python:3.13-slim`
+      runtime), `uv sync --frozen --no-dev` from `uv.lock` (reproducible; dep layer cached
+      separately from `src/`), non-root `appuser`, venv on `PATH` (no `uv run` at runtime).
+      `ENTRYPOINT ["./entrypoint.sh"]` → the secret bridge → `python -m notion_db_updater --serve`.
+      `docker-compose.yml`: single `agent` service, `restart: always`, **no ports**, `extra_hosts`
+      for the host LLM. `.dockerignore` keeps the context small + secret-free.
+- [x] **Compose secrets** (file-mounted) for all keys; no secrets in the image/compose file.
+      → 9 file-mounted secrets (`NOTION_MOVIE_DB_TOKEN`, `OMDB_API_KEY`, `FIRECRAWL/TAVILY/EXA_API_KEY`,
+      `OPENAI_API_KEY`, `SLACK_BOT/APP_TOKEN`, `LANGSMITH_API_KEY`) sourced from `./secrets/*`
+      (the compose file holds only *paths*, never values). `entrypoint.sh` exports them; the
+      secret NAME == the env var the code reads. `make secrets` generates the files from `.env`.
+- [x] **Named volume** for the SQLite checkpointer `.sqlite`.
+      → `checkpoint-data:/data`; `CHECKPOINT_DB_PATH=/data/checkpoints.sqlite`. Named (not bind)
+      so it outlives container recreation → a paused HITL graph resumes after restart (ADR 0007).
 
 **Verification:** `docker compose up`; cron fires on schedule; kill the container → restarts;
 an `awaiting_input` graph **survives the restart** (volume persistence proves ADR 0007).
+→ **Build + config proven by Claude** (no creds needed): `docker compose config` validates the
+merged spec (9 secrets, named volume, no ports, host-gateway) and `docker build` builds the image
+clean to the `--serve` entrypoint. **Live `docker compose up` is owner-run** (secrets/creds +
+host LLM aren't in Claude's shell env): `make secrets && docker compose up --build` → cron logs
+fire; `docker kill` → `restart: always` recovers; create an ambiguous Entry → `awaiting_input`
+→ `docker compose restart` mid-wait → the volume-backed `.sqlite` resumes the paused graph.
 
 ---
 
