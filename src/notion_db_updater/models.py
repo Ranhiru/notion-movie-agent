@@ -61,8 +61,8 @@ def _rich_text(props: dict, prop: str) -> str | None:
 
 
 # Reverse of `schema.normalize_media_type`: the contract's {movie, tv} domain → the Notion
-# `Type` select's option names. Used by the Phase-9 `/add` path, the one flow where the agent
-# backfills `Type` (a Notion-origin row has it human-filled; a `slack` row starts blank).
+# `Type` select's option names. Used by `update_notion` to write the OMDb-resolved `media_type`
+# back to `Type` on every enriched Entry (backfilling a blank and correcting a wrong one).
 _NOTION_TYPE = {"movie": "Movie", "tv": "TV Show"}
 
 

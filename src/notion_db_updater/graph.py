@@ -571,16 +571,16 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
     RT scores are written alongside IMDb/plot/genre but are null-safe: a soft-miss RT simply
     isn't written and never changes the OMDb-decided status (ADR 0004 — RT can't block `done`).
 
-    Phase 9 (ADR 0012): for a resolved `slack`-origin row (a `/add`), the agent also backfills
-    the Notion `Type` select from the resolved `media_type` — a Notion-origin sweep row has
-    `Type` human-filled, so we never overwrite it (`notion_type` stays None there).
+    The Notion `Type` select is written from the resolved `media_type` for *every* enriched
+    Entry — the OMDb-derived type (`omdb_type`, normalized by the Judge) is authoritative, so
+    the agent backfills a blank `Type` and corrects a wrong one alike, on a Slack `/add` row
+    and a Notion-origin sweep row both. It's null-safe and idempotent (ADR 0004): a run that
+    didn't resolve an identity has `enriched=None` (blank / not-found / unconfirmed), so
+    `notion_type` stays None and `Type` is left untouched; an unknown OMDb type maps to None
+    the same way.
     """
     enriched = state.get("enriched")
-    notion_type = (
-        notion_type_value(enriched.media_type)
-        if state.get("origin") == SLACK_ORIGIN and enriched is not None
-        else None
-    )
+    notion_type = notion_type_value(enriched.media_type) if enriched is not None else None
     props = enrichment_properties(
         imdb_rating=state.get("imdb_rating"),
         plot=state.get("plot"),
