@@ -663,25 +663,39 @@ LangSmith shows per-node traces + retries.
 
 ## Phase 8 — RT provider rotation (Firecrawl ‖ Tavily ‖ Exa, round-robin start)
 
-Goal: distribute RT search load across the three free API tiers. ADR 0003 **amended**: a
-rotated-start chain supersedes the original fixed Firecrawl-first order, and **Perplexity is
-dropped** (three rotating providers already give redundancy; one less key). Fan-out was
-rejected (burns ~3× quota per Entry — against the free-tier goal), as was single-pick-no-
-fallback (one soft miss would leave RT null until a manual re-run).
+Goal: distribute RT search load across the three free API tiers. ADR 0003 **amended twice**:
+a rotated-start chain supersedes the original fixed Firecrawl-first order, **Perplexity is
+dropped** (three rotating providers already give redundancy; one less key), and the chain
+lives in an injected **`SearchClient` strategy** behind the subgraph's single `rt_search`
+node — not sibling provider nodes + conditional edges. Soft miss is judged at the *search*
+layer (zero canonical candidates); a found-but-scoreless page ends the lane with null RT
+(accepted: all providers search the same site, a fallback would re-find the same page).
+Fan-out was rejected (burns ~3× quota per Entry — against the free-tier goal), as was
+single-pick-no-fallback (one soft miss would leave RT null until a manual re-run).
 
-- [ ] Add Tavily + Exa provider nodes as **full peers** of Firecrawl (search + content +
-      the same candidate shaping / LLM extraction — parity is what makes rotation safe),
-      driven by `SEARCH_PROVIDERS`. Update the config default to `firecrawl,tavily,exa` and
-      drop `PERPLEXITY_API_KEY` from `config.py` / `.env.example`.
-- [ ] **Round-robin start rotation:** a process-local counter (unpersisted — approximate
-      fairness across restarts is fine) rotates which provider goes *first* per Entry; the
-      other two remain fallbacks in rotation order.
-- [ ] Chain semantics unchanged from ADR 0003: advance on hard fail OR soft miss; retry
-      transient blips within a provider first; **first score wins** (short-circuit the rest).
+- [ ] **Seam (pulled forward, pre-Phase-8):** new `search.py` with the `SearchClient`
+      Protocol (`search_rt_candidates(title, media_type) -> list[RTHit]`, search-only — no
+      lifecycle), `RTHit`, and the provider-agnostic ranking/slug helpers moved out of
+      `firecrawl.py`. Rename the subgraph node + function `firecrawl_provider` → `rt_search`
+      (parallel to `omdb_search`); `build_rt_subgraph` / `build_graph` take
+      `search: SearchClient` instead of `firecrawl: FirecrawlClient`. `Runtime` still
+      constructs/closes the concrete client. Pure refactor — zero behavior change.
+- [ ] Add `TavilyClient` + `ExaClient` as **full `SearchClient` peers** of Firecrawl
+      (search + inline content + the same candidate shaping — markdown-bearing `RTHit`s;
+      parity is what makes rotation safe). Update the config default to
+      `firecrawl,tavily,exa` and drop `PERPLEXITY_API_KEY` from `config.py` / `.env.example`.
+- [ ] **`RoundRobinSearchClient` composite** (itself a `SearchClient`), built from
+      `SEARCH_PROVIDERS`: a process-local counter (unpersisted — approximate fairness across
+      restarts is fine) rotates which provider goes *first* per Entry; the others remain
+      fallbacks in rotation order. Advance on hard fail OR zero candidates; retry transient
+      blips within a provider first; **first candidate wins** (short-circuit the rest). Log
+      the winning provider per Entry (the graph shows one `rt_search` span, so the log line
+      is the observability).
+- [ ] `Runtime` wires the composite when >1 provider is configured, the bare client when 1.
 
-**Verification:** across a 3-Entry sweep, each provider leads exactly once (visible in
-LangSmith traces); force the leading provider to soft-miss → the next in rotation runs;
-confirm first-score-wins short-circuits the rest. Fixtures per provider.
+**Verification:** across a 3-Entry sweep, each provider leads exactly once (winning-provider
+log lines); force the leading provider to hard-fail and to return zero candidates → the next
+in rotation runs; confirm first-candidate-wins short-circuits the rest. Fixtures per provider.
 
 ---
 

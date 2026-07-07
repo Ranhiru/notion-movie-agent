@@ -48,12 +48,13 @@ lane. Not interchangeable APIs — distinct strategies.
 _Avoid_: source, provider, API
 
 **RT Resolution**:
-The lane that obtains Rotten Tomatoes scores via an ordered fallback chain, active by
-default: `Firecrawl /search → Tavily → Exa → Perplexity`. Captures two best-effort
-scores — the **critic** score (Tomatometer) and the **audience** score (Popcornmeter).
-The first provider to return at least one score wins; the rest don't run. Modelled as a
-subgraph.
-_Avoid_: scraping, the search lane
+The lane that obtains Rotten Tomatoes scores via a rotated-start fallback chain of three
+Providers — Firecrawl, Tavily, Exa — active by default. Each Entry starts the chain at a
+different Provider (round-robin, to spread free-tier quota); the chain advances on a hard
+failure or a soft miss. Captures two best-effort scores — the **critic** score
+(Tomatometer) and the **audience** score (Popcornmeter). The first Provider to surface an
+RT page wins; the rest don't run. Modelled as a subgraph.
+_Avoid_: scraping, the search lane, Perplexity (dropped from the chain)
 
 **Critic Score / Audience Score**:
 The two distinct Rotten Tomatoes numbers. **Critic** = Tomatometer (professional
@@ -62,9 +63,11 @@ are often different numbers and must never be conflated.
 _Avoid_: RT score (ambiguous), Tomatometer/Popcornmeter in field names
 
 **Provider**:
-One link in the RT Resolution chain (Firecrawl, Tavily, Exa, or Perplexity). Each is
-tried in order until one yields a usable RT critic score.
-_Avoid_: source, lane, API
+One link in the RT Resolution chain (Firecrawl, Tavily, or Exa). Interchangeable full
+peers behind a common search contract — tried in rotation order until one surfaces the
+Entry's RT page. A Provider succeeds by finding the page; whether the page yields scores
+is decided downstream.
+_Avoid_: source, lane, API, node
 
 **Enrichment Status**:
 An Entry's lifecycle marker — `pending`, `awaiting_input`, `done`, or `failed`.
