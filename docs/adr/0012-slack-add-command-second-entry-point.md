@@ -42,24 +42,30 @@ preserved, which a new `enriching` status would have broken (a crash would stran
 ## Completion feedback and `origin`
 
 `/add` is interactive, so it acks within Slack's 3-second window (an ephemeral "Adding…"),
-does the create/dedupe/enrich in a background task, and posts a completion message with the
-results (IMDb / RT / genre) or a not-found notice. Because the run may reach its terminal
-state much later — after a Slack disambiguation click or even the 7-day cron auto-resolve —
-the notification cannot live at the slash handler's call site. It is a **terminal notify
-node in the graph**, gated on graph state `origin` ∈ {`sweep`, `slack`}: it posts only for
-`slack`-originated runs and no-ops for sweep rows. The Slack target (channel/user) is
-carried in durable graph state alongside `origin` so it survives the interrupt/resume and a
-process restart. Completion uses `chat_postMessage` (not the slash `response_url`, which
-expires ~30 min / 5 uses) precisely because a run can sit in HITL for days.
+does the create/dedupe/enrich in a background task, and immediately posts one visible progress
+message. `Runtime.create_and_enrich` consumes LangGraph's `stream_mode="updates"` output and
+edits that message at real node-completion milestones (search, identity resolution, source
+combination, verification, Notion write). Progress is best-effort: a Slack update failure is
+logged and never gates the durable enrichment run.
+
+The progress message timestamp is carried in graph state with the Slack channel/user. The
+terminal `notify` node edits that same message into the completion result (IMDb / RT / genre)
+or not-found notice. Persisting the timestamp matters because the terminal state may arrive
+much later — after a Slack disambiguation click or even the 7-day cron auto-resolve. The node
+is gated on `origin == "slack"`: it posts only for `slack`-originated runs and no-ops for
+sweep rows. Runs created before this field existed, CLI runs, and any initial progress-post
+failure fall back to `chat_postMessage`. Neither path uses the slash `response_url`, which
+expires (~30 min / 5 uses), because a run can sit in HITL for days.
 
 ## Consequences
 
 - **New surface, reused core.** New: the `/add` command registration (delivered over the
   existing Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
   dedupe query (match the typed Entry case-insensitively; on a hit, tell the user and
-  create nothing), the in-flight guard, the notify node, and two graph-state fields
-  (`origin`, Slack notify context). Unchanged: the enrichment graph, disambiguation picker,
-  checkpointer, status lifecycle, single-flight lock, rate limiters.
+  create nothing), the in-flight guard, streamed progress updates, the notify node, and durable
+  graph state for `origin` plus Slack notify/progress context. Unchanged: the enrichment graph
+  topology, disambiguation picker, checkpointer, status lifecycle, single-flight lock, rate
+  limiters.
 - **The agent now writes `Type`.** §8 had `Type` as human-filled; for `/add` rows it starts
   blank (search OMDb unfiltered, let the 1/many + disambiguation logic resolve `media_type`)
   and is backfilled from the resolved `media_type` so the row ends up complete.
