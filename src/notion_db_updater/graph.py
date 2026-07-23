@@ -104,17 +104,18 @@ class CompletionNotifier:
     """
 
     def __init__(self) -> None:
-        # (channel, text) → coroutine that posts to Slack. None until _serve binds it.
-        self._post: Callable[[str, str], Awaitable[None]] | None = None
+        # (channel, text, message_ts) → coroutine that posts to Slack, or updates the existing
+        # progress message when message_ts is present. None until _serve binds it.
+        self._post: Callable[[str, str, str | None], Awaitable[None]] | None = None
 
-    def bind(self, post: Callable[[str, str], Awaitable[None]]) -> None:
+    def bind(self, post: Callable[[str, str, str | None], Awaitable[None]]) -> None:
         self._post = post
 
-    async def notify(self, channel: str, text: str) -> None:
+    async def notify(self, channel: str, text: str, message_ts: str | None = None) -> None:
         if self._post is None:
             log.info("notify: no Slack notifier bound — skipping completion ping")
             return
-        await self._post(channel, text)
+        await self._post(channel, text, message_ts)
 
 
 class EnrichmentState(TypedDict):
@@ -157,6 +158,9 @@ class EnrichmentState(TypedDict):
     origin: NotRequired[str]  # "slack" for /add; unset/other → sweep (notify no-ops)
     notify_channel: NotRequired[str | None]  # Slack channel to post the completion ping to
     notify_user: NotRequired[str | None]  # Slack user who ran /add (for the @mention)
+    # Timestamp of the visible `/add` progress message. Persisted so a terminal notify after a
+    # human resume (or stale auto-resolve) edits that message instead of posting a second one.
+    notify_message_ts: NotRequired[str | None]
     # Phase 6d: set by the 7-day stale-interrupt auto-resolve before Command(resume=best_guess)
     # so `judge` grades an unconfirmed best-guess `confidence=low` (flagged for review) without
     # an LLM call. Trace-only, like all Judge output — never written to Notion.
@@ -640,7 +644,7 @@ async def notify(state: EnrichmentState, *, notifier: CompletionNotifier) -> dic
     if message is None:
         return {}
     try:
-        await notifier.notify(channel, message)
+        await notifier.notify(channel, message, state.get("notify_message_ts"))
     except Exception:  # noqa: BLE001 — best-effort ping; never fail a written Entry over Slack
         log.exception("notify: failed to post completion ping for %s", state["page_id"])
     return {}

@@ -332,33 +332,78 @@ class SlackTransport:
         pauses for disambiguation (picker in `#notion-movie-db`) still pings this channel on
         resolve. Uses `chat_postMessage` (never the slash `response_url`, which expires).
         """
+        progress_ts: str | None = None
+
+        async def update_progress(text: str) -> None:
+            if progress_ts is None:
+                return
+            try:
+                await self._app.client.chat_update(channel=channel, ts=progress_ts, text=text)
+            except Exception:  # noqa: BLE001 — Slack progress must never gate enrichment
+                log.exception("slack: failed to update /add progress for %r", title)
+
         try:
+            # The slash ack is ephemeral, so post one visible message whose timestamp can be
+            # checkpointed with the graph and edited throughout a later interrupt/resume.
+            try:
+                progress_message = await self._app.client.chat_postMessage(
+                    channel=channel,
+                    text=f"🔎 Checking the watchlist for *{title}*…",
+                )
+                progress_ts = progress_message["ts"]
+            except Exception:  # noqa: BLE001 — terminal notify can still post without a ts
+                log.exception("slack: failed to post /add progress for %r", title)
             existing = await self._runtime.find_duplicate(title)
             if existing is not None:
-                await self._app.client.chat_postMessage(
-                    channel=channel,
-                    text=(
-                        f"*{existing.title}* is already on the watchlist "
-                        f"(status: *{existing.status or 'unset'}*) — nothing added."
-                    ),
+                text = (
+                    f"*{existing.title}* is already on the watchlist "
+                    f"(status: *{existing.status or 'unset'}*) — nothing added."
                 )
+                if progress_ts is not None:
+                    await update_progress(text)
+                else:
+                    await self._app.client.chat_postMessage(channel=channel, text=text)
                 return
-            await self._runtime.create_and_enrich(title, channel=channel, user=user)
+            await update_progress(f"📝 Creating a Notion entry for *{title}*…")
+            await self._runtime.create_and_enrich(
+                title,
+                channel=channel,
+                user=user,
+                message_ts=progress_ts,
+                progress=update_progress,
+            )
         except Exception:
             log.exception("slack: /add %r failed", title)
             with contextlib.suppress(Exception):
-                await self._app.client.chat_postMessage(
-                    channel=channel,
-                    text=f"Couldn't add *{title}* — something went wrong. Try again?",
-                )
+                text = f"Couldn't add *{title}* — something went wrong. Try again?"
+                if progress_ts is not None:
+                    await update_progress(text)
+                else:
+                    await self._app.client.chat_postMessage(channel=channel, text=text)
 
-    async def post_completion(self, channel: str, text: str) -> None:
+    async def post_completion(
+        self, channel: str, text: str, message_ts: str | None = None
+    ) -> None:
         """Post a `/add` completion ping (bound into `Runtime`'s terminal `notify` node).
 
         `chat_postMessage` (not the slash `response_url`, which expires) so a run that only
         resolves days later — after a Slack disambiguation click or the 6d auto-resolve — still
-        reaches the user. Unfurls suppressed so the IMDb link stays a compact click-through.
+        reaches the user. When the run has a durable progress-message timestamp, edit that
+        message into the final result; older/checkpoint-less runs fall back to a new message.
+        Unfurls are suppressed so the IMDb link stays a compact click-through.
         """
+        if message_ts is not None:
+            try:
+                await self._app.client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text=text,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+                return
+            except Exception:  # noqa: BLE001 — deleted/stale message → post the result anew
+                log.exception("slack: failed to finalize progress message; posting completion")
         await self._app.client.chat_postMessage(
             channel=channel,
             text=text,

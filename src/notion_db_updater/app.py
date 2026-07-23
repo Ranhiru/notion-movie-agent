@@ -54,6 +54,21 @@ from .resilience import transient_retry_policy
 
 log = logging.getLogger(__name__)
 
+# Friendly Slack progress emitted after real graph nodes complete. The graph's OMDb and RT
+# lanes run concurrently, so these describe durable milestones rather than pretending to be a
+# percentage-complete counter. Nodes omitted here either finish almost immediately or have
+# their own UI (await_human posts the candidate picker; notify renders the final result).
+_PROGRESS_AFTER_NODE = {
+    "read_page": "🔎 Searching movie databases…",
+    "omdb_search": "🎬 Checking the best title match…",
+    "disambiguate": "🧭 Resolving the title identity…",
+    "omdb_details": "📚 Movie details found — combining sources…",
+    "rt": "🍅 Rotten Tomatoes lookup finished — combining sources…",
+    "assemble": "🧩 Comparing source results…",
+    "resolve_rt": "✅ Verifying the match…",
+    "judge": "📝 Updating Notion…",
+}
+
 # Returned by _run_one when the graph raised a transient error: the Entry was left in its
 # prior (pending/unset) state — distinct from a graph-written terminal status.
 _TRANSIENT = "error"
@@ -201,7 +216,9 @@ class Runtime:
         """
         self._notifier = notifier
 
-    def bind_completion_notifier(self, post: Callable[[str, str], Awaitable[None]]) -> None:
+    def bind_completion_notifier(
+        self, post: Callable[[str, str, str | None], Awaitable[None]]
+    ) -> None:
         """Bind the Slack completion poster the terminal `notify` node uses (Phase 9).
 
         Wired by `_serve` to `SlackTransport.post_completion` after the transport is built (the
@@ -380,7 +397,13 @@ class Runtime:
         return await self._notion.find_by_title(title)
 
     async def create_and_enrich(
-        self, title: str, *, channel: str | None = None, user: str | None = None
+        self,
+        title: str,
+        *,
+        channel: str | None = None,
+        user: str | None = None,
+        message_ts: str | None = None,
+        progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> AddOutcome:
         """Create a Watchlist page from `/add` and enrich it out-of-band (Phase 9 / ADR 0012).
 
@@ -400,6 +423,7 @@ class Runtime:
         entry = await self._notion.create_entry(title)
         page_id = entry.page_id
         log.info("add: created page %s for %r — enriching out-of-band", page_id, title)
+        await self._report_progress(progress, "✅ Notion entry created — starting enrichment…")
         # Hold the page_id in-flight until its terminal/awaiting_input write lands (inside
         # _handle_pause or update_notion), so the sweep never sees it while still `pending`.
         self._inflight.add(page_id)
@@ -411,16 +435,34 @@ class Runtime:
             }
             if self._settings.GRAPH_MAX_CONCURRENCY > 0:
                 config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
-            final_state = await self._graph.ainvoke(
-                {
-                    "page_id": page_id,
-                    "origin": SLACK_ORIGIN,
-                    "notify_channel": channel,
-                    "notify_user": user,
-                },
-                config=config,
-            )
+            initial_state = {
+                "page_id": page_id,
+                "origin": SLACK_ORIGIN,
+                "notify_channel": channel,
+                "notify_user": user,
+                "notify_message_ts": message_ts,
+            }
+            # Stream state updates so Slack reflects nodes that have actually completed.
+            # The checkpointer remains authoritative for the final state and durable resume.
+            interrupts = None
+            async for update in self._graph.astream(
+                initial_state, config=config, stream_mode="updates"
+            ):
+                if "__interrupt__" in update:
+                    interrupts = update["__interrupt__"]
+                for node_name in update:
+                    message = _PROGRESS_AFTER_NODE.get(node_name)
+                    if message is not None:
+                        await self._report_progress(progress, message)
+
+            snapshot = await self._graph.aget_state(config)
+            final_state = dict(snapshot.values)
+            if interrupts:
+                final_state["__interrupt__"] = interrupts
             if await self._handle_pause(entry, final_state):
+                await self._report_progress(
+                    progress, "🧭 I need your help choosing the correct title."
+                )
                 return AddOutcome(page_id=page_id, status=_AWAITING, title=title)
             result = ResumeResult.from_state(final_state)
             return AddOutcome(
@@ -431,6 +473,18 @@ class Runtime:
             )
         finally:
             self._inflight.discard(page_id)
+
+    @staticmethod
+    async def _report_progress(
+        progress: Callable[[str], Awaitable[None]] | None, message: str
+    ) -> None:
+        """Send best-effort interactive progress without making Slack gate enrichment."""
+        if progress is None:
+            return
+        try:
+            await progress(message)
+        except Exception:  # noqa: BLE001 — progress is UX; the durable graph must keep running
+            log.exception("add: failed to update Slack progress message")
 
     async def resume(
         self, page_id: str, chosen_imdb_id: str, *, auto_resolved: bool = False
