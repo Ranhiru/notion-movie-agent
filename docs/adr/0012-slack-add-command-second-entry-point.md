@@ -1,6 +1,6 @@
-# Slack `/add` command: a second entry point via create-then-enrich, out-of-band
+# Slack mention `add`: a second entry point via create-then-enrich, out-of-band
 
-A Slack slash command `/add <name>` lets a human originate an Entry from Slack instead of
+A Slack app mention `@NotionMovieAgent add <name>` lets a human originate an Entry instead of
 adding a row in Notion. Rather than invert the architecture, it is an **additional entry
 point**: the handler creates the Notion page exactly as a human would (Entry only, status
 `pending`), then enriches that one `page_id` **out-of-band** — directly via the graph, *not*
@@ -20,7 +20,7 @@ HITL Slack picker all intact ([0001](./0001-unified-reconcile-single-flight.md),
   and reconcile discovery all need a parallel identity scheme — a large divergence from
   ADR 0006/0007 for a cosmetic gain. Rejected.
 - **Create page first, then trigger `reconcile()` (rejected):** fully reuses ADR 0001, but
-  `/add` is interactive and ADR 0001 accepts that an Entry added during an active sweep waits
+  Slack `add` is interactive and ADR 0001 accepts that an Entry added during an active sweep waits
   up to ~1 hour for the next cron — poor UX for someone watching Slack.
 - **Create page first, enrich that one page out-of-band (chosen).**
 
@@ -33,7 +33,7 @@ keeps a concurrent cron sweep from selecting and re-enriching the same `pending`
 would double external-API spend (exactly what ADR 0001 exists to prevent).
 
 De-confliction is a **process-global in-flight `page_id` guard** (a set / per-page lock),
-shared by the sweep and the slash path; the sweep skips any `page_id` currently being
+shared by the sweep and the Slack-add path; the sweep skips any `page_id` currently being
 enriched out-of-band. No new Notion status, because ADR 0009 makes this a single process.
 It is **crash-safe by construction**: if the process dies mid-enrich the set vanishes but
 the row is still `pending`, so the next cron sweep reclaims it — ADR 0004 self-healing is
@@ -41,9 +41,9 @@ preserved, which a new `enriching` status would have broken (a crash would stran
 
 ## Completion feedback and `origin`
 
-`/add` is interactive, so it acks within Slack's 3-second window (an ephemeral "Adding…"),
-does the create/dedupe/enrich in a background task, and immediately posts one visible progress
-message. `Runtime.create_and_enrich` consumes LangGraph's `stream_mode="updates"` output and
+The app-mention handler schedules create/dedupe/enrich in a background task and returns
+promptly. That task posts one visible progress message. `Runtime.create_and_enrich` consumes
+LangGraph's `stream_mode="updates"` output and
 edits that message at real node-completion milestones (search, identity resolution, source
 combination, verification, Notion write). Progress is best-effort: a Slack update failure is
 logged and never gates the durable enrichment run.
@@ -54,24 +54,23 @@ or not-found notice. Persisting the timestamp matters because the terminal state
 much later — after a Slack disambiguation click or even the 7-day cron auto-resolve. The node
 is gated on `origin == "slack"`: it posts only for `slack`-originated runs and no-ops for
 sweep rows. Runs created before this field existed, CLI runs, and any initial progress-post
-failure fall back to `chat_postMessage`. Neither path uses the slash `response_url`, which
-expires (~30 min / 5 uses), because a run can sit in HITL for days.
+failure fall back to `chat_postMessage` because a run can sit in HITL for days.
 
 ## Consequences
 
-- **New surface, reused core.** New: the `/add` command registration (delivered over the
-  existing Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
+- **New surface, reused core.** New: `add` dispatch in the existing `app_mention` listener
+  (delivered over the Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
   dedupe query (match the typed Entry case-insensitively; on a hit, tell the user and
   create nothing), the in-flight guard, streamed progress updates, the notify node, and durable
   graph state for `origin` plus Slack notify/progress context. Unchanged: the enrichment graph
   topology, disambiguation picker, checkpointer, status lifecycle, single-flight lock, rate
   limiters.
-- **The agent now writes `Type`.** §8 had `Type` as human-filled; for `/add` rows it starts
+- **The agent now writes `Type`.** §8 had `Type` as human-filled; for Slack-add rows it starts
   blank (search OMDb unfiltered, let the 1/many + disambiguation logic resolve `media_type`)
   and is backfilled from the resolved `media_type` so the row ends up complete.
 - **Dedupe is best-effort only.** It matches the typed string before the canonical title /
   `imdb_id` exist, so it catches exact re-adds but not variant spellings (*Dune* vs *Dune:
   Part Two*); those remain the user's call. No page deletion is introduced.
-- **No Notion schema change.** `/add` populates exactly the existing §8 enrichment fields
+- **No Notion schema change.** Slack `add` populates exactly the existing §8 enrichment fields
   (IMDb rating, RT critic + audience, plot, genre, Enrichment Status, + backfilled Type).
 - Sequenced as the phase immediately **before** the deploy phase (TASKS Phase 9).

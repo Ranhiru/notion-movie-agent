@@ -30,16 +30,16 @@ _Avoid_: leftover, missed row
 
 **Origin**:
 Where an Entry entered the system — `sweep` (a row added in Notion, discovered by reconcile)
-or `slack` (typed via the `/add` command). Both produce the same pending Entry and run the
+or `slack` (typed via `@NotionMovieAgent add <name>`). Both produce the same pending Entry and run the
 same enrichment; Origin only governs whether the run reports its result back to Slack on
 completion.
 _Avoid_: source (means a Provider/Lane here), trigger
 
 **Add**:
-Originating an Entry from Slack via the `/add <name>` command: create the Notion page the
+Originating an Entry from Slack via `@NotionMovieAgent add <name>`: create the Notion page the
 user would have typed, then enrich it. A second entry point alongside the Notion row, not a
 replacement.
-_Avoid_: import, create row, slash command (the mechanism, not the act)
+_Avoid_: import, create row, app mention (the mechanism, not the act)
 
 **Lane**:
 One of the two source strategies feeding the merge step, run in parallel:

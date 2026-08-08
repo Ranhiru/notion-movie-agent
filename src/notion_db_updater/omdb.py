@@ -35,7 +35,7 @@ _SEASON_SUFFIX = re.compile(
 )
 
 # A trailing release year the user appended ("Justice League 2017", "Dune (2021)"). OMDb's
-# `?s=` search can't parse a year out of the title string, so it returns 0 — a common `/add`
+# `?s=` search can't parse a year out of the title string, so it returns 0 — a common Slack add
 # miss. Stripped as a fallback; the year still lives in the Entry title, so the disambiguation
 # pre-filter keeps it to pick the right year among the (now multi-year) candidates.
 _TRAILING_YEAR = re.compile(r"\s*[\(\[]?\s*(?:19|20)\d{2}\s*[\)\]]?\s*$")

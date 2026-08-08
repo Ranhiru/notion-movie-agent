@@ -43,11 +43,11 @@ on without a port. The lane splits after `read_page` and rejoins at `assemble`:
   `resolve_rt` correlates a >1 RT candidate set against OMDb's resolved identity; `judge` is
   the LLM-as-judge, building the `EnrichedEntry` output contract and emitting a trace-only
   `confidence` (ADR 0008).
-- **Phase 9 — Slack `/add` (ADR 0012):** `notify` is a terminal node after `update_notion`. It
-  no-ops for a Notion-origin sweep row and posts a Slack completion ping for a `slack`-origin
-  `/add` run (durable notify context in state → fires on the initial run, a resume, or the 6d
-  auto-resolve alike). The `/add` create-then-enrich orchestration itself lives out-of-band in
-  `Runtime` (app.py); the graph is reused unchanged apart from this terminal ping.
+- **Phase 9 — Slack mention `add` (ADR 0012):** `notify` is a terminal node after
+  `update_notion`. It no-ops for a Notion-origin sweep row and posts a completion ping for a
+  Slack-origin add (durable notify context in state → fires on the initial run, a resume, or
+  the 6d auto-resolve alike). The create-then-enrich orchestration itself lives out-of-band
+  in `Runtime` (app.py); the graph is reused unchanged apart from this terminal ping.
 
 Transient OMDb errors still propagate (nothing written → Entry stays pending; RetryPolicy is
 Phase 7). The RT lane, `resolve_rt`, and `judge` all swallow their own errors (best-effort;
@@ -89,7 +89,7 @@ log = logging.getLogger(__name__)
 # it ages out unanswered — the 6d stale-interrupt pass). Distinct from any real imdbID.
 NOT_FOUND = "__not_found__"
 
-# The `/add` origin value; a Notion-origin sweep row leaves `origin` unset (treated as sweep).
+# Slack-add origin; a Notion-origin row leaves `origin` unset (treated as sweep).
 SLACK_ORIGIN = "slack"
 
 
@@ -151,14 +151,14 @@ class EnrichmentState(TypedDict):
     rt_audience: NotRequired[int | None]  # Popcornmeter — written by the RT lane (best-effort)
     status: NotRequired[str]  # done | failed | pending
     note: NotRequired[str]  # why failed / deferred — surfaced in the LangSmith trace
-    # Phase 9 (ADR 0012): the second entry point. `origin` distinguishes a Slack `/add` run
+    # Phase 9 (ADR 0012): the second entry point. `origin` distinguishes a Slack `add` run
     # from the Notion sweep; the notify context is the Slack target for the terminal `notify`.
     # Set in the initial state dict at invoke time (not via Command), so all three are
     # checkpointed and survive the interrupt/resume/restart. Absent → treated as a sweep row.
-    origin: NotRequired[str]  # "slack" for /add; unset/other → sweep (notify no-ops)
+    origin: NotRequired[str]  # "slack" for add; unset/other → sweep (notify no-ops)
     notify_channel: NotRequired[str | None]  # Slack channel to post the completion ping to
-    notify_user: NotRequired[str | None]  # Slack user who ran /add (for the @mention)
-    # Timestamp of the visible `/add` progress message. Persisted so a terminal notify after a
+    notify_user: NotRequired[str | None]  # Slack user who requested add (for the @mention)
+    # Timestamp of the visible add progress message. Persisted so a terminal notify after a
     # human resume (or stale auto-resolve) edits that message instead of posting a second one.
     notify_message_ts: NotRequired[str | None]
     # Phase 6d: set by the 7-day stale-interrupt auto-resolve before Command(resume=best_guess)
@@ -577,7 +577,7 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
 
     The Notion `Type` select is written from the resolved `media_type` for *every* enriched
     Entry — the OMDb-derived type (`omdb_type`, normalized by the Judge) is authoritative, so
-    the agent backfills a blank `Type` and corrects a wrong one alike, on a Slack `/add` row
+    the agent backfills a blank `Type` and corrects a wrong one alike, on a Slack-add row
     and a Notion-origin sweep row both. It's null-safe and idempotent (ADR 0004): a run that
     didn't resolve an identity has `enriched=None` (blank / not-found / unconfirmed), so
     `notion_type` stays None and `Type` is left untouched; an unknown OMDb type maps to None
@@ -599,7 +599,7 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
 
 
 def _completion_message(state: EnrichmentState) -> str | None:
-    """Build the Slack completion ping for a resolved `/add` run, or None if there's nothing.
+    """Build the Slack completion ping for a resolved add run, or None if there's nothing.
 
     `done` → the enrichment summary (IMDb / RT / genre); `failed` → a not-found notice. Any
     other terminal status (shouldn't happen on a resolved run) yields None → no ping.
@@ -625,7 +625,7 @@ def _completion_message(state: EnrichmentState) -> str | None:
 
 
 async def notify(state: EnrichmentState, *, notifier: CompletionNotifier) -> dict:
-    """Terminal node (Phase 9 / ADR 0012): post a Slack completion ping for a `/add` run.
+    """Terminal node (Phase 9 / ADR 0012): post a Slack completion ping for an add run.
 
     No-ops for a Notion-origin sweep row (`origin != "slack"`) — the vast majority of runs.
     For a `slack`-origin run it posts the done/failed summary to the stored `notify_channel`
@@ -669,7 +669,7 @@ def build_graph(
     `disambiguation_llm` drives the Phase-6a `disambiguate` pre-filter (ADR 0008 role 2).
 
     `completion_notifier` (Phase 9 / ADR 0012) is the late-bound Slack poster the terminal
-    `notify` node uses for `/add` runs; pass `None` (CLI / no Slack) for a no-op node.
+    `notify` node uses for Slack-add runs; pass `None` (CLI / no Slack) for a no-op node.
 
     `checkpointer` is an `AsyncSqliteSaver` (ADR 0006 / 0007) when durable execution is wanted
     (the reconcile Runtime, and single-Entry `--enrich`/`--resume`); pass `None` for pure

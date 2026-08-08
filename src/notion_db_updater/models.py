@@ -86,7 +86,7 @@ def enrichment_properties(
     Only the fields that were actually found are included (partial-data writes per ADR 0004);
     `Enrichment Status` is always set. RT scores are best-effort `number` fields (ADR 0003) —
     a null RT is simply omitted, never blocking `done`. `notion_type` (a `Type` option name) is
-    written only for the Phase-9 `/add` path, which backfills `Type` from the resolved
+    written only for the Phase-9 Slack `add` path, which backfills `Type` from the resolved
     `media_type`; it is None (omitted) for a Notion-origin sweep row, whose `Type` is
     human-filled and never overwritten. Shapes proven live by
     `spikes/01_notion_data_source.py`: number, rich_text, select.

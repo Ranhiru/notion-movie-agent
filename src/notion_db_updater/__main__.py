@@ -17,7 +17,7 @@ Phase 6d — auto-resolve stale HITL interrupts (awaiting_input past the 7-day t
     uv run python -m notion_db_updater --auto-resolve-stale                  # one pass
     uv run python -m notion_db_updater --auto-resolve-stale --stale-timeout 0  # test path
 
-Phase 9 — originate an Entry from the CLI (stands in for the Slack `/add` command):
+Phase 9 — originate an Entry from the CLI (stands in for Slack mention `add`):
     uv run python -m notion_db_updater --add "Dune"          # create + enrich out-of-band
 
 Verification (TASKS.md Phase 3): `--reconcile` on the real backfill transitions statuses;
@@ -237,9 +237,9 @@ async def _enrich(page_id: str, capture_fixtures: bool) -> None:
 
 
 async def _add(title: str) -> None:
-    """Phase 9 (ADR 0012): originate an Entry from the CLI — stands in for the Slack `/add`.
+    """Phase 9 (ADR 0012): originate an Entry from the CLI — stands in for Slack mention `add`.
 
-    Dedupes, creates the page, and enriches it out-of-band exactly as the slash handler does,
+    Dedupes, creates the page, and enriches it out-of-band exactly as the mention handler does,
     minus Slack (no completion ping / picker — a pause just prints the resume hint). Lets the
     create-then-enrich path be exercised without Slack tokens (as `--enrich`/`--resume` stand
     in for the HITL transport in earlier phases).
@@ -304,9 +304,10 @@ async def _serve(limit: int | None = None) -> None:
     """Run the reconcile cron + (when Slack is configured) the Socket Mode listener.
 
     Slack is the app's inbound path (ADR 0009 / 0010): it posts the HITL picker when a run
-    pauses and handles the `@movie-bot run` manual trigger. The picker notifier is wired to the
-    same `Runtime` the cron drives, so a paused sweep prompts in Slack and the button click
-    resumes it. When Slack tokens are unset (local dev), falls back to cron-only.
+    pauses and handles the `@movie-bot add <title>` and `@movie-bot run` commands. The picker
+    notifier is wired to the same `Runtime` the cron drives, so a paused sweep prompts in Slack
+    and the button click resumes it. When Slack tokens are unset (local dev), falls back to
+    cron-only.
 
     `limit` caps each sweep to the first N pending entries (testing aid): with the 1-hour
     interval, `--serve --limit 1` processes one ambiguous Entry → one Slack picker, then idles
@@ -318,9 +319,9 @@ async def _serve(limit: int | None = None) -> None:
         if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
             slack = SlackTransport(settings, rt)
             rt.set_notifier(slack.post_picker)
-            rt.bind_completion_notifier(slack.post_completion)  # Phase 9 /add completion ping
+            rt.bind_completion_notifier(slack.post_completion)  # Phase 9 add completion ping
             tasks.append(slack.start())
-            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention run + /add)")
+            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention add/run)")
         else:
             log.info("serve: Slack tokens unset — cron only (no HITL picker)")
         await asyncio.gather(*tasks)
@@ -380,7 +381,9 @@ def main() -> None:
     parser.add_argument(
         "--add",
         metavar="TITLE",
-        help="originate an Entry from the CLI and enrich it (Phase 9 — stands in for /add)",
+        help=(
+            "originate an Entry from the CLI and enrich it (Phase 9 — stands in for Slack add)"
+        ),
     )
     parser.add_argument(
         "--reconcile",

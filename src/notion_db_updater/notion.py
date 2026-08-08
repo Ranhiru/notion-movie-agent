@@ -168,7 +168,7 @@ class NotionClient:
     async def create_entry(self, title: str) -> Entry:
         """Create a new Watchlist page (Phase 9 / ADR 0012): Entry only, `Type` blank, pending.
 
-        The `/add` path originates a row exactly as a human would — just a Title and
+        The Slack `add` path originates a row exactly as a human would — just a Title and
         `Enrichment Status = pending` — then enriches that `page_id` out-of-band through the
         same graph. `Type` is left blank on purpose (search OMDb unfiltered, resolve
         `media_type` via the 1/many + disambiguation logic, then backfill it on write-back).
