@@ -1,0 +1,17 @@
+{
+  "_comment": "Illustrative Slack app_mention payload delivered over Socket Mode (Phase 9 / ADR 0012). The handler parses `event.text` after the leading bot mention and reads `event.channel` plus `event.user` for progress and completion messages.",
+  "token": "verification-token",
+  "team_id": "T0001",
+  "api_app_id": "A0EXAMPLE",
+  "event": {
+    "type": "app_mention",
+    "user": "U0EXAMPLE",
+    "text": "<@U0NOTIONMOVIEAGENT> add Dune",
+    "ts": "1712345678.000001",
+    "channel": "C0NOTIONMOVIE",
+    "event_ts": "1712345678.000001"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0EXAMPLE",
+  "event_time": 1712345678
+}

@@ -8,12 +8,11 @@ A single outbound WebSocket carries all inbound interaction, so there's no publi
    `#notion-movie-db`. The button click resumes the paused graph with the chosen imdbID.
 2. **Manual run:** an `@movie-bot run` app-mention triggers `reconcile()` (under the same
    single-flight lock as the cron; ADR 0001).
-3. **`/add <title>` (Phase 9 / ADR 0012):** a slash command originates an Entry from Slack. The
-   handler `ack()`s within Slack's 3-second window (an ephemeral "Adding…") and does the
-   dedupe / create / out-of-band enrich in a background task; the completion ping is posted by
-   the graph's terminal `notify` node (via `post_completion`, bound into `Runtime`), because a
-   run may only reach `done`/`failed` much later — after a disambiguation click or the 6d
-   auto-resolve.
+3. **`@movie-bot add <title>` (Phase 9 / ADR 0012):** an app mention originates an Entry from
+   Slack. The handler schedules the dedupe / create / out-of-band enrich in a background task;
+   the completion ping is posted by the graph's terminal `notify` node (via `post_completion`,
+   bound into `Runtime`), because a run may only reach `done`/`failed` much later — after a
+   disambiguation click or the 6d auto-resolve.
 
 `Runtime` and this transport are mutually referential — the sweep posts *to* Slack (via
 `Runtime.set_notifier(post_picker)` + `Runtime.bind_completion_notifier(post_completion)`) and
@@ -50,6 +49,11 @@ _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 …
 _MANUAL_ACTION = "manual:submit"
 _MANUAL_BLOCK_PREFIX = "manual_input:"
 _IMDB_ID = re.compile(r"tt\d+")  # matches a full imdb.com/title/tt… URL or a bare tt… id
+# Slack renders a bot mention as `<@BOT_USER_ID>`. Commands must immediately follow the
+# leading mention; the argument remains untouched apart from surrounding whitespace.
+_MENTION_COMMAND = re.compile(
+    r"^\s*<@[^>]+>(?:\s+(?P<command>\S+))?(?:\s+(?P<argument>.*?))?\s*$"
+)
 
 # IMDb title page for a given imdbID — rendered as a clickable link in the picker.
 _IMDB_URL = "https://www.imdb.com/title/{}/"
@@ -177,8 +181,21 @@ def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -
     )
 
 
+def parse_mention_command(text: str) -> tuple[str, str] | None:
+    """Parse Slack's ``<@BOT_ID> command argument`` app-mention text.
+
+    Returns a case-folded command plus its trimmed argument. ``None`` means the event did not
+    start with a Slack mention, which is malformed for this listener but useful to handle
+    defensively in tests and synthetic payloads.
+    """
+    match = _MENTION_COMMAND.fullmatch(text)
+    if match is None:
+        return None
+    return (match.group("command") or "").casefold(), (match.group("argument") or "").strip()
+
+
 class SlackTransport:
-    """Bolt Socket Mode app wiring the HITL picker + manual-run mention to a `Runtime`."""
+    """Bolt Socket Mode app wiring the HITL picker + mention commands to a `Runtime`."""
 
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
@@ -187,7 +204,7 @@ class SlackTransport:
         # chat.postMessage / chat.update; the app token opens the WebSocket.
         self._app = AsyncApp(token=settings.SLACK_BOT_TOKEN)
         self._handler = AsyncSocketModeHandler(self._app, settings.SLACK_APP_TOKEN)
-        # Phase 9: `/add` acks fast and does the work in a background task. Hold strong refs so
+        # Phase 9: mention-based `add` does the work in a background task. Hold strong refs so
         # the tasks aren't garbage-collected mid-flight (asyncio only keeps weak refs).
         self._tasks: set[asyncio.Task[None]] = set()
         self._register()
@@ -289,48 +306,53 @@ class SlackTransport:
 
         @self._app.event("app_mention")
         async def handle_mention(event, say, logger) -> None:  # noqa: ANN001
-            """`@movie-bot run` → one reconcile sweep (single-flight, ADR 0001)."""
-            if "run" not in event.get("text", "").lower():
-                await say("Mention me with `run` to trigger a reconcile sweep.")
-                return
+            """Dispatch `@movie-bot add <title>` and `@movie-bot run`."""
+            await self._handle_mention(event, say, logger)
+
+    async def _handle_mention(self, event, say, logger) -> None:  # noqa: ANN001
+        """Handle one app mention without coupling tests to Bolt's listener registry."""
+        parsed = parse_mention_command(event.get("text", ""))
+        if parsed is None:
+            await say("Mention me with `add <title>` or `run`.")
+            return
+
+        command, argument = parsed
+        if command == "run":
             logger.info("slack: manual run requested")
             await say("Running a reconcile sweep…")
             summary = await self._runtime.reconcile()
             await say(f"reconcile: {summary}")
+            return
 
-        @self._app.command("/add")
-        async def handle_add(ack, command, logger) -> None:  # noqa: ANN001
-            """`/add <title>` → create the Entry and enrich it out-of-band (Phase 9).
+        if command != "add":
+            await say("Mention me with `add <title>` or `run`.")
+            return
+        if not argument:
+            await say(
+                "Usage: `@NotionMovieAgent add <title>` — e.g. `@NotionMovieAgent add Dune`"
+            )
+            return
 
-            Acks within Slack's 3-second window with an ephemeral "Adding…", then hands the
-            dedupe / create / enrich to a background task so the socket isn't blocked. The
-            terminal completion ping comes from the graph's `notify` node, not from here (the
-            run may resolve much later, after a disambiguation click or the 6d timeout).
-            """
-            title = (command.get("text") or "").strip()
-            if not title:
-                await ack(text="Usage: `/add <title>` — e.g. `/add Dune`")
-                return
-            channel = command.get("channel_id")
-            if not channel:  # every slash command carries one — defensive only
-                await ack(text="Couldn't tell which channel to reply in — try again.")
-                return
-            await ack(text=f"Adding *{title}*… I'll post the result here when it's enriched.")
-            user = command.get("user_id")
-            logger.info("slack: /add %r from %s in %s", title, user, channel)
-            task = asyncio.create_task(self._add_flow(title, channel, user))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+        channel = event.get("channel")
+        if not channel:  # every app_mention event carries one — defensive only
+            await say("Couldn't tell which channel to reply in — try again.")
+            return
+        user = event.get("user")
+        logger.info("slack: mention add %r from %s in %s", argument, user, channel)
+        task = asyncio.create_task(self._add_flow(argument, channel, user))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _add_flow(self, title: str, channel: str, user: str | None) -> None:
-        """Background worker for `/add`: dedupe → create + enrich out-of-band (Phase 9).
+        """Background worker for mention `add`: dedupe → create + enrich out-of-band (Phase 9).
 
-        Runs outside the 3-second ack window. On a dedupe hit it posts "already on your
+        Runs after the event listener schedules it. On a dedupe hit it posts "already on your
         watchlist" and creates nothing (ADR 0012 — best-effort dedupe). Otherwise it delegates
         to `Runtime.create_and_enrich`, which creates the page and runs the graph under the
         in-flight guard; the done/failed ping is the graph's `notify` node, so a run that
         pauses for disambiguation (picker in `#notion-movie-db`) still pings this channel on
-        resolve. Uses `chat_postMessage` (never the slash `response_url`, which expires).
+        resolve. Uses `chat_postMessage` so updates remain available after the event is
+        handled.
         """
         progress_ts: str | None = None
 
@@ -340,11 +362,11 @@ class SlackTransport:
             try:
                 await self._app.client.chat_update(channel=channel, ts=progress_ts, text=text)
             except Exception:  # noqa: BLE001 — Slack progress must never gate enrichment
-                log.exception("slack: failed to update /add progress for %r", title)
+                log.exception("slack: failed to update add progress for %r", title)
 
         try:
-            # The slash ack is ephemeral, so post one visible message whose timestamp can be
-            # checkpointed with the graph and edited throughout a later interrupt/resume.
+            # Post one visible message whose timestamp can be checkpointed with the graph and
+            # edited throughout a later interrupt/resume.
             try:
                 progress_message = await self._app.client.chat_postMessage(
                     channel=channel,
@@ -352,7 +374,7 @@ class SlackTransport:
                 )
                 progress_ts = progress_message["ts"]
             except Exception:  # noqa: BLE001 — terminal notify can still post without a ts
-                log.exception("slack: failed to post /add progress for %r", title)
+                log.exception("slack: failed to post add progress for %r", title)
             existing = await self._runtime.find_duplicate(title)
             if existing is not None:
                 text = (
@@ -373,7 +395,7 @@ class SlackTransport:
                 progress=update_progress,
             )
         except Exception:
-            log.exception("slack: /add %r failed", title)
+            log.exception("slack: add %r failed", title)
             with contextlib.suppress(Exception):
                 text = f"Couldn't add *{title}* — something went wrong. Try again?"
                 if progress_ts is not None:
@@ -384,11 +406,11 @@ class SlackTransport:
     async def post_completion(
         self, channel: str, text: str, message_ts: str | None = None
     ) -> None:
-        """Post a `/add` completion ping (bound into `Runtime`'s terminal `notify` node).
+        """Post an `add` completion ping (bound into `Runtime`'s terminal `notify` node).
 
-        `chat_postMessage` (not the slash `response_url`, which expires) so a run that only
-        resolves days later — after a Slack disambiguation click or the 6d auto-resolve — still
-        reaches the user. When the run has a durable progress-message timestamp, edit that
+        A run may only resolve days later — after a Slack disambiguation click or the 6d
+        auto-resolve — so durable graph state retains the channel and message timestamp. When
+        the run has a durable progress-message timestamp, edit that
         message into the final result; older/checkpoint-less runs fall back to a new message.
         Unfurls are suppressed so the IMDb link stays a compact click-through.
         """

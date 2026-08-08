@@ -1,20 +1,23 @@
-# Slack (Bolt + Socket Mode) as the only inbound path: HITL picks + manual run
+# Slack (Bolt + Socket Mode) as the only inbound path: HITL picks + mention commands
 
 The app uses the **Slack Bolt** framework in **Socket Mode** — a single outbound WebSocket
 to Slack that carries *all* inbound interaction, so the build needs no public HTTP endpoint
-(see [0009](./0009-local-first-cron-only-slack-socket-mode.md)). It serves two purposes:
+(see [0009](./0009-local-first-cron-only-slack-socket-mode.md)). It serves three purposes:
 
 1. **HITL disambiguation** ([0006](./0006-hitl-disambiguation-out-of-band-resume.md)): post
    the candidate Entries to **`#notion-movie-db`**, receive the button click, resume the graph.
 2. **Manual run**: an app-mention `@movie-bot run` triggers `reconcile()` (under the
    single-flight lock of [0001](./0001-unified-reconcile-single-flight.md)). The hourly cron
    covers everything else.
+3. **Add an Entry**: `@NotionMovieAgent add <name>` dispatches from the same `app_mention`
+   listener and starts the out-of-band create-then-enrich flow ([0012](./0012-slack-add-command-second-entry-point.md)).
 
 ## Tokens & config
 
 - **`SLACK_BOT_TOKEN`** (`xoxb-…`) and **`SLACK_APP_TOKEN`** (`xapp-…`, scope
   `connections:write`) — both required for Bolt Socket Mode. Socket Mode + Interactivity must
-  be enabled in the app config; `app_mentions:read` for the manual-run trigger.
+  be enabled in the app config; subscribe to the `app_mention` bot event and grant
+  `app_mentions:read` plus `chat:write` for mention commands and their replies.
 - All Slack credentials loaded from env (`.env` in development).
 
 ## Block Kit message shape

@@ -142,10 +142,10 @@ class ResumeResult:
 
 @dataclass(frozen=True, slots=True)
 class AddOutcome:
-    """Result of a Slack `/add` create-then-enrich (Phase 9 / ADR 0012).
+    """Result of a Slack mention `add` create-then-enrich (Phase 9 / ADR 0012).
 
     `status` is the terminal graph status (`done` / `failed`) or `awaiting_input` when the run
-    paused for human disambiguation — enough for the `--add` CLI / the slash handler to report
+    paused for human disambiguation — enough for the `--add` CLI / mention handler to report
     what happened to the freshly-created `page_id`. The completion *ping* itself is posted by
     the graph's `notify` node, not from here (a paused run resolves much later).
     """
@@ -202,7 +202,7 @@ class Runtime:
         self._notifier: Callable[[str, dict], Awaitable[None]] | None = None
         # Phase 9 (ADR 0012): the terminal `notify` node's late-bound Slack poster (bound by
         # `_serve` once the transport exists) and the process-global in-flight guard — page_ids
-        # currently being enriched out-of-band by a `/add`, which the sweep must skip so a
+        # currently being enriched out-of-band by a Slack `add`, which the sweep must skip so a
         # concurrent cron doesn't double-enrich the same still-`pending` row.
         self._completion_notifier = CompletionNotifier()
         self._inflight: set[str] = set()
@@ -283,9 +283,10 @@ class Runtime:
 
     async def _sweep(self, limit: int | None = None) -> ReconcileSummary:
         entries = await self._notion.query_entries()
-        # Phase 9 (ADR 0012): skip any row a `/add` is enriching out-of-band right now — it's
-        # still `pending` (its terminal write hasn't landed), so it matches the sweep filter,
-        # but re-enriching it would double external-API spend (the hazard ADR 0001 prevents).
+        # Phase 9 (ADR 0012): skip any row a Slack `add` is enriching out-of-band right
+        # now — it's still `pending` (its terminal write hasn't landed), so it matches the
+        # sweep filter, but re-enriching it would double external-API spend (the hazard ADR
+        # 0001 prevents).
         # Crash-safe: on a crash the set vanishes and the row is still `pending`, so the next
         # cron reclaims it (ADR 0004 self-heal — no `enriching` Notion status needed).
         if self._inflight:
@@ -345,7 +346,7 @@ class Runtime:
                 config: RunnableConfig = {
                     # thread_id = page_id keys the checkpoint (ADR 0006/0007), so a Phase-6b
                     # paused run resumes on this same key. run_name names the LangSmith trace;
-                    # `origin` foreshadows the Phase 9 Slack `/add` path (ADR 0001).
+                    # `origin` foreshadows the Phase 9 Slack `add` path (ADR 0001).
                     "configurable": {"thread_id": entry.page_id},
                     "run_name": entry.title or "(blank Entry)",
                     "metadata": {"page_id": entry.page_id, "origin": "sweep"},
@@ -371,8 +372,8 @@ class Runtime:
     async def _handle_pause(self, entry: Entry, final_state: dict) -> bool:
         """If a run paused at `interrupt()`: mark awaiting_input + post the picker. → paused?
 
-        Shared by the reconcile sweep (`_run_one`) and the Phase-9 out-of-band `/add`
-        (`create_and_enrich`), so a `/add` that turns ambiguous pauses and prompts in Slack
+        Shared by the reconcile sweep (`_run_one`) and the Phase-9 out-of-band Slack `add`
+        (`create_and_enrich`), so an add that turns ambiguous pauses and prompts in Slack
         exactly like a swept row (ADR 0006 / 0012). The run is checkpointed under
         `thread_id = page_id`; `update_notion` never ran, so we write `awaiting_input` here so
         the next sweep skips it (the filter queries empty/pending only) and an out-of-band
@@ -393,7 +394,7 @@ class Runtime:
         return True
 
     async def find_duplicate(self, title: str) -> Entry | None:
-        """Best-effort pre-create dedupe for `/add` (Phase 9): an existing Entry, or None."""
+        """Best-effort pre-create dedupe for Slack `add` (Phase 9): an Entry, or None."""
         return await self._notion.find_by_title(title)
 
     async def create_and_enrich(
@@ -405,15 +406,16 @@ class Runtime:
         message_ts: str | None = None,
         progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> AddOutcome:
-        """Create a Watchlist page from `/add` and enrich it out-of-band (Phase 9 / ADR 0012).
+        """Create a Watchlist page from Slack `add` and enrich it out-of-band.
 
-        Creates the page (Entry only, `pending`), then runs the *same* enrichment graph on its
-        `page_id` — but **without** the single-flight lock (the lock serializes sweep-vs-sweep;
-        this is an interactive, one-page run). Instead the `page_id` is held in the in-flight
-        guard for the whole run so a concurrent cron sweep skips it (`_sweep`), closing the
-        double-enrich hazard ADR 0012 calls out. `origin=slack` + the notify context ride in on
-        the initial state (checkpointed → durable across the interrupt/resume), so the terminal
-        `notify` node posts the completion ping — even if the run only resolves days later.
+        Phase 9 / ADR 0012. Creates the page (Entry only, `pending`), then runs the *same*
+        enrichment graph on its `page_id` — but **without** the single-flight lock (the lock
+        serializes sweep-vs-sweep; this is an interactive, one-page run). Instead the `page_id`
+        is held in the in-flight guard for the whole run so a concurrent cron sweep skips it
+        (`_sweep`), closing the double-enrich hazard ADR 0012 calls out. `origin=slack` + the
+        notify context ride in on the initial state (checkpointed → durable across the
+        interrupt/resume), so the terminal `notify` node posts the completion ping — even if
+        the run only resolves days later.
 
         Returns an `AddOutcome`; a run that turns ambiguous pauses at `interrupt()`
         (`awaiting_input`) and posts the HITL picker via `_handle_pause`, resolved later by a
