@@ -42,19 +42,20 @@ preserved, which a new `enriching` status would have broken (a crash would stran
 ## Completion feedback and `origin`
 
 The app-mention handler schedules create/dedupe/enrich in a background task and returns
-promptly. That task posts one visible progress message. `Runtime.create_and_enrich` consumes
-LangGraph's `stream_mode="updates"` output and
-edits that message at real node-completion milestones (search, identity resolution, source
-combination, verification, Notion write). Progress is best-effort: a Slack update failure is
-logged and never gates the durable enrichment run.
+promptly. The handler's Bolt `set_status` utility calls `assistant.threads.setStatus`, so
+Slack renders progress as transient agent activity beneath the user's mention rather than as
+additional messages. `Runtime.create_and_enrich` consumes LangGraph's
+`stream_mode="updates"` output and updates that status at real node-completion milestones
+(search, identity resolution, source combination, verification, Notion write). Progress is
+best-effort: a Slack status failure is logged and never gates the durable enrichment run.
 
-The progress message timestamp is carried in graph state with the Slack channel/user. The
-terminal `notify` node edits that same message into the completion result (IMDb / RT / genre)
-or not-found notice. Persisting the timestamp matters because the terminal state may arrive
-much later — after a Slack disambiguation click or even the 7-day cron auto-resolve. The node
-is gated on `origin == "slack"`: it posts only for `slack`-originated runs and no-ops for
-sweep rows. Runs created before this field existed, CLI runs, and any initial progress-post
-failure fall back to `chat_postMessage` because a run can sit in HITL for days.
+The original mention's thread-root timestamp is carried in graph state with the Slack
+channel/user. The terminal `notify` node posts the completion result (IMDb / RT / genre) or
+not-found notice as a reply beneath that mention. Persisting the timestamp matters because
+the terminal state may arrive much later — after a Slack disambiguation click or even the
+7-day cron auto-resolve. The node is gated on `origin == "slack"`: it posts only for
+`slack`-originated runs and no-ops for sweep rows. Runs created before this field existed and
+CLI runs lack a thread root, so they fall back to a channel `chat_postMessage`.
 
 ## Consequences
 
@@ -62,7 +63,7 @@ failure fall back to `chat_postMessage` because a run can sit in HITL for days.
   (delivered over the Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
   dedupe query (match the typed Entry case-insensitively; on a hit, tell the user and
   create nothing), the in-flight guard, streamed progress updates, the notify node, and durable
-  graph state for `origin` plus Slack notify/progress context. Unchanged: the enrichment graph
+  graph state for `origin` plus Slack notify/thread context. Unchanged: the enrichment graph
   topology, disambiguation picker, checkpointer, status lifecycle, single-flight lock, rate
   limiters.
 - **The agent now writes `Type`.** §8 had `Type` as human-filled; for Slack-add rows it starts

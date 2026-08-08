@@ -861,9 +861,11 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
       watchlist (status: …)" and stop) else `create_and_enrich` in a try/except (failure reply
       on error). Completion / not-found feedback comes from the graph `notify` node.
       → `slack.py`. Background tasks held in `self._tasks` (strong refs; discarded on done).
-      `_add_flow` posts everything via `chat_postMessage`. A missing `event.channel` (defensive)
-      returns an error. **Completion channel decision of record:** the mention channel; the picker stays fixed to `#notion-movie-db` (verbatim
-      reuse).
+      `_add_flow` renders enrichment milestones via Bolt's transient `set_status`; dedupe,
+      failure, and completion outcomes use `chat_postMessage` beneath the original mention's
+      thread root. A missing `event.channel` (defensive) returns an error. **Completion channel
+      decision of record:** the mention channel/thread; the picker stays fixed to
+      `#notion-movie-db` (verbatim reuse).
 - [x] `_serve` binds the `CompletionNotifier` to `slack.post_completion` after wiring the picker
       notifier (`Runtime.bind_completion_notifier`).
       → `__main__.py`. `post_completion` suppresses unfurls so the IMDb link stays compact.
@@ -878,8 +880,8 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
       `SlackTransport` constructs with fake tokens + registers `app_mention`; a new title →
       `create_and_enrich` called, no immediate post (ping is the `notify` node); a dedupe hit →
       reply naming the status, `create_and_enrich` **not** called; a create failure → a
-      best-effort error reply, no crash; `post_completion` posts to the channel with unfurls
-      off. Fixture captured: `tests/fixtures/slack_add_command.json` (documented `command`
+      best-effort error reply, no crash; `post_completion` posts in the mention thread with
+      unfurls off. Fixture captured: `tests/fixtures/slack_add_command.json` (documented `command`
       shape). **Live is owner-run** (Slack tokens aren't in Claude's shell env): `--serve` with
       tokens set → run the five mention-add
       scenarios above; a genuinely nonexistent title escalates to the candidate-less picker and

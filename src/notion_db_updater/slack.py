@@ -10,9 +10,10 @@ A single outbound WebSocket carries all inbound interaction, so there's no publi
    single-flight lock as the cron; ADR 0001).
 3. **`@movie-bot add <title>` (Phase 9 / ADR 0012):** an app mention originates an Entry from
    Slack. The handler schedules the dedupe / create / out-of-band enrich in a background task;
-   the completion ping is posted by the graph's terminal `notify` node (via `post_completion`,
-   bound into `Runtime`), because a run may only reach `done`/`failed` much later — after a
-   disambiguation click or the 6d auto-resolve.
+   progress is rendered with Slack's transient assistant-thread status, while the completion
+   ping is posted as a reply in the mention's thread by the graph's terminal `notify` node
+   (via `post_completion`, bound into `Runtime`). A run may only reach `done`/`failed` much
+   later — after a disambiguation click or the 6d auto-resolve.
 
 `Runtime` and this transport are mutually referential — the sweep posts *to* Slack (via
 `Runtime.set_notifier(post_picker)` + `Runtime.bind_completion_notifier(post_completion)`) and
@@ -173,6 +174,11 @@ def _section_blocks(text: str) -> list[dict]:
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
 
+def _status_text(text: str) -> str:
+    """Turn the existing mrkdwn progress copy into Slack assistant-status plain text."""
+    return re.sub(r"^[^\w]+", "", text).replace("*", "")
+
+
 def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -> list[dict]:
     """The terminal ✅ message replacing the picker once a run resolves (button or manual)."""
     return _section_blocks(
@@ -305,11 +311,11 @@ class SlackTransport:
             )
 
         @self._app.event("app_mention")
-        async def handle_mention(event, say, logger) -> None:  # noqa: ANN001
+        async def handle_mention(event, say, set_status, logger) -> None:  # noqa: ANN001
             """Dispatch `@movie-bot add <title>` and `@movie-bot run`."""
-            await self._handle_mention(event, say, logger)
+            await self._handle_mention(event, say, logger, set_status)
 
-    async def _handle_mention(self, event, say, logger) -> None:  # noqa: ANN001
+    async def _handle_mention(self, event, say, logger, set_status=None) -> None:  # noqa: ANN001
         """Handle one app mention without coupling tests to Bolt's listener registry."""
         parsed = parse_mention_command(event.get("text", ""))
         if parsed is None:
@@ -337,13 +343,24 @@ class SlackTransport:
         if not channel:  # every app_mention event carries one — defensive only
             await say("Couldn't tell which channel to reply in — try again.")
             return
+        # A top-level mention starts a new thread; a mention made inside an existing thread
+        # keeps using that thread's root. Slack's assistant status and the eventual answer must
+        # target the same root timestamp.
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        if not thread_ts:  # every real message event carries ts — defensive only
+            await say("Couldn't tell which message to reply to — try again.")
+            return
         user = event.get("user")
         logger.info("slack: mention add %r from %s in %s", argument, user, channel)
-        task = asyncio.create_task(self._add_flow(argument, channel, user))
+        task = asyncio.create_task(
+            self._add_flow(argument, channel, user, thread_ts, set_status)
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _add_flow(self, title: str, channel: str, user: str | None) -> None:
+    async def _add_flow(
+        self, title: str, channel: str, user: str | None, thread_ts: str, set_status
+    ) -> None:  # noqa: ANN001
         """Background worker for mention `add`: dedupe → create + enrich out-of-band (Phase 9).
 
         Runs after the event listener schedules it. On a dedupe hit it posts "already on your
@@ -351,81 +368,71 @@ class SlackTransport:
         to `Runtime.create_and_enrich`, which creates the page and runs the graph under the
         in-flight guard; the done/failed ping is the graph's `notify` node, so a run that
         pauses for disambiguation (picker in `#notion-movie-db`) still pings this channel on
-        resolve. Uses `chat_postMessage` so updates remain available after the event is
-        handled.
+        resolve. Progress uses `assistant.threads.setStatus`, which Slack renders as transient
+        agent activity beneath the mention rather than as chat messages. Final outcomes use
+        `chat.postMessage(thread_ts=...)`, so the channel only gets a thread indicator.
         """
-        progress_ts: str | None = None
 
         async def update_progress(text: str) -> None:
-            if progress_ts is None:
+            if set_status is None:
                 return
             try:
-                await self._app.client.chat_update(channel=channel, ts=progress_ts, text=text)
+                await set_status(status=_status_text(text))
             except Exception:  # noqa: BLE001 — Slack progress must never gate enrichment
                 log.exception("slack: failed to update add progress for %r", title)
 
         try:
-            # Post one visible message whose timestamp can be checkpointed with the graph and
-            # edited throughout a later interrupt/resume.
-            try:
-                progress_message = await self._app.client.chat_postMessage(
-                    channel=channel,
-                    text=f"🔎 Checking the watchlist for *{title}*…",
-                )
-                progress_ts = progress_message["ts"]
-            except Exception:  # noqa: BLE001 — terminal notify can still post without a ts
-                log.exception("slack: failed to post add progress for %r", title)
+            await update_progress(f"🔎 Checking the watchlist for *{title}*…")
             existing = await self._runtime.find_duplicate(title)
             if existing is not None:
                 text = (
                     f"*{existing.title}* is already on the watchlist "
                     f"(status: *{existing.status or 'unset'}*) — nothing added."
                 )
-                if progress_ts is not None:
-                    await update_progress(text)
-                else:
-                    await self._app.client.chat_postMessage(channel=channel, text=text)
+                await self._app.client.chat_postMessage(
+                    channel=channel, text=text, thread_ts=thread_ts
+                )
                 return
             await update_progress(f"📝 Creating a Notion entry for *{title}*…")
             await self._runtime.create_and_enrich(
                 title,
                 channel=channel,
                 user=user,
-                message_ts=progress_ts,
+                # Persist the request thread root with the graph. If enrichment pauses for
+                # human input, its eventual completion still replies to the original mention.
+                thread_ts=thread_ts,
                 progress=update_progress,
             )
         except Exception:
             log.exception("slack: add %r failed", title)
             with contextlib.suppress(Exception):
                 text = f"Couldn't add *{title}* — something went wrong. Try again?"
-                if progress_ts is not None:
-                    await update_progress(text)
-                else:
-                    await self._app.client.chat_postMessage(channel=channel, text=text)
+                await self._app.client.chat_postMessage(
+                    channel=channel, text=text, thread_ts=thread_ts
+                )
 
     async def post_completion(
-        self, channel: str, text: str, message_ts: str | None = None
+        self, channel: str, text: str, thread_ts: str | None = None
     ) -> None:
         """Post an `add` completion ping (bound into `Runtime`'s terminal `notify` node).
 
         A run may only resolve days later — after a Slack disambiguation click or the 6d
-        auto-resolve — so durable graph state retains the channel and message timestamp. When
-        the run has a durable progress-message timestamp, edit that
-        message into the final result; older/checkpoint-less runs fall back to a new message.
-        Unfurls are suppressed so the IMDb link stays a compact click-through.
+        auto-resolve — so durable graph state retains the channel and original mention's
+        thread timestamp. New runs post into that thread; older/checkpoint-less runs fall back
+        to a channel message. Unfurls are suppressed so the IMDb link stays compact.
         """
-        if message_ts is not None:
+        if thread_ts is not None:
             try:
-                await self._app.client.chat_update(
+                await self._app.client.chat_postMessage(
                     channel=channel,
-                    ts=message_ts,
                     text=text,
+                    thread_ts=thread_ts,
                     unfurl_links=False,
                     unfurl_media=False,
                 )
                 return
-            except Exception:  # noqa: BLE001 — deleted/stale message → post the result anew
-                log.exception("slack: failed to finalize progress message; posting completion")
+            except Exception:  # noqa: BLE001 — deleted/stale root → post the result anew
+                log.exception("slack: failed to post threaded completion; posting to channel")
         await self._app.client.chat_postMessage(
             channel=channel,
             text=text,

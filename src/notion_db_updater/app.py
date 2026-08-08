@@ -403,7 +403,7 @@ class Runtime:
         *,
         channel: str | None = None,
         user: str | None = None,
-        message_ts: str | None = None,
+        thread_ts: str | None = None,
         progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> AddOutcome:
         """Create a Watchlist page from Slack `add` and enrich it out-of-band.
@@ -442,7 +442,7 @@ class Runtime:
                 "origin": SLACK_ORIGIN,
                 "notify_channel": channel,
                 "notify_user": user,
-                "notify_message_ts": message_ts,
+                "notify_thread_ts": thread_ts,
             }
             # Stream state updates so Slack reflects nodes that have actually completed.
             # The checkpointer remains authoritative for the final state and durable resume.
