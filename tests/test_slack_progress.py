@@ -7,7 +7,7 @@ from unittest.mock import ANY, AsyncMock, Mock
 
 from notion_db_updater.app import Runtime
 from notion_db_updater.models import Entry
-from notion_db_updater.slack import SlackTransport, parse_mention_command
+from notion_db_updater.slack import LOADING_MESSAGES, SlackTransport, parse_mention_command
 
 
 def _entry(title: str = "Dune") -> Entry:
@@ -66,13 +66,18 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         transport._tasks = set()
         started = asyncio.Event()
         release = asyncio.Event()
-        received: list[tuple[str, str, str | None, str, object]] = []
+        received: list[tuple[str, str, str | None, str | None, str, object]] = []
         set_status = AsyncMock()
 
         async def add_flow(
-            title: str, channel: str, user: str | None, thread_ts: str, status
+            title: str,
+            channel: str,
+            team_id: str | None,
+            user: str | None,
+            thread_ts: str,
+            status,
         ) -> None:
-            received.append((title, channel, user, thread_ts, status))
+            received.append((title, channel, team_id, user, thread_ts, status))
             started.set()
             await release.wait()
 
@@ -85,6 +90,7 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
             {
                 "text": "<@U0BOT> add Dune",
                 "channel": "C123",
+                "team": "T123",
                 "user": "U123",
                 "ts": "171234.567",
             },
@@ -95,7 +101,9 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         await started.wait()
 
         self.assertEqual(len(transport._tasks), 1)
-        self.assertEqual(received, [("Dune", "C123", "U123", "171234.567", set_status)])
+        self.assertEqual(
+            received, [("Dune", "C123", "T123", "U123", "171234.567", set_status)]
+        )
         say.assert_not_awaited()
         logger.info.assert_called_once_with(
             "slack: mention add %r from %s in %s", "Dune", "U123", "C123"
@@ -192,10 +200,10 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [call.args[0] for call in progress.await_args_list],
             [
-                "✅ Notion entry created — starting enrichment…",
-                "🔎 Searching movie databases…",
-                "🎬 Checking the best title match…",
-                "📝 Updating Notion…",
+                "notion.creation.complete",
+                "database.read.complete",
+                "omdb.search.complete",
+                "confidence.assessment.complete",
             ],
         )
         self.assertNotIn("page-1", runtime._inflight)
@@ -263,18 +271,45 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_status_progress_is_transient_and_thread_root_is_checkpointed(self) -> None:
+    @staticmethod
+    def _stream_client(**overrides) -> SimpleNamespace:
+        values = {
+            "chat_startStream": AsyncMock(return_value={"ok": True, "ts": "stream-1"}),
+            "chat_appendStream": AsyncMock(return_value={"ok": True}),
+            "chat_stopStream": AsyncMock(return_value={"ok": True}),
+            "chat_postMessage": AsyncMock(return_value={"ok": True}),
+            "chat_update": AsyncMock(return_value={"ok": True}),
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    async def test_add_starts_grouped_plan_with_loading_rotation_and_task_chunks(self) -> None:
         transport = object.__new__(SlackTransport)
-        client = SimpleNamespace(chat_postMessage=AsyncMock(), chat_update=AsyncMock())
+        client = self._stream_client()
         set_status = AsyncMock()
+
+        async def create_and_enrich(*args, progress, **kwargs) -> None:
+            for event_id in (
+                "notion.creation.complete",
+                "database.read.complete",
+                "omdb.search.complete",
+                "omdb.details.complete",
+                "rotten_tomatoes.complete",
+                "sources.compare.complete",
+                "match.verification.complete",
+                "confidence.assessment.complete",
+                "notion.update.complete",
+            ):
+                await progress(event_id)
+
         runtime = SimpleNamespace(
             find_duplicate=AsyncMock(return_value=None),
-            create_and_enrich=AsyncMock(),
+            create_and_enrich=AsyncMock(side_effect=create_and_enrich),
         )
         transport._app = SimpleNamespace(client=client)
         transport._runtime = runtime
 
-        await transport._add_flow("Dune", "C123", "U123", "171234.567", set_status)
+        await transport._add_flow("Dune", "C123", "T123", "U123", "171234.567", set_status)
 
         runtime.create_and_enrich.assert_awaited_once_with(
             "Dune",
@@ -283,18 +318,61 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
             thread_ts="171234.567",
             progress=ANY,
         )
-        set_status.assert_has_awaits(
-            [
-                unittest.mock.call(status="Checking the watchlist for Dune…"),
-                unittest.mock.call(status="Creating a Notion entry for Dune…"),
-            ]
+        client.chat_startStream.assert_awaited_once_with(
+            channel="C123",
+            thread_ts="171234.567",
+            recipient_team_id="T123",
+            recipient_user_id="U123",
+            task_display_mode="plan",
         )
+        self.assertEqual(len(LOADING_MESSAGES), 10)
+        self.assertEqual(len(set(LOADING_MESSAGES)), 10)
+        set_status.assert_awaited_once_with(
+            status="Adding Dune to your watchlist…",
+            loading_messages=LOADING_MESSAGES,
+        )
+        chunks = [
+            chunk
+            for call in client.chat_appendStream.await_args_list
+            for chunk in call.kwargs["chunks"]
+        ]
+        self.assertTrue(chunks)
+        self.assertTrue(all(chunk["type"] == "task_update" for chunk in chunks))
+        self.assertTrue(all(len(chunk["title"]) < 256 for chunk in chunks))
+        self.assertEqual(
+            {chunk["status"] for chunk in chunks},
+            {"pending", "in_progress", "complete"},
+        )
+        self.assertEqual(
+            {chunk["id"] for chunk in chunks},
+            {
+                "deduplication",
+                "notion_creation",
+                "database_search",
+                "title_matching",
+                "disambiguation",
+                "omdb_details",
+                "rotten_tomatoes",
+                "source_comparison",
+                "verification",
+                "confidence",
+                "notion_update",
+            },
+        )
+        for task_id in {chunk["id"] for chunk in chunks}:
+            self.assertEqual(
+                [chunk["status"] for chunk in chunks if chunk["id"] == task_id],
+                ["pending", "in_progress", "complete"],
+            )
+        client.chat_stopStream.assert_awaited_once_with(channel="C123", ts="stream-1")
         client.chat_postMessage.assert_not_awaited()
         client.chat_update.assert_not_awaited()
 
-    async def test_status_failure_does_not_gate_enrichment(self) -> None:
+    async def test_slack_stream_and_status_failures_do_not_gate_enrichment(self) -> None:
         transport = object.__new__(SlackTransport)
-        client = SimpleNamespace(chat_postMessage=AsyncMock(), chat_update=AsyncMock())
+        client = self._stream_client(
+            chat_startStream=AsyncMock(side_effect=RuntimeError("Slack unavailable"))
+        )
         runtime = SimpleNamespace(
             find_duplicate=AsyncMock(return_value=None),
             create_and_enrich=AsyncMock(),
@@ -304,7 +382,7 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         set_status = AsyncMock(side_effect=RuntimeError("Slack unavailable"))
 
         with self.assertLogs("notion_db_updater.slack", level="ERROR"):
-            await transport._add_flow("Dune", "C123", "U123", "171234.567", set_status)
+            await transport._add_flow("Dune", "C123", "T123", "U123", "171234.567", set_status)
 
         runtime.create_and_enrich.assert_awaited_once_with(
             "Dune",
@@ -313,20 +391,158 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
             thread_ts="171234.567",
             progress=ANY,
         )
+        client.chat_appendStream.assert_not_awaited()
+        client.chat_stopStream.assert_not_awaited()
 
-    async def test_duplicate_result_is_a_thread_reply(self) -> None:
+    async def test_append_failure_does_not_gate_enrichment_and_open_stream_stops(self) -> None:
         transport = object.__new__(SlackTransport)
-        client = SimpleNamespace(chat_postMessage=AsyncMock(), chat_update=AsyncMock())
+        client = self._stream_client(
+            chat_appendStream=AsyncMock(side_effect=RuntimeError("Slack unavailable"))
+        )
+        runtime = SimpleNamespace(
+            find_duplicate=AsyncMock(return_value=None),
+            create_and_enrich=AsyncMock(),
+        )
+        transport._app = SimpleNamespace(client=client)
+        transport._runtime = runtime
+
+        with self.assertLogs("notion_db_updater.slack", level="ERROR"):
+            await transport._add_flow(
+                "Dune", "C123", "T123", "U123", "171234.567", AsyncMock()
+            )
+
+        runtime.create_and_enrich.assert_awaited_once()
+        client.chat_stopStream.assert_awaited_once_with(channel="C123", ts="stream-1")
+
+    async def test_duplicate_result_is_a_thread_reply_and_stops_stream(self) -> None:
+        transport = object.__new__(SlackTransport)
+        client = self._stream_client()
         transport._app = SimpleNamespace(client=client)
         transport._runtime = SimpleNamespace(find_duplicate=AsyncMock(return_value=_entry()))
 
-        await transport._add_flow("Dune", "C123", "U123", "171234.567", AsyncMock())
+        await transport._add_flow("Dune", "C123", "T123", "U123", "171234.567", AsyncMock())
 
         client.chat_postMessage.assert_awaited_once_with(
             channel="C123",
             text="*Dune* is already on the watchlist (status: *pending*) — nothing added.",
             thread_ts="171234.567",
         )
+        client.chat_stopStream.assert_awaited_once_with(channel="C123", ts="stream-1")
+
+    async def test_graph_failure_marks_active_task_error_and_stops_stream(self) -> None:
+        transport = object.__new__(SlackTransport)
+        client = self._stream_client()
+        transport._app = SimpleNamespace(client=client)
+        transport._runtime = SimpleNamespace(
+            find_duplicate=AsyncMock(return_value=None),
+            create_and_enrich=AsyncMock(side_effect=RuntimeError("graph failed")),
+        )
+
+        with self.assertLogs("notion_db_updater.slack", level="ERROR"):
+            await transport._add_flow(
+                "Dune", "C123", "T123", "U123", "171234.567", AsyncMock()
+            )
+
+        error_chunks = [
+            chunk
+            for call in client.chat_appendStream.await_args_list
+            for chunk in call.kwargs["chunks"]
+            if chunk["status"] == "error"
+        ]
+        self.assertEqual([chunk["id"] for chunk in error_chunks], ["notion_creation"])
+        client.chat_stopStream.assert_awaited_once_with(channel="C123", ts="stream-1")
+        client.chat_postMessage.assert_awaited_once_with(
+            channel="C123",
+            text="Couldn't add *Dune* — something went wrong. Try again?",
+            thread_ts="171234.567",
+        )
+
+    async def test_hitl_pause_marks_disambiguation_and_stops_stream(self) -> None:
+        transport = object.__new__(SlackTransport)
+        client = self._stream_client()
+
+        async def pause(*args, progress, **kwargs) -> None:
+            await progress("notion.creation.complete")
+            await progress("database.read.complete")
+            await progress("omdb.search.complete")
+            await progress("human_input.required")
+
+        transport._app = SimpleNamespace(client=client)
+        transport._runtime = SimpleNamespace(
+            find_duplicate=AsyncMock(return_value=None),
+            create_and_enrich=AsyncMock(side_effect=pause),
+        )
+
+        await transport._add_flow("Dune", "C123", "T123", "U123", "171234.567", AsyncMock())
+
+        error_chunks = [
+            chunk
+            for call in client.chat_appendStream.await_args_list
+            for chunk in call.kwargs["chunks"]
+            if chunk["status"] == "error"
+        ]
+        self.assertEqual([chunk["id"] for chunk in error_chunks], ["disambiguation"])
+        client.chat_stopStream.assert_awaited_once_with(channel="C123", ts="stream-1")
+
+    async def test_slack_origin_pause_passes_checkpointed_picker_context(self) -> None:
+        runtime = object.__new__(Runtime)
+        runtime._notion = SimpleNamespace(update_entry=AsyncMock())
+        runtime._notifier = AsyncMock()
+        payload = {"title": "Dune", "candidates": []}
+
+        paused = await runtime._handle_pause(
+            _entry(),
+            {
+                "__interrupt__": [SimpleNamespace(value=payload)],
+                "origin": "slack",
+                "notify_channel": "C123",
+                "notify_thread_ts": "171234.567",
+            },
+        )
+
+        self.assertTrue(paused)
+        runtime._notifier.assert_awaited_once_with("page-1", payload, "C123", "171234.567")
+
+    async def test_reconcile_pause_keeps_configured_top_level_picker_fallback(self) -> None:
+        runtime = object.__new__(Runtime)
+        runtime._notion = SimpleNamespace(update_entry=AsyncMock())
+        runtime._notifier = AsyncMock()
+        payload = {"title": "Dune", "candidates": []}
+
+        await runtime._handle_pause(
+            _entry(), {"__interrupt__": [SimpleNamespace(value=payload)]}
+        )
+
+        runtime._notifier.assert_awaited_once_with("page-1", payload, None, None)
+
+    async def test_picker_uses_originating_channel_and_thread(self) -> None:
+        transport = object.__new__(SlackTransport)
+        transport._channel = "CFALLBACK"
+        client = self._stream_client()
+        transport._app = SimpleNamespace(client=client)
+
+        await transport.post_picker(
+            "page-1",
+            {"title": "Dune", "candidates": []},
+            "C123",
+            "171234.567",
+        )
+
+        kwargs = client.chat_postMessage.await_args.kwargs
+        self.assertEqual(kwargs["channel"], "C123")
+        self.assertEqual(kwargs["thread_ts"], "171234.567")
+
+    async def test_reconcile_picker_is_top_level_in_configured_channel(self) -> None:
+        transport = object.__new__(SlackTransport)
+        transport._channel = "CFALLBACK"
+        client = self._stream_client()
+        transport._app = SimpleNamespace(client=client)
+
+        await transport.post_picker("page-1", {"title": "Dune", "candidates": []})
+
+        kwargs = client.chat_postMessage.await_args.kwargs
+        self.assertEqual(kwargs["channel"], "CFALLBACK")
+        self.assertNotIn("thread_ts", kwargs)
 
 
 if __name__ == "__main__":

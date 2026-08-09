@@ -54,20 +54,24 @@ from .resilience import transient_retry_policy
 
 log = logging.getLogger(__name__)
 
-# Friendly Slack progress emitted after real graph nodes complete. The graph's OMDb and RT
-# lanes run concurrently, so these describe durable milestones rather than pretending to be a
-# percentage-complete counter. Nodes omitted here either finish almost immediately or have
-# their own UI (await_human posts the candidate picker; notify renders the final result).
-_PROGRESS_AFTER_NODE = {
-    "read_page": "🔎 Searching movie databases…",
-    "omdb_search": "🎬 Checking the best title match…",
-    "disambiguate": "🧭 Resolving the title identity…",
-    "omdb_details": "📚 Movie details found — combining sources…",
-    "rt": "🍅 Rotten Tomatoes lookup finished — combining sources…",
-    "assemble": "🧩 Comparing source results…",
-    "resolve_rt": "✅ Verifying the match…",
-    "judge": "📝 Updating Notion…",
+# Transport-neutral progress events emitted after real graph nodes complete. Their values are
+# stable interface identifiers, not Slack copy: transports decide how to render them. The OMDb
+# and RT lanes run concurrently, so events describe durable milestones rather than percentages.
+# `await_human` has its own event below; `notify` is the final Slack result and needs no task.
+_PROGRESS_EVENT_AFTER_NODE = {
+    "read_page": "database.read.complete",
+    "omdb_search": "omdb.search.complete",
+    "disambiguate": "title.disambiguation.complete",
+    "omdb_details": "omdb.details.complete",
+    "rt": "rotten_tomatoes.complete",
+    "assemble": "sources.compare.complete",
+    "resolve_rt": "match.verification.complete",
+    "judge": "confidence.assessment.complete",
+    "update_notion": "notion.update.complete",
 }
+
+_PROGRESS_NOTION_CREATED = "notion.creation.complete"
+_PROGRESS_HITL_REQUIRED = "human_input.required"
 
 # Returned by _run_one when the graph raised a transient error: the Entry was left in its
 # prior (pending/unset) state — distinct from a graph-written terminal status.
@@ -199,7 +203,9 @@ class Runtime:
         self._graph: CompiledStateGraph | None = None
         # Optional interrupt notifier (Phase 6c): set to `SlackTransport.post_picker` so a
         # paused run posts its candidate picker to Slack. Left None (no notification) for CLI.
-        self._notifier: Callable[[str, dict], Awaitable[None]] | None = None
+        self._notifier: (
+            Callable[[str, dict, str | None, str | None], Awaitable[None]] | None
+        ) = None
         # Phase 9 (ADR 0012): the terminal `notify` node's late-bound Slack poster (bound by
         # `_serve` once the transport exists) and the process-global in-flight guard — page_ids
         # currently being enriched out-of-band by a Slack `add`, which the sweep must skip so a
@@ -207,12 +213,17 @@ class Runtime:
         self._completion_notifier = CompletionNotifier()
         self._inflight: set[str] = set()
 
-    def set_notifier(self, notifier: Callable[[str, dict], Awaitable[None]]) -> None:
-        """Register the interrupt notifier (`page_id`, payload) → posts the HITL picker.
+    def set_notifier(
+        self,
+        notifier: Callable[[str, dict, str | None, str | None], Awaitable[None]],
+    ) -> None:
+        """Register the interrupt notifier → posts the HITL picker.
 
         Wired by `_serve` to `SlackTransport.post_picker` (ADR 0010). Kept separate from
         `__init__` because the Slack transport needs a live `Runtime` to bind its handlers, so
-        the two are wired after the Runtime is entered.
+        the two are wired after the Runtime is entered. The optional channel/thread arguments
+        come from checkpointed Slack-add state; sweep-originated runs pass neither so the
+        transport can retain its configured top-level fallback.
         """
         self._notifier = notifier
 
@@ -387,7 +398,22 @@ class Runtime:
         await self._notion.update_entry(entry.page_id, enrichment_properties(status=_AWAITING))
         if self._notifier is not None:
             try:
-                await self._notifier(entry.page_id, interrupts[0].value)
+                origin_channel = (
+                    final_state.get("notify_channel")
+                    if final_state.get("origin") == SLACK_ORIGIN
+                    else None
+                )
+                origin_thread_ts = (
+                    final_state.get("notify_thread_ts")
+                    if final_state.get("origin") == SLACK_ORIGIN
+                    else None
+                )
+                await self._notifier(
+                    entry.page_id,
+                    interrupts[0].value,
+                    origin_channel,
+                    origin_thread_ts,
+                )
             except Exception:
                 log.exception("failed to post HITL picker for %s", entry.page_id)
         log.info("%r (%s) awaiting human input", entry.title, entry.page_id)
@@ -425,7 +451,7 @@ class Runtime:
         entry = await self._notion.create_entry(title)
         page_id = entry.page_id
         log.info("add: created page %s for %r — enriching out-of-band", page_id, title)
-        await self._report_progress(progress, "✅ Notion entry created — starting enrichment…")
+        await self._report_progress(progress, _PROGRESS_NOTION_CREATED)
         # Hold the page_id in-flight until its terminal/awaiting_input write lands (inside
         # _handle_pause or update_notion), so the sweep never sees it while still `pending`.
         self._inflight.add(page_id)
@@ -453,18 +479,16 @@ class Runtime:
                 if "__interrupt__" in update:
                     interrupts = update["__interrupt__"]
                 for node_name in update:
-                    message = _PROGRESS_AFTER_NODE.get(node_name)
-                    if message is not None:
-                        await self._report_progress(progress, message)
+                    event_id = _PROGRESS_EVENT_AFTER_NODE.get(node_name)
+                    if event_id is not None:
+                        await self._report_progress(progress, event_id)
 
             snapshot = await self._graph.aget_state(config)
             final_state = dict(snapshot.values)
             if interrupts:
                 final_state["__interrupt__"] = interrupts
             if await self._handle_pause(entry, final_state):
-                await self._report_progress(
-                    progress, "🧭 I need your help choosing the correct title."
-                )
+                await self._report_progress(progress, _PROGRESS_HITL_REQUIRED)
                 return AddOutcome(page_id=page_id, status=_AWAITING, title=title)
             result = ResumeResult.from_state(final_state)
             return AddOutcome(
@@ -478,15 +502,15 @@ class Runtime:
 
     @staticmethod
     async def _report_progress(
-        progress: Callable[[str], Awaitable[None]] | None, message: str
+        progress: Callable[[str], Awaitable[None]] | None, event_id: str
     ) -> None:
-        """Send best-effort interactive progress without making Slack gate enrichment."""
+        """Send a best-effort progress event without making its transport gate enrichment."""
         if progress is None:
             return
         try:
-            await progress(message)
+            await progress(event_id)
         except Exception:  # noqa: BLE001 — progress is UX; the durable graph must keep running
-            log.exception("add: failed to update Slack progress message")
+            log.exception("add: failed to report interactive progress event %s", event_id)
 
     async def resume(
         self, page_id: str, chosen_imdb_id: str, *, auto_resolved: bool = False

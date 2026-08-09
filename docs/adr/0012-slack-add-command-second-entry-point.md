@@ -42,12 +42,32 @@ preserved, which a new `enriching` status would have broken (a crash would stran
 ## Completion feedback and `origin`
 
 The app-mention handler schedules create/dedupe/enrich in a background task and returns
-promptly. The handler's Bolt `set_status` utility calls `assistant.threads.setStatus`, so
-Slack renders progress as transient agent activity beneath the user's mention rather than as
-additional messages. `Runtime.create_and_enrich` consumes LangGraph's
-`stream_mode="updates"` output and updates that status at real node-completion milestones
-(search, identity resolution, source combination, verification, Notion write). Progress is
-best-effort: a Slack status failure is logged and never gates the durable enrichment run.
+promptly. It opens a `chat.startStream` reply beneath the mention with
+`task_display_mode="plan"`, the originating workspace/user recipient IDs, and a grouped plan
+covering deduplication, Notion creation, database search, title matching/disambiguation, OMDb,
+Rotten Tomatoes, source comparison, verification, confidence, and the final Notion update.
+The handler's Bolt `set_status` utility displays `Adding {title} to your watchlist…` and rotates
+ten production-themed loading messages while that plan runs.
+
+`Runtime.create_and_enrich` retains LangGraph `stream_mode="updates"`, but its progress callback
+now emits stable, transport-neutral event IDs. The Slack transport maps those IDs to
+`task_update` chunks (`pending` → `in_progress` → `complete`, or `error`) and sends every
+transition with `chat.appendStream`. Every successfully opened stream is terminated with
+`chat.stopStream` on success, duplicate detection, HITL pause, or failure. Streaming and status
+calls remain best-effort: any Slack failure is logged and never gates durable enrichment.
+
+The loading-message rotation is:
+
+1. “Rewinding the tape for clues…”
+2. “Checking continuity with the script supervisor…”
+3. “Sending the title through casting…”
+4. “Asking the projectionist to focus…”
+5. “Searching the backlot for the right cut…”
+6. “Comparing notes in the writers’ room…”
+7. “Checking whether this is the reboot…”
+8. “Waiting for the post-credits scene…”
+9. “Polishing the ratings montage…”
+10. “Rolling credits on the paperwork…”
 
 The original mention's thread-root timestamp is carried in graph state with the Slack
 channel/user. The terminal `notify` node posts the completion result (IMDb / RT / genre) or
@@ -57,13 +77,19 @@ the terminal state may arrive much later — after a Slack disambiguation click 
 `slack`-originated runs and no-ops for sweep rows. Runs created before this field existed and
 CLI runs lack a thread root, so they fall back to a channel `chat_postMessage`.
 
+That same checkpointed channel/thread context is supplied to the interrupt notifier. A
+Slack-originated add therefore posts its HITL picker in the original mention thread. Scheduled
+and manual reconcile rows have no originating request thread, so their picker remains a
+top-level message in the configured HITL channel.
+
 ## Consequences
 
 - **New surface, reused core.** New: `add` dispatch in the existing `app_mention` listener
   (delivered over the Socket Mode socket — ADR 0010), the create-page step, a best-effort pre-create
   dedupe query (match the typed Entry case-insensitively; on a hit, tell the user and
-  create nothing), the in-flight guard, streamed progress updates, the notify node, and durable
-  graph state for `origin` plus Slack notify/thread context. Unchanged: the enrichment graph
+  create nothing), the in-flight guard, streamed task-plan updates, origin-aware HITL routing,
+  the notify node, and durable graph state for `origin` plus Slack notify/thread context.
+  Unchanged: the enrichment graph
   topology, disambiguation picker, checkpointer, status lifecycle, single-flight lock, rate
   limiters.
 - **The agent now writes `Type`.** §8 had `Type` as human-filled; for Slack-add rows it starts

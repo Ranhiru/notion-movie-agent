@@ -10,8 +10,8 @@ A single outbound WebSocket carries all inbound interaction, so there's no publi
    single-flight lock as the cron; ADR 0001).
 3. **`@movie-bot add <title>` (Phase 9 / ADR 0012):** an app mention originates an Entry from
    Slack. The handler schedules the dedupe / create / out-of-band enrich in a background task;
-   progress is rendered with Slack's transient assistant-thread status, while the completion
-   ping is posted as a reply in the mention's thread by the graph's terminal `notify` node
+   progress is rendered as a streamed grouped task plan, while the completion ping is posted
+   as a reply in the mention's thread by the graph's terminal `notify` node
    (via `post_completion`, bound into `Runtime`). A run may only reach `done`/`failed` much
    later — after a disambiguation click or the 6d auto-resolve.
 
@@ -174,11 +174,6 @@ def _section_blocks(text: str) -> list[dict]:
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
 
-def _status_text(text: str) -> str:
-    """Turn the existing mrkdwn progress copy into Slack assistant-status plain text."""
-    return re.sub(r"^[^\w]+", "", text).replace("*", "")
-
-
 def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -> list[dict]:
     """The terminal ✅ message replacing the picker once a run resolves (button or manual)."""
     return _section_blocks(
@@ -198,6 +193,214 @@ def parse_mention_command(text: str) -> tuple[str, str] | None:
     if match is None:
         return None
     return (match.group("command") or "").casefold(), (match.group("argument") or "").strip()
+
+
+# Slack rotates these while the title-specific assistant status is visible. Keep this exact
+# production-themed set stable: it is deliberate product copy, not transport-neutral runtime
+# progress (and every item is comfortably below Slack's status limits).
+LOADING_MESSAGES = [
+    "Rewinding the tape for clues…",
+    "Checking continuity with the script supervisor…",
+    "Sending the title through casting…",
+    "Asking the projectionist to focus…",
+    "Searching the backlot for the right cut…",
+    "Comparing notes in the writers’ room…",
+    "Checking whether this is the reboot…",
+    "Waiting for the post-credits scene…",
+    "Polishing the ratings montage…",
+    "Rolling credits on the paperwork…",
+]
+
+# `task_display_mode="plan"` groups these stable task IDs into a single plan. Task titles are
+# Slack-owned copy (all <256 chars); Runtime only emits the stable event IDs mapped below.
+_PLAN_TASKS = [
+    ("deduplication", "Check for an existing watchlist entry"),
+    ("notion_creation", "Create the Notion watchlist entry"),
+    ("database_search", "Search the watchlist database"),
+    ("title_matching", "Find the best title match"),
+    ("disambiguation", "Resolve title disambiguation"),
+    ("omdb_details", "Fetch OMDb details"),
+    ("rotten_tomatoes", "Fetch Rotten Tomatoes ratings"),
+    ("source_comparison", "Compare source results"),
+    ("verification", "Verify the resolved match"),
+    ("confidence", "Assess enrichment confidence"),
+    ("notion_update", "Update the Notion watchlist entry"),
+]
+_TASK_TITLES = dict(_PLAN_TASKS)
+
+# One transport-neutral event may close one task and begin another. `_TaskStream` supplies any
+# missing `in_progress` step before a terminal status, keeping every task transition valid even
+# when graph routing skips `disambiguate` (the one-candidate path).
+_EVENT_TASK_UPDATES: dict[str, tuple[tuple[str, str], ...]] = {
+    "deduplication.started": (("deduplication", "in_progress"),),
+    "deduplication.duplicate": (("deduplication", "complete"),),
+    "deduplication.complete": (
+        ("deduplication", "complete"),
+        ("notion_creation", "in_progress"),
+    ),
+    "notion.creation.complete": (
+        ("notion_creation", "complete"),
+        ("database_search", "in_progress"),
+        ("rotten_tomatoes", "in_progress"),
+    ),
+    "database.read.complete": (
+        ("database_search", "complete"),
+        ("title_matching", "in_progress"),
+    ),
+    "omdb.search.complete": (
+        ("title_matching", "complete"),
+        ("disambiguation", "in_progress"),
+    ),
+    "title.disambiguation.complete": (
+        ("disambiguation", "complete"),
+        ("omdb_details", "in_progress"),
+    ),
+    "omdb.details.complete": (
+        ("title_matching", "complete"),
+        ("disambiguation", "complete"),
+        ("omdb_details", "complete"),
+    ),
+    "rotten_tomatoes.complete": (("rotten_tomatoes", "complete"),),
+    "sources.compare.complete": (
+        ("source_comparison", "complete"),
+        ("verification", "in_progress"),
+    ),
+    "match.verification.complete": (
+        ("verification", "complete"),
+        ("confidence", "in_progress"),
+    ),
+    "confidence.assessment.complete": (
+        ("confidence", "complete"),
+        ("notion_update", "in_progress"),
+    ),
+    "notion.update.complete": (("notion_update", "complete"),),
+    # An HITL pause is an intentional terminal point for this stream. `error` makes the
+    # blocked task visible; the threaded picker directly beneath it supplies the next action.
+    "human_input.required": (("disambiguation", "error"),),
+}
+
+
+class _TaskStream:
+    """Best-effort lifecycle for one Slack grouped task plan."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        title: str,
+        channel: str,
+        team_id: str | None,
+        user_id: str | None,
+        thread_ts: str,
+        set_status: Any,
+    ) -> None:
+        self._client = client
+        self._title = title
+        self._channel = channel
+        self._team_id = team_id
+        self._user_id = user_id
+        self._thread_ts = thread_ts
+        self._set_status = set_status
+        self._ts: str | None = None
+        self._stopped = False
+        self._statuses = dict.fromkeys(_TASK_TITLES, "pending")
+
+    async def start(self) -> None:
+        """Open the threaded stream, then set the title-specific rotating status."""
+        try:
+            response = await self._client.chat_startStream(
+                channel=self._channel,
+                thread_ts=self._thread_ts,
+                recipient_team_id=self._team_id,
+                recipient_user_id=self._user_id,
+                task_display_mode="plan",
+            )
+            self._ts = response.get("ts")
+        except Exception:  # noqa: BLE001 - Slack UI must never gate durable enrichment
+            log.exception("slack: failed to start add task stream for %r", self._title)
+
+        if self._set_status is not None:
+            try:
+                await self._set_status(
+                    status=f"Adding {self._title} to your watchlist…",
+                    loading_messages=LOADING_MESSAGES,
+                )
+            except Exception:  # noqa: BLE001 - status rotation is a best-effort enhancement
+                log.exception("slack: failed to set add loading status for %r", self._title)
+
+    async def initialize(self) -> None:
+        """Publish the whole pending plan through appendStream."""
+        await self._append(
+            [self._chunk(task_id, "pending") for task_id, _title in _PLAN_TASKS]
+        )
+
+    async def emit(self, event_id: str) -> None:
+        """Translate one stable runtime/transport event into task-update transitions."""
+        if event_id == "workflow.error":
+            chunks: list[dict] = []
+            for task_id, status in self._statuses.items():
+                if status == "in_progress":
+                    chunks.extend(self._transition(task_id, "error"))
+            await self._append(chunks)
+            return
+
+        updates = _EVENT_TASK_UPDATES.get(event_id)
+        if updates is None:
+            log.warning("slack: ignoring unknown progress event %r", event_id)
+            return
+        chunks = []
+        for task_id, status in updates:
+            chunks.extend(self._transition(task_id, status))
+        if (
+            self._statuses["omdb_details"] == "complete"
+            and self._statuses["rotten_tomatoes"] == "complete"
+            and self._statuses["source_comparison"] == "pending"
+        ):
+            chunks.extend(self._transition("source_comparison", "in_progress"))
+        await self._append(chunks)
+
+    def _transition(self, task_id: str, target: str) -> list[dict]:
+        current = self._statuses[task_id]
+        if current == target or current in {"complete", "error"}:
+            return []
+        chunks: list[dict] = []
+        if current == "pending" and target in {"complete", "error"}:
+            self._statuses[task_id] = "in_progress"
+            chunks.append(self._chunk(task_id, "in_progress"))
+        self._statuses[task_id] = target
+        chunks.append(self._chunk(task_id, target))
+        return chunks
+
+    @staticmethod
+    def _chunk(task_id: str, status: str) -> dict:
+        return {
+            "type": "task_update",
+            "id": task_id,
+            "title": _TASK_TITLES[task_id],
+            "status": status,
+        }
+
+    async def _append(self, chunks: list[dict]) -> None:
+        if self._ts is None or not chunks:
+            return
+        try:
+            await self._client.chat_appendStream(
+                channel=self._channel,
+                ts=self._ts,
+                chunks=chunks,
+            )
+        except Exception:  # noqa: BLE001 - task progress is best-effort
+            log.exception("slack: failed to append add task progress for %r", self._title)
+
+    async def stop(self) -> None:
+        """Stop an opened stream exactly once, including on pause/failure/duplicate."""
+        if self._ts is None or self._stopped:
+            return
+        self._stopped = True
+        try:
+            await self._client.chat_stopStream(channel=self._channel, ts=self._ts)
+        except Exception:  # noqa: BLE001 - task UI must never change enrichment outcome
+            log.exception("slack: failed to stop add task stream for %r", self._title)
 
 
 class SlackTransport:
@@ -311,11 +514,14 @@ class SlackTransport:
             )
 
         @self._app.event("app_mention")
-        async def handle_mention(event, say, set_status, logger) -> None:  # noqa: ANN001
+        async def handle_mention(body, event, say, set_status, logger) -> None:  # noqa: ANN001
             """Dispatch `@movie-bot add <title>` and `@movie-bot run`."""
-            await self._handle_mention(event, say, logger, set_status)
+            team_id = body.get("team_id") or event.get("team")
+            await self._handle_mention(event, say, logger, set_status, team_id)
 
-    async def _handle_mention(self, event, say, logger, set_status=None) -> None:  # noqa: ANN001
+    async def _handle_mention(
+        self, event, say, logger, set_status=None, team_id: str | None = None
+    ) -> None:  # noqa: ANN001
         """Handle one app mention without coupling tests to Bolt's listener registry."""
         parsed = parse_mention_command(event.get("text", ""))
         if parsed is None:
@@ -353,13 +559,26 @@ class SlackTransport:
         user = event.get("user")
         logger.info("slack: mention add %r from %s in %s", argument, user, channel)
         task = asyncio.create_task(
-            self._add_flow(argument, channel, user, thread_ts, set_status)
+            self._add_flow(
+                argument,
+                channel,
+                team_id or event.get("team"),
+                user,
+                thread_ts,
+                set_status,
+            )
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _add_flow(
-        self, title: str, channel: str, user: str | None, thread_ts: str, set_status
+        self,
+        title: str,
+        channel: str,
+        team_id: str | None,
+        user: str | None,
+        thread_ts: str,
+        set_status,
     ) -> None:  # noqa: ANN001
         """Background worker for mention `add`: dedupe → create + enrich out-of-band (Phase 9).
 
@@ -367,24 +586,29 @@ class SlackTransport:
         watchlist" and creates nothing (ADR 0012 — best-effort dedupe). Otherwise it delegates
         to `Runtime.create_and_enrich`, which creates the page and runs the graph under the
         in-flight guard; the done/failed ping is the graph's `notify` node, so a run that
-        pauses for disambiguation (picker in `#notion-movie-db`) still pings this channel on
-        resolve. Progress uses `assistant.threads.setStatus`, which Slack renders as transient
-        agent activity beneath the mention rather than as chat messages. Final outcomes use
-        `chat.postMessage(thread_ts=...)`, so the channel only gets a thread indicator.
+        pauses for disambiguation still pings this channel on resolve. Progress is a threaded
+        `chat.startStream` plan made of `task_update` chunks; the assistant status supplies the
+        title-specific loading-message rotation. Final outcomes use `chat.postMessage` with the
+        original `thread_ts`, so the channel only gets a thread indicator.
         """
 
-        async def update_progress(text: str) -> None:
-            if set_status is None:
-                return
-            try:
-                await set_status(status=_status_text(text))
-            except Exception:  # noqa: BLE001 — Slack progress must never gate enrichment
-                log.exception("slack: failed to update add progress for %r", title)
+        stream = _TaskStream(
+            self._app.client,
+            title=title,
+            channel=channel,
+            team_id=team_id,
+            user_id=user,
+            thread_ts=thread_ts,
+            set_status=set_status,
+        )
+        await stream.start()
+        await stream.initialize()
 
         try:
-            await update_progress(f"🔎 Checking the watchlist for *{title}*…")
+            await stream.emit("deduplication.started")
             existing = await self._runtime.find_duplicate(title)
             if existing is not None:
+                await stream.emit("deduplication.duplicate")
                 text = (
                     f"*{existing.title}* is already on the watchlist "
                     f"(status: *{existing.status or 'unset'}*) — nothing added."
@@ -393,7 +617,7 @@ class SlackTransport:
                     channel=channel, text=text, thread_ts=thread_ts
                 )
                 return
-            await update_progress(f"📝 Creating a Notion entry for *{title}*…")
+            await stream.emit("deduplication.complete")
             await self._runtime.create_and_enrich(
                 title,
                 channel=channel,
@@ -401,15 +625,18 @@ class SlackTransport:
                 # Persist the request thread root with the graph. If enrichment pauses for
                 # human input, its eventual completion still replies to the original mention.
                 thread_ts=thread_ts,
-                progress=update_progress,
+                progress=stream.emit,
             )
         except Exception:
             log.exception("slack: add %r failed", title)
+            await stream.emit("workflow.error")
             with contextlib.suppress(Exception):
                 text = f"Couldn't add *{title}* — something went wrong. Try again?"
                 await self._app.client.chat_postMessage(
                     channel=channel, text=text, thread_ts=thread_ts
                 )
+        finally:
+            await stream.stop()
 
     async def post_completion(
         self, channel: str, text: str, thread_ts: str | None = None
@@ -440,18 +667,27 @@ class SlackTransport:
             unfurl_media=False,
         )
 
-    async def post_picker(self, page_id: str, payload: dict) -> None:
-        """Post the candidate picker to the channel — the `Runtime` interrupt notifier."""
+    async def post_picker(
+        self,
+        page_id: str,
+        payload: dict,
+        origin_channel: str | None = None,
+        origin_thread_ts: str | None = None,
+    ) -> None:
+        """Post a picker in its originating thread, or the configured fallback channel."""
         title = payload.get("title") or "a title"
-        await self._app.client.chat_postMessage(
-            channel=self._channel,
-            text=f"Need a hand disambiguating {title}",  # notification fallback
-            blocks=build_picker_blocks(page_id, payload),
+        kwargs: dict[str, Any] = {
+            "channel": origin_channel or self._channel,
+            "text": f"Need a hand disambiguating {title}",  # notification fallback
+            "blocks": build_picker_blocks(page_id, payload),
             # The candidate IMDb links are for clicking, not previewing — suppress unfurls so
             # the picker stays compact (no poster/summary cards stacked under each option).
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if origin_channel is not None and origin_thread_ts is not None:
+            kwargs["thread_ts"] = origin_thread_ts
+        await self._app.client.chat_postMessage(**kwargs)
         log.info("slack: posted disambiguation picker for page %s", page_id)
 
     async def start(self) -> None:

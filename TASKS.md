@@ -759,10 +759,11 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
 6d auto-resolve alike — because all three flow through `update_notion → notify`.
 
 **Decisions of record (this phase):**
-- **Completion pings go to the originating mention channel; the disambiguation picker stays fixed to
-  `#notion-movie-db`.** The picker is reused *verbatim* (no new picker code → fixed
-  `SLACK_CHANNEL`, ADR 0012); completions reply where the user mentioned the app
-  (`event.channel`). App mentions are channel-oriented; direct-message support is not added.
+- **Completion pings and Slack-add disambiguation pickers use the originating mention thread.**
+  The checkpointed channel/thread metadata routes both back to the request. Reconcile-originated
+  rows have no natural request thread, so their picker remains a top-level message in the
+  configured `SLACK_CHANNEL`. App mentions are channel-oriented; direct-message support is not
+  added.
 - **`origin` + notify context are set at invoke time in the initial state dict**, so they are
   checkpointed and survive interrupt/resume/restart (durable, ADR 0012). Resume / auto-resolve
   don't re-supply them — they're already in the checkpoint. The sweep passes neither → `origin`
@@ -861,18 +862,17 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
       watchlist (status: …)" and stop) else `create_and_enrich` in a try/except (failure reply
       on error). Completion / not-found feedback comes from the graph `notify` node.
       → `slack.py`. Background tasks held in `self._tasks` (strong refs; discarded on done).
-      `_add_flow` renders enrichment milestones via Bolt's transient `set_status`; dedupe,
-      failure, and completion outcomes use `chat_postMessage` beneath the original mention's
-      thread root. A missing `event.channel` (defensive) returns an error. **Completion channel
-      decision of record:** the mention channel/thread; the picker stays fixed to
-      `#notion-movie-db` (verbatim reuse).
+      `_add_flow` renders enrichment milestones in the mention thread; dedupe, failure, and
+      completion outcomes use `chat_postMessage` beneath the same thread root. A missing
+      `event.channel` (defensive) returns an error. **Completion channel decision of record:**
+      the mention channel/thread. (The grouped task-stream rendering is recorded in 9d.)
 - [x] `_serve` binds the `CompletionNotifier` to `slack.post_completion` after wiring the picker
       notifier (`Runtime.bind_completion_notifier`).
       → `__main__.py`. `post_completion` suppresses unfurls so the IMDb link stays compact.
 - [x] **Verify:** offline — command handler acks + spawns; dedupe reply posted (client mocked);
       completion notifier posts a done/failed message on terminal. **Live (owner-run):**
       `@NotionMovieAgent add Dune` → row created → enriched → completion ping with IMDb/RT/genre;
-      an ambiguous title → picker in `#notion-movie-db` → click → ping after resume; an existing
+      an ambiguous title → picker in the originating thread → click → ping after resume; an existing
       Entry → dedupe reply, no new row; gibberish → candidate-less picker, then failed → not-found
       ping after the (shortened) timeout; a cron sweep mid-add → sweep
       skips that `page_id` (no double enrichment). Fixture: a Slack `command` payload.
@@ -886,6 +886,25 @@ ping) and fires on every terminal path — the initial invoke, a Slack-click res
       tokens set → run the five mention-add
       scenarios above; a genuinely nonexistent title escalates to the candidate-less picker and
       only pings `failed` once the (shortened) `STALE_INTERRUPT_TIMEOUT_SECONDS` fires.
+
+### 9d — Slack loading rotation, streamed task plan, and threaded HITL
+
+- [x] Start a `chat.startStream` reply under the original mention with
+      `task_display_mode="plan"`, `recipient_team_id`, and `recipient_user_id`; set the
+      title-specific `Adding {title} to your watchlist…` status with the ten production-themed
+      loading messages recorded in ADR 0012.
+- [x] Replace runtime-owned Slack copy with stable progress event IDs. Map deduplication,
+      Notion creation, graph node completions, HITL pause, and failure into grouped
+      `task_update` chunks with valid `pending` / `in_progress` / `complete` / `error`
+      transitions. Append every transition with `chat.appendStream` and stop every opened
+      stream on success, duplicate, pause, or failure. Slack remains best-effort throughout.
+- [x] Extend the interrupt notifier with optional checkpointed origin channel/thread context.
+      Slack-add pickers use that thread; reconcile pickers remain top-level in the configured
+      HITL channel. Candidate buttons, manual IMDb input, checkpoint identity, resume behavior,
+      and final threaded completion replies are unchanged.
+- [x] Offline verification covers the exact loading-message set/status, recipient IDs and plan
+      mode, task chunk shapes/transitions, normal/duplicate/failure/HITL terminals, Slack API
+      failure isolation, and origin-aware picker routing.
 
 ---
 
@@ -948,7 +967,7 @@ fire; `docker kill` → `restart: always` recovers; create an ambiguous Entry �
 
 1. Add a fresh Entry to the Watchlist → next reconcile enriches it (IMDb + RT + plot + genre)
    and sets `done`; LangSmith trace shows the full graph.
-2. Add an ambiguous Entry → pre-filter unsure → Slack picker in `#notion-movie-db` → click →
+2. Add an ambiguous Entry → pre-filter unsure → Slack picker in its origin thread → click →
    row completes; restart mid-wait proves durability.
 3. Add a non-existent Entry → `failed`, no RT chain burned, no Slack ping.
 4. Re-run reconcile → idempotent (no duplicate writes; only pending/stragglers reprocessed).
