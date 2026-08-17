@@ -1,15 +1,24 @@
 # Notion Movie/TV Enrichment Agent
 
-A Python + **LangGraph** service that enriches a Notion **Watchlist** with IMDb rating,
-Rotten Tomatoes scores, plot, and genre. A learning project for LangGraph primitives.
+A LangGraph/LangChain service that enriches a Notion **Watchlist** with IMDb rating,
+Rotten Tomatoes scores, plot, and genre. 
 
 Design docs: [`CONTEXT.md`](CONTEXT.md) · [`RESEARCH.md`](RESEARCH.md) ·
 [`docs/adr/`](docs/adr) · [`TASKS.md`](TASKS.md).
 
+
+# Preview 
+
+https://github.com/user-attachments/assets/2592c712-a857-41c2-bbc9-78a015647c74
+
 ## The enrichment graph
 
-`reconcile()` runs each Watchlist Entry through this graph. The OMDb and Rotten Tomatoes
-lanes **fan out in parallel**, then fan in to `assemble` before the write-back:
+Uses OMDB AI as the authoritative source to find movies, fetches Rotten Tomatoes scores with best effort using Tavily/Exa/Firecrawl.
+
+If there are multiple matches, posts a message on Slack (HITL) asking user to confirm.
+
+Running on OpenRouter with `openai/gpt-5.4-nano` currently in prod, with traces uploaded to LangSmith.
+
 
 ![Enrichment graph](flow.png)
 
