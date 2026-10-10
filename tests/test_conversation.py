@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +87,87 @@ class FixtureRuntime:
 
 
 class ConversationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def approval_token(reply):
+        return json.loads(reply.call_args.kwargs["blocks"][-1]["elements"][0]["value"])[
+            "token"
+        ]
+
+    async def button_plan(self, decision="approve", selected=(1, 2, 3, 4)):
+        self.scripts.append(
+            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
+        )
+        reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
+        blocks = reply.call_args.kwargs["blocks"]
+        self.assertEqual(blocks[0]["text"]["text"], "Review Watchlist changes")
+        action = next(
+            a for a in blocks[-1]["elements"] if a["action_id"] == f"watchlist:{decision}"
+        )
+        body = {
+            "user": {"id": "owner"},
+            "channel": {"id": "C"},
+            "team": {"id": "T"},
+            "message": {"ts": "preview-1"},
+            "state": {
+                "values": {
+                    "watchlist_selection": {
+                        "watchlist:selection": {
+                            "selected_options": [{"value": str(n)} for n in selected],
+                        }
+                    }
+                }
+            },
+        }
+        return body, action
+
+    async def test_approve_button_applies_only_selection_once(self):
+        body, action = await self.button_plan(selected=(2, 4))
+        client = self.transport._app.client
+        await self.transport._handle_approval(body, action, client)
+        await self.transport._handle_approval(body, action, client)
+        self.assertEqual(self.runtime.writes, [("add", "tt0000002"), ("add", "tt0000004")])
+        self.assertNotIn(
+            "actions", [b["type"] for b in client.chat_update.call_args.kwargs["blocks"]]
+        )
+        self.assertEqual(self.scripts, [])
+
+    async def test_deny_button_persists_and_cannot_be_approved_after_restart(self):
+        body, action = await self.button_plan(decision="deny")
+        await self.transport._handle_approval(body, action, self.transport._app.client)
+        self.assertEqual(self.runtime.writes, [])
+        self.transport._runtime.conversation = Conversation(
+            self.runtime, self.conversation.db_path, "owner", self.planner
+        )
+        await self.transport._handle_approval(
+            body, action | {"action_id": "watchlist:approve"}, self.transport._app.client
+        )
+        self.assertEqual(self.runtime.writes, [])
+        self.assertEqual(await self.transport._runtime.conversation.recover(), [])
+
+    async def test_buttons_reject_other_users_empty_selection_and_expired_plan(self):
+        body, action = await self.button_plan(selected=())
+        client = self.transport._app.client
+        await self.transport._handle_approval(body | {"user": {"id": "other"}}, action, client)
+        client.chat_update.assert_not_awaited()
+        await self.transport._handle_approval(body, action, client)
+        client.chat_postEphemeral.assert_awaited_once()
+        pending = self.conversation._load("request:T:C:1")
+        pending["expires"] = 0
+        self.conversation._save("request:T:C:1", pending)
+        body.pop("state")
+        await self.transport._handle_approval(body, action, client)
+        self.assertEqual(self.runtime.writes, [])
+        self.assertIn("expired", client.chat_update.call_args.kwargs["text"])
+
+    async def test_button_token_is_bound_to_its_original_thread(self):
+        body, action = await self.button_plan()
+        value = json.loads(action["value"])
+        value["thread_ts"] = "another-thread"
+        await self.transport._handle_approval(
+            body, action | {"value": json.dumps(value)}, self.transport._app.client
+        )
+        self.assertEqual(self.runtime.writes, [])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -117,6 +199,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = SimpleNamespace(conversation=self.conversation)
         self.transport._tasks = set()
+        self.transport._owner = "owner"
+        self.transport._app = SimpleNamespace(client=AsyncMock())
 
     async def mention(self, text, *, ts="1", user="owner", thread_ts=None):
         say = AsyncMock()
@@ -140,6 +224,29 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Movie tt0000001", reply.call_args.kwargs["text"])
         self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
 
+    async def test_polite_single_add_does_not_require_redundant_approval(self):
+        self.scripts.append([Action(operation="add", imdb_id="tt0000001")])
+        reply = await self.mention(
+            "Can you add Lone Survivor to my list ? I want to watch the latest season"
+        )
+        self.assertEqual(self.runtime.writes, [("add", "tt0000001")])
+        self.assertNotIn("approve", reply.call_args.kwargs["text"])
+
+    def test_polite_requests_preserve_ambiguous_and_negated_guards(self):
+        for text in (
+            "Can you add the Reacher to my list ? I want to watch the latest season",
+            "Could you add Reacher?",
+            "Would you please add Reacher?",
+        ):
+            self.assertTrue(Conversation._explicit_action(text, "add"))
+        for text in (
+            "Can you add Reacher if it is good?",
+            "Could you not add Reacher?",
+            "Can you recommend something to add?",
+            "Should I add Reacher?",
+        ):
+            self.assertFalse(Conversation._explicit_action(text, "add"))
+
     async def test_four_separate_tool_calls_wait_for_request_wide_approval(self):
         self.scripts.append(
             [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
@@ -147,8 +254,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         self.assertEqual(self.runtime.writes, [])
         preview = reply.call_args.kwargs["text"]
-        self.assertIn("approve", preview)
-        token = preview.split("approve ")[1].split()[0].strip("`")
+        self.assertIn("Approve", preview)
+        token = self.approval_token(reply)
         reply = await self.mention(f"approve {token}", ts="2", thread_ts="1")
         self.assertEqual(len(self.runtime.writes), 4)
 
@@ -163,7 +270,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         )
         reply = await self.mention("add movies from https://example.com/top10")
         self.assertEqual(self.runtime.writes, [])
-        token = reply.call_args.kwargs["text"].split("approve ")[1].split()[0].strip("`")
+        token = self.approval_token(reply)
         await self.mention(f"approve {token} 2", ts="2", thread_ts="1")
         self.assertEqual(self.runtime.writes, [("add", "tt0000002")])
 
@@ -202,7 +309,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
         )
         reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
-        token = reply.call_args.kwargs["text"].split("approve ")[1].split()[0].strip("`")
+        token = self.approval_token(reply)
         self.transport._runtime.conversation = Conversation(
             self.runtime, self.conversation.db_path, "owner", self.planner
         )
@@ -253,7 +360,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("notion_db_updater.conversation.time.time", return_value=100):
             reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
-        token = reply.call_args.kwargs["text"].split("approve ")[1].split()[0].strip("`")
+        token = self.approval_token(reply)
         with patch("notion_db_updater.conversation.time.time", return_value=1901):
             reply = await self.mention(f"approve {token}", ts="2", thread_ts="1")
         self.assertEqual(self.runtime.writes, [])
@@ -265,7 +372,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.scripts.append([Action(operation="remove", page_id="page-tt0000001")])
         reply = await self.mention("give me some unwatched recommendations")
         self.assertEqual(self.runtime.writes, [])
-        self.assertIn("approve", reply.call_args.kwargs["text"])
+        self.assertIn("Approve", reply.call_args.kwargs["text"])
 
     async def test_search_limit_is_enforced_and_reported_by_application(self):
         research = SimpleNamespace(search=AsyncMock(return_value=[]))
@@ -312,7 +419,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
         )
         preview = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
-        token = preview.call_args.kwargs["text"].split("approve ")[1].split()[0].strip("`")
+        token = self.approval_token(preview)
         self.scripts.append([Action(operation="add", imdb_id="tt0000009")])
         await self.mention("actually add only Movie nine", ts="2", thread_ts="1")
         reply = await self.mention(f"approve {token}", ts="3", thread_ts="1")

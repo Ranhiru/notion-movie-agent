@@ -283,6 +283,33 @@ class Conversation:
                     },
                 )
                 return response
+            denial = re.fullmatch(r"deny\s+([0-9a-f]{16})", text)
+            if denial:
+                pending_key = state.get("pending")
+                pending = self._load(pending_key) if pending_key else {}
+                if (
+                    pending.get("token") != denial[1]
+                    or pending.get("user") != self.owner
+                    or pending.get("status") != "pending"
+                    or pending.get("expires", 0) <= time.time()
+                ):
+                    return (
+                        "This plan is expired, already used, or no longer awaiting approval."
+                    )
+                response = "Denied. None of the proposed changes were applied."
+                pending.update(status="denied", response=response)
+                assert isinstance(pending_key, str)
+                self._save(pending_key, pending)
+                state.pop("pending", None)
+                state.setdefault("messages", []).extend(
+                    [
+                        {"role": "user", "content": text},
+                        {"role": "assistant", "content": response},
+                    ]
+                )
+                self._save(key, state)
+                self._save(request_key, {"response": response})
+                return response
             approval = re.fullmatch(r"approve\s+([0-9a-f]{16})(?:\s+([\d, ]+))?", text)
             if approval:
                 pending_key = state.get("pending")
@@ -485,6 +512,16 @@ class Conversation:
     @staticmethod
     def _explicit_action(text: str, operation: str) -> bool:
         """Ambiguous prose gets a preview; retrieved content never supplies permission."""
+        command, polite = re.subn(
+            r"^\s*(?:can|could|would) you\s+(?:please\s+)?"
+            r"(?=(?:add|put|include|save|remove|delete|trash|mark|set|flag|refresh|re-enrich)\b)",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if polite:
+            text = command.replace("?", "", 1)
         if re.search(
             r"\?|\b(?:don't|do not|never|not|can't|cannot|could|would|should|might|"
             r"maybe|perhaps|whether|if)\b",

@@ -45,11 +45,76 @@ class _FakeGraph:
 
 
 class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_conversation_status_cleanup_and_approval_wait(self) -> None:
+        for outcome, final_status in (
+            ("Approve this exact action list (expires in 30 minutes):", "suspended"),
+            (RuntimeError("Planner failed"), "active"),
+            (asyncio.CancelledError(), "active"),
+        ):
+            with self.subTest(outcome=outcome):
+                transport = object.__new__(SlackTransport)
+                transport._owner = "U123"
+                client = AsyncMock()
+                transport._app = SimpleNamespace(client=client)
+
+                async def handle(event, team, client=client, outcome=outcome):
+                    self.assertEqual(
+                        client.api_call.await_args.kwargs["json"],
+                        {
+                            "channel_id": "C123",
+                            "thread_ts": "1",
+                            "status": "processing",
+                        },
+                    )
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    return outcome
+
+                transport._runtime = SimpleNamespace(
+                    conversation=SimpleNamespace(handle=handle)
+                )
+                event = {
+                    "user": "U123",
+                    "channel": "C123",
+                    "ts": "2",
+                    "thread_ts": "1",
+                    "text": "add Reacher",
+                }
+                if isinstance(outcome, BaseException):
+                    with self.assertRaises(type(outcome)):
+                        await transport.handle_conversation(event, AsyncMock(), "T123")
+                else:
+                    await transport.handle_conversation(event, AsyncMock(), "T123")
+                self.assertEqual(
+                    client.api_call.await_args.kwargs["json"]["status"], final_status
+                )
+
+    async def test_status_failure_does_not_block_reply_or_allow_other_users(self) -> None:
+        transport = object.__new__(SlackTransport)
+        transport._owner = "U123"
+        client = AsyncMock()
+        client.api_call.side_effect = RuntimeError("Status unavailable")
+        transport._app = SimpleNamespace(client=client)
+        conversation = SimpleNamespace(handle=AsyncMock(return_value="Done."))
+        transport._runtime = SimpleNamespace(conversation=conversation)
+        event = {"user": "U123", "channel": "C123", "ts": "1", "text": "add Reacher"}
+        say = AsyncMock()
+        with self.assertLogs("notion_db_updater.slack", level="ERROR"):
+            await transport.handle_conversation(event, say, "T123")
+        say.assert_awaited_once_with(text="Done.", thread_ts="1")
+        client.api_call.reset_mock()
+        conversation.handle.reset_mock()
+        await transport.handle_conversation(event | {"user": "OTHER"}, say, "T123")
+        client.api_call.assert_not_awaited()
+        conversation.handle.assert_not_awaited()
+
     async def test_mention_routes_free_form_request_to_conversation(self) -> None:
         transport = object.__new__(SlackTransport)
         transport._tasks = set()
         conversation = SimpleNamespace(handle=AsyncMock(return_value="Sweep started."))
         transport._runtime = SimpleNamespace(conversation=conversation)
+        transport._owner = "U123"
+        transport._app = SimpleNamespace(client=AsyncMock())
         say = AsyncMock()
         event = {
             "text": "<@U0BOT> run enrichment for pending Entries",
@@ -68,6 +133,13 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
 
         conversation.handle.assert_awaited_once_with(event, "T123")
         say.assert_awaited_once_with(text="Sweep started.", thread_ts="171234.567")
+        self.assertEqual(
+            [
+                call.kwargs["json"]["status"]
+                for call in transport._app.client.api_call.await_args_list
+            ],
+            ["processing", "active"],
+        )
 
     async def test_mention_without_conversation_reports_configuration_error(self) -> None:
         transport = object.__new__(SlackTransport)

@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -295,6 +296,8 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = self.runtime
         self.transport._tasks = set()
+        self.transport._owner = "UOWNER"
+        self.transport._app = SimpleNamespace(client=AsyncMock())
         self.say = AsyncMock()
         self._request_num = 0
 

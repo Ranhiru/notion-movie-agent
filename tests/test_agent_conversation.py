@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -58,6 +59,8 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = cast(Any, SimpleNamespace(conversation=self.conversation))
         self.transport._tasks = set()
+        self.transport._owner = self.conversation.owner
+        self.transport._app = SimpleNamespace(client=AsyncMock())
 
     def _planner(self, *responses: AIMessage):
         model = ScriptedToolModel(responses=list(responses))

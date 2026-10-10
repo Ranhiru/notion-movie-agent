@@ -23,6 +23,7 @@ import contextlib
 import json
 import logging
 import re
+from html import escape
 from typing import TYPE_CHECKING, Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -40,6 +41,97 @@ log = logging.getLogger(__name__)
 _MAX_CANDIDATES = 5
 _BUTTON_LABEL_MAX = 70
 _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 … pick:4
+_APPROVAL_ACTION = re.compile(r"^watchlist:(approve|deny)$")
+_SELECTION_ACTION = "watchlist:selection"
+
+
+def _approval_blocks(response: str, thread_ts: str) -> list[dict]:
+    """Render the persisted preview with selectable changes and decision buttons."""
+    token = re.search(r"`approve ([0-9a-f]{16})`", response)
+    if token is None:
+        return _section_blocks(response)
+    lines = [line for line in response.splitlines() if re.match(r"^\d+\. ", line)]
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Review Watchlist changes"}}
+    ]
+    options = []
+    labels = {
+        "add": "Add",
+        "remove": "Remove",
+        "watched": "Mark watched",
+        "unwatched": "Mark unwatched",
+        "refresh": "Refresh enrichment",
+    }
+    for index, line in enumerate(lines, 1):
+        label = re.sub(
+            r"^\d+\. (\w+):",
+            lambda m, index=index: f"{index}. {labels.get(m[1], m[1])} —",
+            line,
+        )
+        heading, description = label.split(" —", 1)
+        blocks.extend(
+            _section_blocks(
+                f"*{escape(heading, quote=False)}* —{escape(description, quote=False)}"
+            )
+        )
+        options.append(
+            {"text": {"type": "plain_text", "text": label[:75]}, "value": str(index)}
+        )
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Select the changes to apply, then approve. "
+                    "Deny cancels the whole plan. "
+                    "This approval expires in 30 minutes.",
+                }
+            ],
+        }
+    )
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": "watchlist_selection",
+            "elements": [
+                {
+                    "type": "multi_static_select",
+                    "action_id": _SELECTION_ACTION,
+                    "placeholder": {"type": "plain_text", "text": "Select changes"},
+                    "options": options,
+                    "initial_options": options,
+                }
+            ],
+        }
+    )
+    for notice in response.splitlines()[len(lines) + 2 :]:
+        if notice.strip():
+            blocks.extend(_section_blocks(escape(notice, quote=False)))
+    value = json.dumps({"token": token[1], "thread_ts": thread_ts})
+    blocks.append(
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "watchlist:approve",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "Approve selected"},
+                    "value": value,
+                },
+                {
+                    "type": "button",
+                    "action_id": "watchlist:deny",
+                    "text": {"type": "plain_text", "text": "Deny"},
+                    "value": value,
+                },
+            ],
+        }
+    )
+    return blocks
+
+
 # The manual-input escape hatch (6e): deliberately outside the `pick:\d+` regex so the
 # candidate-button handler can never receive it. `block_id` carries the page_id (see below).
 _MANUAL_ACTION = "manual:submit"
@@ -397,6 +489,17 @@ class SlackTransport:
         self._register()
 
     def _register(self) -> None:
+        @self._app.action(_SELECTION_ACTION)
+        async def handle_selection(ack) -> None:  # noqa: ANN001
+            await ack()
+
+        @self._app.action(_APPROVAL_ACTION)
+        async def handle_approval(ack, body, action, client) -> None:  # noqa: ANN001
+            await ack()
+            task = asyncio.create_task(self._handle_approval(body, action, client))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
         @self._app.action(_PICK_ACTION)
         async def handle_pick(ack, body, action, client, logger) -> None:  # noqa: ANN001
             """A candidate button was clicked → resume the paused run with that imdbID."""
@@ -530,9 +633,102 @@ class SlackTransport:
         """Reply in the originating thread using the durable conversation Runtime."""
         conversation = self._runtime.conversation
         assert conversation is not None
-        response = await conversation.handle(event, team_id)
-        if response is not None:
-            await say(text=response, thread_ts=event.get("thread_ts") or event.get("ts"))
+        if (
+            event.get("user") != self._owner
+            or event.get("bot_id")
+            or event.get("subtype")
+            or not all(event.get(k) for k in ("channel", "ts", "text"))
+        ):
+            return
+        channel = event["channel"]
+        thread_ts = event.get("thread_ts") or event["ts"]
+        status = "active"
+        await self._conversation_status(channel, thread_ts, "processing")
+        try:
+            response = await conversation.handle(event, team_id)
+            if response is not None:
+                if response.startswith("Approve this exact action list"):
+                    status = "suspended"
+                    await say(
+                        text=re.sub(
+                            r"^Reply `approve .*?$",
+                            "Use the Approve or Deny buttons below.",
+                            response,
+                            flags=re.MULTILINE,
+                        ),
+                        thread_ts=thread_ts,
+                        blocks=_approval_blocks(response, thread_ts),
+                    )
+                else:
+                    await say(text=response, thread_ts=thread_ts)
+        finally:
+            await self._conversation_status(channel, thread_ts, status)
+
+    async def _handle_approval(self, body, action, client) -> None:  # noqa: ANN001
+        """Buttons reuse the durable, owner-bound approval path without invoking the model."""
+        user = body.get("user", {}).get("id")
+        if user != self._owner:
+            return
+        data = json.loads(action["value"])
+        token, thread_ts = data["token"], data["thread_ts"]
+        decision = action["action_id"].split(":")[-1]
+        if decision not in {"approve", "deny"} or not re.fullmatch(r"[0-9a-f]{16}", token):
+            return
+        channel = body["channel"]["id"]
+        text = f"{decision} {token}"
+        if decision == "approve":
+            selection = (
+                body.get("state", {})
+                .get("values", {})
+                .get("watchlist_selection", {})
+                .get(_SELECTION_ACTION)
+            )
+            if selection is not None:
+                selected = selection.get("selected_options") or []
+                if not selected:
+                    await client.chat_postEphemeral(
+                        channel=channel,
+                        user=user,
+                        text="Select at least one change, or deny the plan.",
+                    )
+                    return
+                numbers = [option["value"] for option in selected]
+                if not all(re.fullmatch(r"[1-9]\d*", number) for number in numbers):
+                    return
+                text += " " + ",".join(numbers)
+        action_ts = action.get("action_ts", body["message"]["ts"])
+        event = {
+            "user": user,
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "ts": f"decision:{token}:{decision}:{action_ts}",
+            "text": text,
+        }
+        await self._conversation_status(channel, thread_ts, "processing")
+        try:
+            conversation = self._runtime.conversation
+            assert conversation is not None
+            response = await conversation.handle(event, body.get("team", {}).get("id"))
+            if response is not None:
+                await client.chat_update(
+                    channel=channel,
+                    ts=body["message"]["ts"],
+                    text=response,
+                    blocks=_section_blocks(response),
+                )
+        finally:
+            await self._conversation_status(channel, thread_ts, "active")
+
+    async def _conversation_status(self, channel: str, thread_ts: str, status: str) -> None:
+        """Native Slack loading UI is best effort and never blocks a Watchlist request."""
+        try:
+            # Use api_call until the installed SDK exposes the agent sessions method.
+            await self._app.client.api_call(
+                "agents.sessions.setStatus",
+                json={"channel_id": channel, "thread_ts": thread_ts, "status": status},
+            )
+        except Exception:
+            log.exception("Could not update Slack agent session status")
 
     async def _add_flow(
         self,

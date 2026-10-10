@@ -95,9 +95,9 @@ Mention the bot to start, then reply normally within that thread:
 
 All writes are staged before execution. Four or more distinct Entries across a request
 require approval; every URL Import requires a preview. Ambiguous write intent also gets a
-preview. Reply with the displayed `approve <token>` command, optionally selecting action
-numbers (`approve <token> 1,3`). Approval expires after 30 minutes and applies only once to
-that exact plan. Removal moves an Entry to Notion trash, and refresh preserves viewing
+preview with selectable changes and Approve/Deny buttons. Select the changes to apply, then
+click Approve selected, or Deny to cancel the plan. Approval expires after 30 minutes and
+applies only once to that exact plan. Removal moves an Entry to Notion trash, and refresh preserves viewing
 state, title, type, and identity. Requests and references persist in the checkpoint database.
 
 Default recommendations use up to five existing unchecked Watched Entries. Explicit discovery

@@ -74,6 +74,8 @@ class GuardrailConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = SimpleNamespace(conversation=self.conversation)
         self.transport._tasks = set()
+        self.transport._owner = "owner"
+        self.transport._app = SimpleNamespace(client=AsyncMock())
 
     async def mention(self, text: str):
         say = AsyncMock()
