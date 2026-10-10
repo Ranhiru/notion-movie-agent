@@ -206,28 +206,11 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Movie tt0000001", reply.call_args.kwargs["text"])
         self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
 
-    async def test_polite_single_add_does_not_require_redundant_approval(self):
+    async def test_staged_single_add_does_not_require_command_keywords(self):
         self.scripts.append([Action(operation="add", imdb_id="tt0000001")])
-        reply = await self.mention(
-            "Can you add Lone Survivor to my list ? I want to watch the latest season"
-        )
+        reply = await self.mention("I would like Lone Survivor on my Watchlist.")
         self.assertEqual(self.runtime.writes, [("add", "tt0000001")])
         self.assertNotIn("approve", reply.call_args.kwargs["text"])
-
-    def test_polite_requests_preserve_ambiguous_and_negated_guards(self):
-        for text in (
-            "Can you add the Reacher to my list ? I want to watch the latest season",
-            "Could you add Reacher?",
-            "Would you please add Reacher?",
-        ):
-            self.assertTrue(Conversation._explicit_action(text, "add"))
-        for text in (
-            "Can you add Reacher if it is good?",
-            "Could you not add Reacher?",
-            "Can you recommend something to add?",
-            "Should I add Reacher?",
-        ):
-            self.assertFalse(Conversation._explicit_action(text, "add"))
 
     async def test_four_separate_tool_calls_wait_for_request_wide_approval(self):
         self.stage_adds(1, 2, 3, 4)
@@ -324,14 +307,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             reply = await self.mention(f"approve {token}", ts="2", thread_ts="1")
         self.assertEqual(self.runtime.writes, [])
         self.assertIn("expired", reply.call_args.kwargs["text"])
-
-    async def test_research_content_cannot_authorize_an_unrequested_write(self):
-        await self.runtime.add_resolved("tt0000001", "fixture")
-        self.runtime.writes.clear()
-        self.scripts.append([Action(operation="remove", page_id="page-tt0000001")])
-        reply = await self.mention("give me some unwatched recommendations")
-        self.assertEqual(self.runtime.writes, [])
-        self.assertIn("Approve", reply.call_args.kwargs["text"])
 
     async def test_search_limit_is_enforced_and_reported_by_application(self):
         research = SimpleNamespace(search=AsyncMock(return_value=[]))

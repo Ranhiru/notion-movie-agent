@@ -101,8 +101,9 @@ fallback when the session API is unavailable. Long requests refresh the indicato
 - `mark the second one watched`, `remove Black Hawk Down`, or `refresh Lone Survivor`
 
 All writes are staged before execution. Four or more distinct Entries across a request
-require approval; every URL Import requires a preview. Ambiguous write intent also gets a
-preview with selectable changes and Approve/Deny buttons. Select the changes to apply, then
+require approval; every URL Import requires a preview with selectable changes and Approve/Deny
+buttons. The LLM interprets intent and asks for clarification when it is unclear.
+Select the changes to apply, then
 click Approve selected, or Deny to cancel the plan. Approval expires after 30 minutes and
 applies only once to that exact plan. Removal moves an Entry to Notion trash, and refresh preserves viewing
 state, title, type, and identity. Requests and references persist in the checkpoint database.

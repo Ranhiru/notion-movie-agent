@@ -454,7 +454,6 @@ class Conversation:
             if actions and (
                 re.search(r"https?://", text)
                 or request.get("imported")
-                or not all(self._explicit_action(text, a["operation"]) for a in actions)
                 or len(affected_entries) >= 4
             ):
                 request.update(
@@ -548,45 +547,6 @@ class Conversation:
                 seen.add(marker)
                 actions.append(prepared)
         return actions
-
-    @staticmethod
-    def _explicit_action(text: str, operation: str) -> bool:
-        """Ambiguous prose gets a preview; retrieved content never supplies permission."""
-        command, polite = re.subn(
-            r"^\s*(?:can|could|would) you\s+(?:please\s+)?"
-            r"(?=(?:add|put|include|save|remove|delete|trash|mark|set|flag|refresh|re-enrich)\b)",
-            "",
-            text,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        if polite:
-            text = command.replace("?", "", 1)
-        if re.search(
-            r"\?|\b(?:don't|do not|never|not|can't|cannot|could|would|should|might|"
-            r"maybe|perhaps|whether|if)\b",
-            text,
-            re.IGNORECASE,
-        ):
-            return False
-        if re.match(
-            r"\s*(?:can you\s+)?"
-            r"(?:what|which|recommend|suggest|find|give|show|tell|list|search)\b",
-            text,
-            re.IGNORECASE,
-        ):
-            return False
-        patterns = {
-            "add": r"\b(?:add|put|include|save)\b",
-            "remove": r"\b(?:remove|delete|trash)\b",
-            "watched": (
-                r"\b(?:mark|set|flag)\b.*\bwatched\b"
-                r"|\bi (?:have |already |just )?watched\b"
-            ),
-            "unwatched": r"\b(?:mark|set|flag)\b.*\bunwatched\b",
-            "refresh": r"\b(?:refresh|re-enrich)\b",
-        }
-        return bool(re.search(patterns[operation], text, re.IGNORECASE))
 
     @staticmethod
     def _preview(request: dict) -> str:

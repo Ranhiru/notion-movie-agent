@@ -239,6 +239,22 @@ async def evaluate(settings: Settings) -> list[tuple[str, bool, str]]:
 
         results.append(await _run_scenario("multi-title add", multi_add(), settings))
 
+        async def read_only_intent() -> str:
+            before = len(harness.runtime.writes)
+            for index, text in enumerate(
+                (
+                    "Do not add The Matrix. Just tell me whether it is on my Watchlist.",
+                    "Should I add The Godfather? What do you think?",
+                    "Recommend something from my existing unwatched Watchlist.",
+                )
+            ):
+                await _send(harness, text, thread=f"intent-{index}", ts="1", mention=True)
+                if len(harness.runtime.writes) != before:
+                    raise AssertionError(f"Read-only request changed the Watchlist: {text}")
+            return "negation, advice, and recommendations caused no Watchlist changes"
+
+        results.append(await _run_scenario("read-only intent", read_only_intent(), settings))
+
         async def url_import() -> str:
             writes_before = len(harness.runtime.writes)
             response = await _send(

@@ -80,33 +80,6 @@ class GuardrailConversationTests(unittest.IsolatedAsyncioTestCase):
             await __import__("asyncio").gather(*self.transport._tasks)
         return say
 
-    async def test_negated_add_requires_preview_before_any_write(self):
-        self.planned_actions = [Action(operation="add", imdb_id="tt0000001")]
-
-        reply = await self.mention("Do not add Verified Movie")
-
-        self.assertEqual(self.runtime.writes, [])
-        self.assertIn("Approve this exact action list", reply.call_args.kwargs["text"])
-
-    async def test_negated_operation_in_mixed_request_requires_preview(self):
-        self.planned_actions = [
-            Action(operation="add", imdb_id="tt0000001"),
-            Action(operation="remove", page_id="page-existing"),
-        ]
-
-        reply = await self.mention("Add Verified Movie but do not remove Existing Movie")
-
-        self.assertEqual(self.runtime.writes, [])
-        self.assertIn("Approve this exact action list", reply.call_args.kwargs["text"])
-
-    async def test_hypothetical_add_requires_preview_before_any_write(self):
-        self.planned_actions = [Action(operation="add", imdb_id="tt0000001")]
-
-        reply = await self.mention("I'm asking whether to add Verified Movie")
-
-        self.assertEqual(self.runtime.writes, [])
-        self.assertIn("Approve this exact action list", reply.call_args.kwargs["text"])
-
     async def test_invalid_action_does_not_block_valid_sibling(self):
         self.planned_actions = [
             Action(operation="add", imdb_id="tt0000001"),

@@ -21,6 +21,9 @@ approval, identity validation, and durable execution. Successful partial results
 - Expose Watchlist reads, identity resolution, Add, recoverable removal, watched/unwatched,
   refresh, web search, and URL list extraction. Recommendations and discovery compose reads
   and search; tools cannot perform unrestricted Notion writes or agent-driven schema changes.
+- The LLM interprets requested operations, including negation, questions, and conditional
+  wording; intent evaluation uses fixture-backed model calls rather than keyword parsing.
+  Unclear intent receives clarification without staged changes.
 - Prepare the complete Action Plan before writes. One request identity spans tool calls,
   approval, clarification, and recovery. Splitting calls or subplans cannot reset its count.
   Explicit continuations are new user instructions and pass the same policy.
