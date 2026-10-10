@@ -89,6 +89,20 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Lone Survivor", result)
         self.assertEqual(self.runtime.writes, [("add", "tt1091191")])
 
+    async def test_agent_runs_reconcile_through_a_tool_call(self) -> None:
+        from unittest.mock import AsyncMock
+
+        self.runtime.reconcile = AsyncMock(return_value="1 entries → 1 done")
+        self.conversation.planner = self._planner(
+            tool_call("run_reconcile", {}, "reconcile-1"),
+            reply_call("The pending Entry was enriched.", [], "reply-reconcile"),
+        )
+
+        result = await self._send("Run an enrichment sweep", ts="reconcile", mention=True)
+
+        self.runtime.reconcile.assert_awaited_once_with()
+        self.assertEqual(result, "The pending Entry was enriched.")
+
     async def test_agent_cannot_add_a_different_valid_identity(self) -> None:
         self.conversation.planner = self._planner(
             tool_call("resolve_title", {"query": "Lone Survivor"}, "resolve-1"),

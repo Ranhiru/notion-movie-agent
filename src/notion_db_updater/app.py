@@ -439,7 +439,8 @@ class Runtime:
         `thread_id = page_id`; `update_notion` never ran, so we write `awaiting_input` here so
         the next sweep skips it (the filter queries empty/pending only) and an out-of-band
         resume finishes it. Posting the picker is best-effort — a Slack failure must not fail
-        the caller; the row stays awaiting_input for the next `@movie-bot run` / `--enrich`.
+        the caller; the row stays awaiting_input for the next assistant reconcile request or
+        `--enrich`.
         Returns True when it handled a pause, False for a terminal run.
         """
         interrupts = final_state.get("__interrupt__")

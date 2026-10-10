@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import httpx
 from langchain_core.runnables import RunnableLambda
@@ -309,7 +309,13 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
             query = text[4:].strip()
             candidates = await tools.resolve_title(query)
             if candidates:
-                tools.stage(Action(operation="add", imdb_id=candidates[0]["imdb_id"]))
+                tools.stage(
+                    Action(
+                        operation="add",
+                        imdb_id=candidates[0]["imdb_id"],
+                        resolution_query=query,
+                    )
+                )
             return Reply(text="Staged the resolved title.")
         if lowered == "mark watched":
             entry = (await tools.watchlist())[0]
@@ -341,8 +347,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "ts": timestamp,
             },
             self.say,
-            Mock(),
-            team_id="TWORK",
+            "TWORK",
         )
         tasks = list(self.transport._tasks)
         if tasks:

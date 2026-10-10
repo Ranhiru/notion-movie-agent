@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock
 
 from notion_db_updater.app import Runtime
 from notion_db_updater.models import Entry
-from notion_db_updater.slack import LOADING_MESSAGES, SlackTransport, parse_mention_command
+from notion_db_updater.slack import LOADING_MESSAGES, SlackTransport
 
 
 def _entry(title: str = "Dune") -> Entry:
@@ -22,22 +22,6 @@ def _entry(title: str = "Dune") -> Entry:
         genre=None,
         status="pending",
     )
-
-
-class SlackMentionParsingTests(unittest.TestCase):
-    def test_parses_add_title_after_slack_mention(self) -> None:
-        self.assertEqual(
-            parse_mention_command("<@U0BOT> add Dune: Part Two"), ("add", "Dune: Part Two")
-        )
-
-    def test_command_is_case_insensitive_and_whitespace_is_trimmed(self) -> None:
-        self.assertEqual(parse_mention_command("  <@U0BOT>   ADD   Dune  "), ("add", "Dune"))
-
-    def test_missing_argument_is_preserved_for_usage_handling(self) -> None:
-        self.assertEqual(parse_mention_command("<@U0BOT> add"), ("add", ""))
-
-    def test_rejects_text_without_a_leading_slack_mention(self) -> None:
-        self.assertIsNone(parse_mention_command("add Dune <@U0BOT>"))
 
 
 class _FakeNotion:
@@ -61,123 +45,47 @@ class _FakeGraph:
 
 
 class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
-    async def test_mention_add_schedules_tracked_background_flow(self) -> None:
+    async def test_mention_routes_free_form_request_to_conversation(self) -> None:
         transport = object.__new__(SlackTransport)
         transport._tasks = set()
-        started = asyncio.Event()
-        release = asyncio.Event()
-        received: list[tuple[str, str, str | None, str | None, str, object]] = []
-        set_status = AsyncMock()
-
-        async def add_flow(
-            title: str,
-            channel: str,
-            team_id: str | None,
-            user: str | None,
-            thread_ts: str,
-            status,
-        ) -> None:
-            received.append((title, channel, team_id, user, thread_ts, status))
-            started.set()
-            await release.wait()
-
-        transport._add_flow = add_flow
-        transport._runtime = SimpleNamespace(reconcile=AsyncMock())
+        conversation = SimpleNamespace(handle=AsyncMock(return_value="Sweep started."))
+        transport._runtime = SimpleNamespace(conversation=conversation)
         say = AsyncMock()
-        logger = Mock()
+        event = {
+            "text": "<@U0BOT> run enrichment for pending Entries",
+            "channel": "C123",
+            "team": "T123",
+            "user": "U123",
+            "ts": "171234.567",
+        }
 
         await transport._handle_mention(
-            {
-                "text": "<@U0BOT> add Dune",
-                "channel": "C123",
-                "team": "T123",
-                "user": "U123",
-                "ts": "171234.567",
-            },
+            event,
             say,
-            logger,
-            set_status,
+            "T123",
         )
-        await started.wait()
+        await asyncio.gather(*transport._tasks)
 
-        self.assertEqual(len(transport._tasks), 1)
-        self.assertEqual(
-            received, [("Dune", "C123", "T123", "U123", "171234.567", set_status)]
-        )
-        say.assert_not_awaited()
-        logger.info.assert_called_once_with(
-            "slack: mention add %r from %s in %s", "Dune", "U123", "C123"
-        )
+        conversation.handle.assert_awaited_once_with(event, "T123")
+        say.assert_awaited_once_with(text="Sweep started.", thread_ts="171234.567")
 
-        task = next(iter(transport._tasks))
-        release.set()
-        await task
-
-    async def test_mention_add_without_title_replies_with_usage(self) -> None:
+    async def test_mention_without_conversation_reports_configuration_error(self) -> None:
         transport = object.__new__(SlackTransport)
         transport._tasks = set()
         transport._runtime = SimpleNamespace(reconcile=AsyncMock())
         say = AsyncMock()
 
         await transport._handle_mention(
-            {
-                "text": "<@U0BOT> add",
-                "channel": "C123",
-                "user": "U123",
-                "ts": "171234.567",
-            },
+            {"text": "<@U0BOT> add Dune", "channel": "C123", "user": "U123"},
             say,
-            Mock(),
         )
 
         say.assert_awaited_once_with(
-            "Usage: `@NotionMovieAgent add <title>` — e.g. `@NotionMovieAgent add Dune`"
+            "The conversational Watchlist assistant is not configured. "
+            "Set OPENAI_AGENT_MODEL to enable it."
         )
+        transport._runtime.reconcile.assert_not_awaited()
         self.assertFalse(transport._tasks)
-
-    async def test_mention_add_without_channel_replies_with_error(self) -> None:
-        transport = object.__new__(SlackTransport)
-        transport._tasks = set()
-        transport._runtime = SimpleNamespace(reconcile=AsyncMock())
-        say = AsyncMock()
-
-        await transport._handle_mention(
-            {"text": "<@U0BOT> add Dune", "user": "U123"}, say, Mock()
-        )
-
-        say.assert_awaited_once_with("Couldn't tell which channel to reply in — try again.")
-        self.assertFalse(transport._tasks)
-
-    async def test_mention_run_retains_reconcile_behavior(self) -> None:
-        transport = object.__new__(SlackTransport)
-        runtime = SimpleNamespace(reconcile=AsyncMock(return_value="1 enriched"))
-        transport._runtime = runtime
-        say = AsyncMock()
-
-        await transport._handle_mention(
-            {"text": "<@U0BOT> run", "channel": "C123", "user": "U123"}, say, Mock()
-        )
-
-        runtime.reconcile.assert_awaited_once_with()
-        self.assertEqual(
-            [call.args[0] for call in say.await_args_list],
-            ["Running a reconcile sweep…", "reconcile: 1 enriched"],
-        )
-
-    async def test_unknown_mention_command_replies_with_help(self) -> None:
-        transport = object.__new__(SlackTransport)
-        transport._runtime = SimpleNamespace(reconcile=AsyncMock())
-        say = AsyncMock()
-
-        await transport._handle_mention(
-            {"text": "<@U0BOT> dance", "channel": "C123", "user": "U123"}, say, Mock()
-        )
-
-        say.assert_awaited_once_with(
-            "Command mode supports `add <title>` and `run`. With the conversational "
-            "assistant enabled, you can also import a list, get recommendations, ask "
-            "questions, remove Entries, mark them watched, or refresh them."
-        )
 
     async def test_add_streams_real_node_progress_and_checkpoints_thread_ts(self) -> None:
         runtime = object.__new__(Runtime)

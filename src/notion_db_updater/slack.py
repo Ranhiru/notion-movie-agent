@@ -6,19 +6,14 @@ A single outbound WebSocket carries all inbound interaction, so there's no publi
 1. **HITL disambiguation (ADR 0006):** when a reconcile run pauses at `interrupt()`, `Runtime`
    calls `post_picker` — a Block Kit prompt of the OMDb candidates is posted to
    `#notion-movie-db`. The button click resumes the paused graph with the chosen imdbID.
-2. **Manual run:** an `@movie-bot run` app-mention triggers `reconcile()` (under the same
-   single-flight lock as the cron; ADR 0001).
-3. **`@movie-bot add <title>` (Phase 9 / ADR 0012):** an app mention originates an Entry from
-   Slack. The handler schedules the dedupe / create / out-of-band enrich in a background task;
-   progress is rendered as a streamed grouped task plan, while the completion ping is posted
-   as a reply in the mention's thread by the graph's terminal `notify` node
-   (via `post_completion`, bound into `Runtime`). A run may only reach `done`/`failed` much
-   later — after a disambiguation click or the 6d auto-resolve.
+2. **Watchlist conversations:** app mentions and replies in the originating thread go through
+   the conversational agent. Its tools read Watchlist data, stage user-requested changes, and
+   run an explicit reconcile sweep through the shared `Runtime`.
 
 `Runtime` and this transport are mutually referential — the sweep posts *to* Slack (via
 `Runtime.set_notifier(post_picker)` + `Runtime.bind_completion_notifier(post_completion)`) and
-Slack interactions call *back into* `Runtime.resume` / `.reconcile` / `.create_and_enrich`.
-`_serve` wires all three, then runs the cron loop and the Socket Mode listener concurrently.
+Slack interactions call *back into* the conversation tools and `Runtime.resume`. `_serve` wires
+the notifier, then runs the cron loop and the Socket Mode listener concurrently.
 """
 
 from __future__ import annotations
@@ -50,11 +45,6 @@ _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 …
 _MANUAL_ACTION = "manual:submit"
 _MANUAL_BLOCK_PREFIX = "manual_input:"
 _IMDB_ID = re.compile(r"tt\d+")  # matches a full imdb.com/title/tt… URL or a bare tt… id
-# Slack renders a bot mention as `<@BOT_USER_ID>`. Commands must immediately follow the
-# leading mention; the argument remains untouched apart from surrounding whitespace.
-_MENTION_COMMAND = re.compile(
-    r"^\s*<@[^>]+>(?:\s+(?P<command>\S+))?(?:\s+(?P<argument>.*?))?\s*$"
-)
 
 # IMDb title page for a given imdbID — rendered as a clickable link in the picker.
 _IMDB_URL = "https://www.imdb.com/title/{}/"
@@ -180,19 +170,6 @@ def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -
         f"✅ <@{user}> picked *{label}*  ·  <{imdb_url}|IMDb ↗>\n"
         f"_Enrichment status: *{status}*_"
     )
-
-
-def parse_mention_command(text: str) -> tuple[str, str] | None:
-    """Parse Slack's ``<@BOT_ID> command argument`` app-mention text.
-
-    Returns a case-folded command plus its trimmed argument. ``None`` means the event did not
-    start with a Slack mention, which is malformed for this listener but useful to handle
-    defensively in tests and synthetic payloads.
-    """
-    match = _MENTION_COMMAND.fullmatch(text)
-    if match is None:
-        return None
-    return (match.group("command") or "").casefold(), (match.group("argument") or "").strip()
 
 
 # Slack rotates these while the title-specific assistant status is visible. Keep this exact
@@ -404,7 +381,7 @@ class _TaskStream:
 
 
 class SlackTransport:
-    """Bolt Socket Mode app wiring the HITL picker + mention commands to a `Runtime`."""
+    """Bolt Socket Mode app wiring the HITL picker + Watchlist conversations to a Runtime."""
 
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
@@ -519,10 +496,10 @@ class SlackTransport:
             )
 
         @self._app.event("app_mention")
-        async def handle_mention(body, event, say, set_status, logger) -> None:  # noqa: ANN001
-            """Dispatch `@movie-bot add <title>` and `@movie-bot run`."""
+        async def handle_mention(body, event, say) -> None:  # noqa: ANN001
+            """Dispatch app mentions through the conversational assistant."""
             team_id = body.get("team_id") or event.get("team")
-            await self._handle_mention(event, say, logger, set_status, team_id)
+            await self._handle_mention(event, say, team_id)
 
         @self._app.event("message")
         async def handle_thread(body, event, say) -> None:  # noqa: ANN001
@@ -533,72 +510,16 @@ class SlackTransport:
                     event, say, body.get("team_id") or event.get("team")
                 )
 
-    async def _handle_mention(
-        self, event, say, logger, set_status=None, team_id: str | None = None
-    ) -> None:  # noqa: ANN001
+    async def _handle_mention(self, event, say, team_id: str | None = None) -> None:  # noqa: ANN001
         """Handle one app mention without coupling tests to Bolt's listener registry."""
         conversation = getattr(self._runtime, "conversation", None)
-        if conversation is not None:
-            self._schedule_conversation(event, say, team_id)
-            return
-        owner = getattr(self, "_owner", "")
-        if owner and event.get("user") != owner:
-            return
-        parsed = parse_mention_command(event.get("text", ""))
-        if parsed is None:
+        if conversation is None:
             await say(
-                "Command mode supports `add <title>` and `run`. With the conversational "
-                "assistant enabled, you can also import a list, get recommendations, ask "
-                "questions, remove Entries, mark them watched, or refresh them."
+                "The conversational Watchlist assistant is not configured. "
+                "Set OPENAI_AGENT_MODEL to enable it."
             )
             return
-
-        command, argument = parsed
-        if command == "run":
-            logger.info("slack: manual run requested")
-            await say("Running a reconcile sweep…")
-            summary = await self._runtime.reconcile()
-            await say(f"reconcile: {summary}")
-            return
-
-        if command != "add":
-            await say(
-                "Command mode supports `add <title>` and `run`. With the conversational "
-                "assistant enabled, you can also import a list, get recommendations, ask "
-                "questions, remove Entries, mark them watched, or refresh them."
-            )
-            return
-        if not argument:
-            await say(
-                "Usage: `@NotionMovieAgent add <title>` — e.g. `@NotionMovieAgent add Dune`"
-            )
-            return
-
-        channel = event.get("channel")
-        if not channel:  # every app_mention event carries one — defensive only
-            await say("Couldn't tell which channel to reply in — try again.")
-            return
-        # A top-level mention starts a new thread; a mention made inside an existing thread
-        # keeps using that thread's root. Slack's assistant status and the eventual answer must
-        # target the same root timestamp.
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        if not thread_ts:  # every real message event carries ts — defensive only
-            await say("Couldn't tell which message to reply to — try again.")
-            return
-        user = event.get("user")
-        logger.info("slack: mention add %r from %s in %s", argument, user, channel)
-        task = asyncio.create_task(
-            self._add_flow(
-                argument,
-                channel,
-                team_id or event.get("team"),
-                user,
-                thread_ts,
-                set_status,
-            )
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._schedule_conversation(event, say, team_id)
 
     def _schedule_conversation(self, event, say, team_id=None) -> None:  # noqa: ANN001
         task = asyncio.create_task(self.handle_conversation(event, say, team_id))

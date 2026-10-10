@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 from notion_db_updater.conversation import Action, Conversation, Reply
 from notion_db_updater.slack import SlackTransport
@@ -83,7 +83,7 @@ class GuardrailConversationTests(unittest.IsolatedAsyncioTestCase):
             "user": "owner",
             "ts": "1",
         }
-        await self.transport._handle_mention(event, say, Mock(), team_id="T")
+        await self.transport._handle_mention(event, say, team_id="T")
         if self.transport._tasks:
             await __import__("asyncio").gather(*self.transport._tasks)
         return say

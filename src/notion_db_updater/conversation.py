@@ -66,6 +66,10 @@ class RequestTools:
             if not e.removed and (not unwatched or e.watched is False)
         ]
 
+    async def reconcile(self) -> str:
+        """Run one explicitly requested enrichment sweep through the shared Runtime."""
+        return str(await self.runtime.reconcile())
+
     async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
         candidates = await self.runtime.resolve_title(query, media_type)
         if not self.request.get("imported") and _query_is_grounded(
