@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 
 from .config import Settings
 
@@ -711,13 +712,57 @@ class SlackTransport:
         channel = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
         status = "active"
-        await self._conversation_status(channel, thread_ts, "processing")
+        progress_ts = None
+        replied = False
+        ignored = False
+        heartbeat = None
         try:
-            response = await conversation.handle(event, team_id)
+            message = await self._app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="💭 Working on your request…",
+            )
+            if isinstance(message["ts"], str):
+                progress_ts = message["ts"]
+        except Exception:
+            log.exception("Could not post conversation progress")
+
+        async def progress(text: str) -> None:
+            if progress_ts:
+                await self._app.client.chat_update(
+                    channel=channel,
+                    ts=progress_ts,
+                    text=escape(text, quote=False),
+                    blocks=[],
+                )
+
+        async def reply(**kwargs) -> None:
+            nonlocal replied
+            if progress_ts and not replied:
+                await self._app.client.chat_update(
+                    channel=channel,
+                    ts=progress_ts,
+                    text=kwargs["text"],
+                    blocks=kwargs.get("blocks", []),
+                )
+            else:
+                await say(**kwargs)
+            replied = True
+
+        async def keep_status() -> None:
+            while True:
+                await asyncio.sleep(60)
+                await self._conversation_status(channel, thread_ts, "processing")
+
+        try:
+            await self._conversation_status(channel, thread_ts, "processing")
+            heartbeat = asyncio.create_task(keep_status())
+            response = await conversation.handle(event, team_id, progress=progress)
+            ignored = response is None
             if response is not None:
                 if response.startswith("Approve this exact action list"):
                     status = "suspended"
-                    await say(
+                    await reply(
                         text=re.sub(
                             r"^Reply `approve .*?$",
                             "Use the Approve or Deny buttons below.",
@@ -728,11 +773,29 @@ class SlackTransport:
                         blocks=_approval_blocks(response, thread_ts),
                     )
                 else:
-                    await say(text=response, thread_ts=thread_ts)
-                    for reply in self._identity_replies(event, team_id):
+                    await reply(text=response, thread_ts=thread_ts)
+                    for identity_reply in self._identity_replies(event, team_id):
                         status = "suspended"
-                        await say(**reply)
+                        await reply(**identity_reply)
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+            if progress_ts and not replied:
+                try:
+                    if ignored:
+                        await self._app.client.chat_delete(channel=channel, ts=progress_ts)
+                    else:
+                        await self._app.client.chat_update(
+                            channel=channel,
+                            ts=progress_ts,
+                            blocks=[],
+                            text="The request ended without a reply. "
+                            "Please retry or clarify your request.",
+                        )
+                except Exception:
+                    log.exception("Could not finalize conversation progress")
             await self._conversation_status(channel, thread_ts, status)
 
     def _identity_replies(self, event: dict, team_id: str | None) -> list[dict]:
@@ -865,6 +928,24 @@ class SlackTransport:
                 "agents.sessions.setStatus",
                 json={"channel_id": channel, "thread_ts": thread_ts, "status": status},
             )
+        except SlackApiError as exc:
+            error = exc.response.get("error")
+            if error not in {
+                "feature_disabled",
+                "unknown_method",
+                "method_not_supported_for_channel_type",
+            }:
+                log.warning("Slack agent session status rejected: %s", error)
+                return
+            log.info("Slack agent session status unavailable (%s); using thread status", error)
+            try:
+                await self._app.client.assistant_threads_setStatus(
+                    channel_id=channel,
+                    thread_ts=thread_ts,
+                    status="is working…" if status == "processing" else "",
+                )
+            except Exception:
+                log.exception("Could not update Slack assistant thread status")
         except Exception:
             log.exception("Could not update Slack agent session status")
 

@@ -44,6 +44,7 @@ class RequestTools:
     max_titles: int = 25
     notices: list[str] = field(default_factory=list)
     resolved_ids: dict[str, set[str]] = field(default_factory=dict)
+    progress: Callable[[str], Awaitable[None]] | None = None
 
     def stage(self, action: Action) -> str:
         """Propose an action; staging never performs a Watchlist write."""
@@ -59,6 +60,7 @@ class RequestTools:
         return "Staged for the complete request plan; nothing written."
 
     async def watchlist(self, unwatched: bool = False) -> list[dict]:
+        await _report_progress(self.progress, "📚 Reading your Watchlist…")
         entries = await self.runtime.list_watchlist(unwatched=unwatched)
         return [
             asdict(e) if is_dataclass(e) and not isinstance(e, type) else dict(vars(e))
@@ -68,9 +70,11 @@ class RequestTools:
 
     async def reconcile(self) -> str:
         """Run one explicitly requested enrichment sweep through the shared Runtime."""
+        await _report_progress(self.progress, "🎬 Enriching pending Watchlist Entries…")
         return str(await self.runtime.reconcile())
 
     async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
+        await _report_progress(self.progress, f"🔎 Finding an IMDb match for {query[:180]}…")
         candidates = await self.runtime.resolve_title(query, media_type)
         if not self.request.get("imported") and _query_is_grounded(
             query, self.request.get("text", "")
@@ -105,6 +109,7 @@ class RequestTools:
         self.request["searches"] = count + 1
         self.persist()
         try:
+            await _report_progress(self.progress, f"🔎 Searching the web for {query[:180]}…")
             return await self.research.search(query)
         except Exception:
             log.exception("Web search failed")
@@ -117,6 +122,7 @@ class RequestTools:
         self.request.update(imported=True, page_read=True)
         self.persist()
         try:
+            await _report_progress(self.progress, "🌐 Reading the supplied page…")
             if self.research is None:
                 raise ValueError("Page retrieval is not configured")
             text = await self.research.fetch_page(url)
@@ -138,6 +144,16 @@ class RequestTools:
 
 
 Planner = Callable[[list[dict], RequestTools], Awaitable[Reply]]
+
+
+async def _report_progress(
+    callback: Callable[[str], Awaitable[None]] | None, text: str
+) -> None:
+    if callback is not None:
+        try:
+            await callback(text)
+        except Exception:
+            log.exception("Could not report conversation progress")
 
 
 def _query_is_grounded(query: str, request_text: str) -> bool:
@@ -352,7 +368,13 @@ class Conversation:
                 )
         return replies
 
-    async def handle(self, event: dict, team_id: str | None = None) -> str | None:
+    async def handle(
+        self,
+        event: dict,
+        team_id: str | None = None,
+        *,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str | None:
         if event.get("user") != self.owner or event.get("bot_id") or event.get("subtype"):
             return None
         if not all(event.get(k) for k in ("channel", "ts", "text")):
@@ -375,7 +397,7 @@ class Conversation:
             if previous.get("status") == "pending":
                 return self._preview(previous)
             if previous.get("status") == "executing":
-                response = await self._execute(request_key, previous)
+                response = await self._execute(request_key, previous, progress=progress)
                 self._save(
                     key,
                     state
@@ -451,7 +473,7 @@ class Conversation:
                 pending["status"] = "executing"
                 assert isinstance(pending_key, str)
                 self._save(pending_key, pending)
-                response = await self._execute(pending_key, pending)
+                response = await self._execute(pending_key, pending, progress=progress)
                 state.pop("pending", None)
                 state["references"] = pending.get("references", [])
                 state["identity_request"] = pending_key
@@ -482,9 +504,11 @@ class Conversation:
                 max_searches=self.max_searches,
                 max_titles=self.max_titles,
                 persist=lambda: self._save(request_key, request),
+                progress=progress,
             )
             try:
                 reply = await self.planner(messages, context)
+                await _report_progress(progress, "📝 Checking the result…")
                 available = {
                     e.page_id for e in await self.runtime.list_watchlist() if not e.removed
                 }
@@ -518,7 +542,7 @@ class Conversation:
                 self._save(request_key, request)
             elif actions:
                 self._save(request_key, request)
-                response = await self._execute(request_key, request)
+                response = await self._execute(request_key, request, progress=progress)
                 state.pop("pending", None)
             else:
                 request["status"] = "answered"
@@ -670,7 +694,13 @@ class Conversation:
             + f"`approve {request['token']} 1,2`."
         )
 
-    async def _execute(self, key: str, request: dict) -> str:
+    async def _execute(
+        self,
+        key: str,
+        request: dict,
+        *,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
         results = []
         for i, action in enumerate(request["actions"]):
             if action.get("result"):
@@ -701,6 +731,9 @@ class Conversation:
                 action["result"] = result
                 self._save(key, request)
             else:
+                await _report_progress(
+                    progress, f"🎬 Applying the requested change to {action['title']}…"
+                )
                 action["started"] = True
                 self._save(key, request)
                 try:

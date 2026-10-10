@@ -88,7 +88,12 @@ Slack needs `app_mention` plus message subscriptions for the channel types you u
 `app_mentions:read` and `chat:write` scopes, Socket Mode, and interactivity. Reinstall the app
 after changing scopes. See [Slack message events](https://docs.slack.dev/reference/events/message.channels/).
 
-Mention the bot to start, then reply normally within that thread:
+Mention the bot to start, then reply normally within that thread.
+
+Each request shows a working message in its thread. Real tool operations update that message
+with progress such as web searches and IMDb matching; the final answer replaces it.
+The native working indicator uses agent session status, with assistant thread status as a
+fallback when the session API is unavailable. Long requests refresh the indicator every minute.
 
 - `@Movie Bot add Lone Survivor and Black Hawk Down`
 - `@Movie Bot add the movies from https://example.com/list`

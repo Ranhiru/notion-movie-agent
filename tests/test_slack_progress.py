@@ -5,7 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
+from slack_sdk.errors import SlackApiError
+
 from notion_db_updater.app import Runtime
+from notion_db_updater.conversation import RequestTools
 from notion_db_updater.models import Entry
 from notion_db_updater.slack import LOADING_MESSAGES, SlackTransport
 
@@ -45,6 +48,139 @@ class _FakeGraph:
 
 
 class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_progress_covers_real_work_and_does_not_report_blocked_calls(self):
+        progress = AsyncMock()
+        runtime = SimpleNamespace(
+            list_watchlist=AsyncMock(return_value=[]),
+            resolve_title=AsyncMock(return_value=[]),
+            reconcile=AsyncMock(return_value="Done"),
+        )
+        research = SimpleNamespace(
+            search=AsyncMock(return_value=[]), fetch_page=AsyncMock(return_value="Page")
+        )
+        tools = RequestTools(
+            runtime=runtime,
+            request={"text": "https://example.com/movies"},
+            references=[],
+            research=research,
+            progress=progress,
+            max_searches=1,
+        )
+        await tools.watchlist()
+        await tools.resolve_title("Reacher")
+        await tools.reconcile()
+        await tools.search("Reacher")
+        await tools.search("Blocked second query")
+        await tools.fetch_page("https://example.com/movies")
+        await tools.fetch_page("https://example.com/movies")
+        self.assertEqual(progress.await_count, 5)
+        self.assertIn("IMDb match for Reacher", progress.await_args_list[1].args[0])
+        research.search.assert_awaited_once_with("Reacher")
+        research.fetch_page.assert_awaited_once()
+
+    async def test_visible_progress_is_cleaned_up_on_ignore_failure_and_cancellation(self):
+        for outcome in (None, RuntimeError("Planner failed"), asyncio.CancelledError()):
+            with self.subTest(outcome=outcome):
+                transport = object.__new__(SlackTransport)
+                transport._owner = "U123"
+                client = AsyncMock()
+                client.chat_postMessage.return_value = {"ts": "progress-1"}
+                transport._app = SimpleNamespace(client=client)
+                handle = AsyncMock(return_value=outcome)
+                if isinstance(outcome, BaseException):
+                    handle.side_effect = outcome
+                transport._runtime = SimpleNamespace(
+                    conversation=SimpleNamespace(handle=handle)
+                )
+                event = {"user": "U123", "channel": "C123", "ts": "1", "text": "hello"}
+                if isinstance(outcome, BaseException):
+                    with self.assertRaises(type(outcome)):
+                        await transport.handle_conversation(event, AsyncMock(), "T123")
+                    self.assertNotIn("Working", client.chat_update.await_args.kwargs["text"])
+                else:
+                    await transport.handle_conversation(event, AsyncMock(), "T123")
+                    client.chat_delete.assert_awaited_once_with(
+                        channel="C123", ts="progress-1"
+                    )
+                self.assertEqual(client.api_call.await_args.kwargs["json"]["status"], "active")
+
+    async def test_working_message_and_real_tool_progress_precede_final_reply(self):
+        transport = object.__new__(SlackTransport)
+        transport._owner = "U123"
+        client = AsyncMock()
+        client.chat_postMessage.return_value = {"ts": "progress-1"}
+        transport._app = SimpleNamespace(client=client)
+
+        async def search(query):
+            self.assertIn(
+                "Searching the web for Reacher", client.chat_update.await_args.kwargs["text"]
+            )
+            return []
+
+        async def handle(event, team, *, progress):
+            client.chat_postMessage.assert_awaited_once_with(
+                channel="C123",
+                thread_ts="1",
+                text="💭 Working on your request…",
+            )
+            tools = RequestTools(
+                runtime=SimpleNamespace(),
+                request={"text": event["text"]},
+                references=[],
+                research=SimpleNamespace(search=search),
+                progress=progress,
+            )
+            await tools.search("Reacher latest season")
+            return "Here is the result."
+
+        transport._runtime = SimpleNamespace(conversation=SimpleNamespace(handle=handle))
+        say = AsyncMock()
+        event = {
+            "user": "U123",
+            "channel": "C123",
+            "ts": "2",
+            "thread_ts": "1",
+            "text": "Check Reacher",
+        }
+        await transport.handle_conversation(event, say, "T123")
+        self.assertEqual(client.chat_update.await_args.kwargs["text"], "Here is the result.")
+        self.assertEqual(client.chat_update.await_args.kwargs["ts"], "progress-1")
+        say.assert_not_awaited()
+
+    async def test_native_status_uses_compatible_fallback_when_sessions_unavailable(self):
+        transport = object.__new__(SlackTransport)
+        client = AsyncMock()
+        client.api_call.side_effect = SlackApiError(
+            "not available", {"error": "feature_disabled"}
+        )
+        transport._app = SimpleNamespace(client=client)
+        await transport._conversation_status("C123", "1", "processing")
+        client.assistant_threads_setStatus.assert_awaited_with(
+            channel_id="C123",
+            thread_ts="1",
+            status="is working…",
+        )
+        await transport._conversation_status("C123", "1", "active")
+        client.assistant_threads_setStatus.assert_awaited_with(
+            channel_id="C123",
+            thread_ts="1",
+            status="",
+        )
+
+    async def test_progress_update_failure_does_not_interrupt_the_tool(self):
+        search = AsyncMock(return_value=[{"title": "Evidence"}])
+        tools = RequestTools(
+            runtime=SimpleNamespace(),
+            request={"text": "research Reacher"},
+            references=[],
+            research=SimpleNamespace(search=search),
+            progress=AsyncMock(side_effect=RuntimeError("Slack unavailable")),
+        )
+        with self.assertLogs("notion_db_updater.conversation", level="ERROR"):
+            result = await tools.search("Reacher")
+        self.assertEqual(result, [{"title": "Evidence"}])
+        search.assert_awaited_once_with("Reacher")
+
     async def test_conversation_status_cleanup_and_approval_wait(self) -> None:
         for outcome, final_status in (
             ("Approve this exact action list (expires in 30 minutes):", "suspended"),
@@ -57,7 +193,7 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
                 client = AsyncMock()
                 transport._app = SimpleNamespace(client=client)
 
-                async def handle(event, team, client=client, outcome=outcome):
+                async def handle(event, team, client=client, outcome=outcome, **kwargs):
                     self.assertEqual(
                         client.api_call.await_args.kwargs["json"],
                         {
@@ -131,7 +267,7 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.gather(*transport._tasks)
 
-        conversation.handle.assert_awaited_once_with(event, "T123")
+        conversation.handle.assert_awaited_once_with(event, "T123", progress=ANY)
         say.assert_awaited_once_with(text="Sweep started.", thread_ts="171234.567")
         self.assertEqual(
             [
