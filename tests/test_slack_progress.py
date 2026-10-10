@@ -173,7 +173,11 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
             {"text": "<@U0BOT> dance", "channel": "C123", "user": "U123"}, say, Mock()
         )
 
-        say.assert_awaited_once_with("Mention me with `add <title>` or `run`.")
+        say.assert_awaited_once_with(
+            "Command mode supports `add <title>` and `run`. With the conversational "
+            "assistant enabled, you can also import a list, get recommendations, ask "
+            "questions, remove Entries, mark them watched, or refresh them."
+        )
 
     async def test_add_streams_real_node_progress_and_checkpoints_thread_ts(self) -> None:
         runtime = object.__new__(Runtime)

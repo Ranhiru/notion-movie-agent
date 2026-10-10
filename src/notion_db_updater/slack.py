@@ -546,7 +546,11 @@ class SlackTransport:
             return
         parsed = parse_mention_command(event.get("text", ""))
         if parsed is None:
-            await say("Mention me with `add <title>` or `run`.")
+            await say(
+                "Command mode supports `add <title>` and `run`. With the conversational "
+                "assistant enabled, you can also import a list, get recommendations, ask "
+                "questions, remove Entries, mark them watched, or refresh them."
+            )
             return
 
         command, argument = parsed
@@ -558,7 +562,11 @@ class SlackTransport:
             return
 
         if command != "add":
-            await say("Mention me with `add <title>` or `run`.")
+            await say(
+                "Command mode supports `add <title>` and `run`. With the conversational "
+                "assistant enabled, you can also import a list, get recommendations, ask "
+                "questions, remove Entries, mark them watched, or refresh them."
+            )
             return
         if not argument:
             await say(
