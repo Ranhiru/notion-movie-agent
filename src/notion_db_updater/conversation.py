@@ -522,17 +522,15 @@ class Conversation:
                     "Nothing was changed; please clarify or retry."
                 )
             request.update(actions=actions, status="executing")
+            affected_entries = {
+                action.get("imdb_id") or action.get("page_id") or str(index)
+                for index, action in enumerate(actions)
+            }
             if actions and (
                 re.search(r"https?://", text)
                 or request.get("imported")
                 or not all(self._explicit_action(text, a["operation"]) for a in actions)
-                or len(
-                    {
-                        a.get("imdb_id") or a.get("page_id") or str(i)
-                        for i, a in enumerate(actions)
-                    }
-                )
-                >= 4
+                or len(affected_entries) >= 4
             ):
                 request.update(
                     status="pending", token=secrets.token_hex(8), expires=time.time() + 1800
@@ -549,14 +547,14 @@ class Conversation:
                 response = reply.text
             if context.notices:
                 response += "\n" + "\n".join(dict.fromkeys(context.notices))
+            if request.get("status") == "done":
+                references = request.get("references", [])
+            else:
+                references = reply.references or state.get("references", [])
             state.update(
                 identity_request=request_key,
                 messages=messages + [{"role": "assistant", "content": response}],
-                references=(
-                    request.get("references", [])
-                    if request.get("status") == "done"
-                    else reply.references or state.get("references", [])
-                ),
+                references=references,
             )
             self._save(key, state)
             if request.get("status") != "pending":

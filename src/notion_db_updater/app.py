@@ -51,7 +51,7 @@ from .llm import (
 )
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
-from .omdb import OMDbClient
+from .omdb import OMDbClient, parse_year
 from .providers import build_search_client
 from .resilience import transient_retry_policy
 
@@ -499,7 +499,7 @@ class Runtime:
         return [
             {
                 "title": candidate.title,
-                "year": self._candidate_year(candidate.year),
+                "year": parse_year(candidate.year),
                 "imdb_id": candidate.imdb_id,
                 "media_type": self._canonical_media_type(candidate.media_type),
             }
@@ -508,8 +508,6 @@ class Runtime:
 
     async def validate_identity(self, imdb_id: str) -> dict:
         """Fetch an IMDb ID from OMDb and return its verified canonical identity."""
-        from .omdb import parse_year
-
         key = imdb_id.strip()
         if not key:
             raise ValueError("IMDb ID is required")
@@ -526,12 +524,6 @@ class Runtime:
             "year": parse_year(details.get("Year")),
             "media_type": media_type,
         }
-
-    @staticmethod
-    def _candidate_year(value: str | None) -> int | None:
-        from .omdb import parse_year
-
-        return parse_year(value)
 
     @staticmethod
     def _canonical_media_type(value: str | None) -> str | None:

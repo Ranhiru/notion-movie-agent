@@ -758,25 +758,26 @@ class SlackTransport:
             await self._conversation_status(channel, thread_ts, "processing")
             heartbeat = asyncio.create_task(keep_status())
             response = await conversation.handle(event, team_id, progress=progress)
-            ignored = response is None
-            if response is not None:
-                if response.startswith("Approve this exact action list"):
+            if response is None:
+                ignored = True
+                return
+            if response.startswith("Approve this exact action list"):
+                status = "suspended"
+                await reply(
+                    text=re.sub(
+                        r"^Reply `approve .*?$",
+                        "Use the Approve or Deny buttons below.",
+                        response,
+                        flags=re.MULTILINE,
+                    ),
+                    thread_ts=thread_ts,
+                    blocks=_approval_blocks(response, thread_ts),
+                )
+            else:
+                await reply(text=response, thread_ts=thread_ts)
+                for identity_reply in self._identity_replies(event, team_id):
                     status = "suspended"
-                    await reply(
-                        text=re.sub(
-                            r"^Reply `approve .*?$",
-                            "Use the Approve or Deny buttons below.",
-                            response,
-                            flags=re.MULTILINE,
-                        ),
-                        thread_ts=thread_ts,
-                        blocks=_approval_blocks(response, thread_ts),
-                    )
-                else:
-                    await reply(text=response, thread_ts=thread_ts)
-                    for identity_reply in self._identity_replies(event, team_id):
-                        status = "suspended"
-                        await reply(**identity_reply)
+                    await reply(**identity_reply)
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
