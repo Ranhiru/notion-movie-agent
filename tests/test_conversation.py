@@ -11,7 +11,7 @@ import httpx
 
 from notion_db_updater.config import Settings
 from notion_db_updater.conversation import Action, Conversation, Reply
-from notion_db_updater.research import ResearchClient
+from notion_db_updater.firecrawl import FirecrawlClient
 from notion_db_updater.slack import SlackTransport
 
 
@@ -393,11 +393,23 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
         def respond(request):
             requests.append(request)
-            return httpx.Response(302, headers={"Location": "http://127.0.0.1/private"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "markdown": "Untrusted redirected content",
+                        "metadata": {"url": "http://127.0.0.1/private"},
+                    },
+                },
+            )
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
-            research = ResearchClient(
-                Settings(NOTION_MOVIE_DB_TOKEN="fixture", _env_file=None), page_http=http
+        async with httpx.AsyncClient(
+            base_url="https://api.firecrawl.dev/v2",
+            transport=httpx.MockTransport(respond),
+        ) as http:
+            research = FirecrawlClient(
+                Settings(NOTION_MOVIE_DB_TOKEN="fixture", _env_file=None), http=http
             )
             self.addAsyncCleanup(research.aclose)
             self.conversation.research = research
@@ -411,6 +423,11 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("notion_db_updater.conversation", level="ERROR"):
                 reply = await self.mention("add movies from https://93.184.216.34/list")
             self.assertEqual(len(requests), 1)
+            self.assertEqual(str(requests[0].url), "https://api.firecrawl.dev/v2/scrape")
+            payload = json.loads(requests[0].content)
+            self.assertEqual(payload["url"], "https://93.184.216.34/list")
+            self.assertEqual(payload["formats"], ["markdown"])
+            self.assertFalse(payload["skipTlsVerification"])
             self.assertEqual(self.runtime.writes, [])
             self.assertIn("could not be read safely", reply.call_args.kwargs["text"])
 

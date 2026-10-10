@@ -40,6 +40,7 @@ from langgraph.types import Command
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
 from .conversation import Conversation
+from .firecrawl import FirecrawlClient
 from .graph import NOT_FOUND, SLACK_ORIGIN, CompletionNotifier, build_graph
 from .llm import (
     agent_model,
@@ -266,7 +267,12 @@ class Runtime:
         )
         # Phase 8 (ADR 0003): the RT search strategy — a bare provider or the round-robin
         # composite — built from SEARCH_PROVIDERS; the exit stack closes its clients on aclose.
-        search = await self._stack.enter_async_context(build_search_client(self._settings))
+        research = None
+        if self._settings.OPENAI_AGENT_MODEL:
+            research = await self._stack.enter_async_context(FirecrawlClient(self._settings))
+        search = await self._stack.enter_async_context(
+            build_search_client(self._settings, firecrawl=research)
+        )
         # Phase 7 (ADR 0013): one shared LLM rate limiter for all three role models (aggregate
         # cap on the single endpoint), and the transient-retry policy for the gating nodes.
         limiter = llm_rate_limiter(self._settings)
@@ -283,9 +289,7 @@ class Runtime:
         )
         if self._settings.OPENAI_AGENT_MODEL:
             from .agent import build_planner
-            from .research import ResearchClient
 
-            research = await self._stack.enter_async_context(ResearchClient(self._settings))
             self.conversation = Conversation(
                 self,
                 self._settings.CHECKPOINT_DB_PATH,

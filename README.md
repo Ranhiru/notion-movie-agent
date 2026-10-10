@@ -108,10 +108,12 @@ applies only once to that exact plan. Removal moves an Entry to Notion trash, an
 state, title, type, and identity. Requests and references persist in the checkpoint database.
 
 Default recommendations use up to five existing unchecked Watched Entries. Explicit discovery
-can search outside the Watchlist; suggestions do not Add anything. Web research uses Tavily
-and cites its evidence. Initial limits are three searches and 25 staged actions per request;
-the supplied HTML page is retrieved once, without following other pages. Page retrieval
-rejects private network addresses and rechecks redirects, with a 1 MB body ceiling and a
+can search outside the Watchlist; suggestions do not Add anything. Web research uses Firecrawl
+search and cites its evidence. Initial limits are three searches and 25 staged actions per request;
+the supplied page is scraped once through Firecrawl, without crawling linked pages.
+Page retrieval rejects private network addresses before submission and validates the returned
+page URL. Firecrawl handles network access and redirects remotely; the bot never connects
+to supplied pages directly. Provider responses have a 1 MB ceiling and page text has a
 64,000-character agent-context ceiling. Limits are reported with an explicit continuation
 option. Raise the configuration ceilings deliberately after evaluating behavior.
 
