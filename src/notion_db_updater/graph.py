@@ -66,6 +66,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import NotRequired, TypedDict
 
 from langchain_openai import ChatOpenAI
@@ -77,7 +78,7 @@ from pydantic import BaseModel, Field
 
 from .models import Entry, enrichment_properties, notion_type_value
 from .notion import NotionClient
-from .omdb import Candidate, OMDbClient, details_fields, normalize_title
+from .omdb import Candidate, OMDbClient, details_fields, imdb_identity, normalize_title
 from .rt import build_rt_subgraph, extract_rt_page, synopsis_region
 from .schema import Confidence, EnrichedEntry, normalize_media_type
 from .search import RTHit, SearchClient
@@ -181,14 +182,24 @@ class EnrichmentState(TypedDict):
     judge_reason: NotRequired[str]
 
 
-async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
+async def read_page(state: EnrichmentState, *, notion: NotionClient, omdb: OMDbClient) -> dict:
     """Fetch the Entry and reset per-run choices left in a reused page checkpoint."""
     entry = await notion.get_entry(state["page_id"])
+    candidates = []
+    if entry.title and imdb_identity(entry.title):
+        candidates = await omdb.search(entry.title, entry.media_type)
+        if candidates:
+            if (
+                state.get("resolved_imdb_id")
+                and state.get("resolved_imdb_id") != candidates[0].imdb_id
+            ):
+                raise ValueError("Entry link does not match the requested IMDb identity")
+            entry = replace(entry, title=candidates[0].title)
     fresh = {
         "entry": entry,
         "status": "pending",
         "note": "",
-        "candidates": [],
+        "candidates": candidates,
         "chosen_imdb_id": state.get("resolved_imdb_id"),
         "best_guess_imdb_id": None,
         "confident": False,
@@ -220,6 +231,8 @@ async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
             "chosen_imdb_id": None,
             "note": "blank Entry — skipped",
         }
+    if imdb_identity(entry.title) and not candidates:
+        return {**fresh, "status": "failed", "note": "IMDb identity not found in OMDb"}
     return fresh
 
 
@@ -241,6 +254,9 @@ async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
 
     if state.get("resolved_imdb_id"):
         return {"candidates": [], "chosen_imdb_id": state.get("resolved_imdb_id")}
+    candidates = state.get("candidates")
+    if candidates:
+        return {"candidates": candidates, "chosen_imdb_id": candidates[0].imdb_id}
 
     entry = state.get("entry")
     assert entry is not None and entry.title is not None  # guaranteed by read_page
@@ -757,7 +773,9 @@ def build_graph(
     g = StateGraph(EnrichmentState)
     # Gating nodes carry the RetryPolicy (ADR 0013); best-effort / no-IO nodes don't.
     g.add_node(
-        "read_page", functools.partial(read_page, notion=notion), retry_policy=retry_policy
+        "read_page",
+        functools.partial(read_page, notion=notion, omdb=omdb_client),
+        retry_policy=retry_policy,
     )
     g.add_node(
         "omdb_search",
