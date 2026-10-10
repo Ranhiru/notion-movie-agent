@@ -304,16 +304,22 @@ async def _serve(limit: int | None = None) -> None:
     """Run the reconcile cron + (when Slack is configured) the Socket Mode listener.
 
     Slack is the app's inbound path (ADR 0009 / 0010): it posts the HITL picker when a run
-    pauses and handles the `@movie-bot add <title>` and `@movie-bot run` commands. The picker
-    notifier is wired to the same `Runtime` the cron drives, so a paused sweep prompts in Slack
-    and the button click resumes it. When Slack tokens are unset (local dev), falls back to
-    cron-only.
+    pauses and routes app mentions and thread replies through the conversational assistant. The
+    picker notifier is wired to the same `Runtime` the cron drives, so a paused sweep prompts
+    in Slack and the button click resumes it. When Slack tokens are unset (local dev), falls
+    back to cron-only.
 
     `limit` caps each sweep to the first N pending entries (testing aid): with the 1-hour
     interval, `--serve --limit 1` processes one ambiguous Entry → one Slack picker, then idles
     with the listener open so the click round-trip can be verified in isolation.
     """
     settings = get_settings()
+    if (
+        settings.SLACK_BOT_TOKEN
+        and settings.SLACK_APP_TOKEN
+        and not settings.OPENAI_AGENT_MODEL
+    ):
+        raise ValueError("OPENAI_AGENT_MODEL is required when Slack Socket Mode is enabled")
     async with Runtime(settings) as rt:
         tasks = [rt.run_forever(limit=limit)]
         if settings.SLACK_BOT_TOKEN and settings.SLACK_APP_TOKEN:
@@ -321,7 +327,7 @@ async def _serve(limit: int | None = None) -> None:
             rt.set_notifier(slack.post_picker)
             rt.bind_completion_notifier(slack.post_completion)  # Phase 9 add completion ping
             tasks.append(slack.start())
-            log.info("serve: Slack Socket Mode enabled (HITL picker + @mention add/run)")
+            log.info("serve: Slack Socket Mode enabled (HITL picker + Watchlist assistant)")
         else:
             log.info("serve: Slack tokens unset — cron only (no HITL picker)")
         await asyncio.gather(*tasks)
@@ -348,6 +354,13 @@ def _configure_logging(mode: str) -> None:
         ],
     )
     log.info("logging to %s", log_path)
+
+
+async def _watchlist_schema(create_identity: bool) -> None:
+    """Read the live schema, adding IMDb ID only on an explicit migration command."""
+    async with NotionClient(get_settings()) as client:
+        await client.ensure_schema(create_identity=create_identity)
+    print("Watchlist schema verified (Watched checkbox and IMDb ID rich_text).")
 
 
 def main() -> None:
@@ -391,6 +404,16 @@ def main() -> None:
         help="run one reconcile sweep over the whole Watchlist (Phase 3 'run now')",
     )
     parser.add_argument(
+        "--prepare-watchlist",
+        action="store_true",
+        help="verify live schema and add the missing IMDb ID rich_text property",
+    )
+    parser.add_argument(
+        "--check-watchlist-schema",
+        action="store_true",
+        help="verify live Watched/IMDb ID schema without changing it",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="run the in-process reconcile cron until interrupted (Phase 3)",
@@ -418,6 +441,8 @@ def main() -> None:
     if args.generate_graph:
         _configure_logging("graph")
         asyncio.run(_generate_graph())
+    elif args.prepare_watchlist or args.check_watchlist_schema:
+        asyncio.run(_watchlist_schema(args.prepare_watchlist))
     elif args.serve:
         _configure_logging("serve")
         try:

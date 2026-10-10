@@ -39,8 +39,11 @@ from langgraph.types import Command
 
 from .checkpoint import open_checkpointer
 from .config import Settings, get_settings
+from .conversation import Conversation
+from .firecrawl import FirecrawlClient
 from .graph import NOT_FOUND, SLACK_ORIGIN, CompletionNotifier, build_graph
 from .llm import (
+    agent_model,
     disambiguation_model,
     extraction_model,
     judge_model,
@@ -48,7 +51,7 @@ from .llm import (
 )
 from .models import Entry, enrichment_properties
 from .notion import NotionClient
-from .omdb import OMDbClient
+from .omdb import OMDbClient, parse_year
 from .providers import build_search_client
 from .resilience import transient_retry_policy
 
@@ -212,6 +215,14 @@ class Runtime:
         # concurrent cron doesn't double-enrich the same still-`pending` row.
         self._completion_notifier = CompletionNotifier()
         self._inflight: set[str] = set()
+        self.conversation: Conversation | None = None
+        # Serialize identity check/create and mutations within this single-process Runtime.
+        self._identity_lock = asyncio.Lock()
+        self._page_locks: dict[str, asyncio.Lock] = {}
+
+    def _page_lock(self, page_id: str) -> asyncio.Lock:
+        """Return the process-local operation lock for one Notion Entry."""
+        return self._page_locks.setdefault(page_id, asyncio.Lock())
 
     def set_notifier(
         self,
@@ -239,6 +250,10 @@ class Runtime:
         self._completion_notifier.bind(post)
 
     async def __aenter__(self) -> Runtime:
+        # Fail before serving requests if the Watchlist identity/viewing properties drifted.
+        # Schema changes remain explicit through ensure_watchlist_schema(create_identity=True).
+        if self._settings.OPENAI_AGENT_MODEL:
+            await self._notion.ensure_schema(create_identity=False)
         # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
         # across entries. `open_checkpointer` applies the state-type allowlist + runs setup()
         # (WAL lifecycle proven by spike 03). Models are bound once (ChatOpenAI is stateless
@@ -248,7 +263,12 @@ class Runtime:
         )
         # Phase 8 (ADR 0003): the RT search strategy — a bare provider or the round-robin
         # composite — built from SEARCH_PROVIDERS; the exit stack closes its clients on aclose.
-        search = await self._stack.enter_async_context(build_search_client(self._settings))
+        research = None
+        if self._settings.OPENAI_AGENT_MODEL:
+            research = await self._stack.enter_async_context(FirecrawlClient(self._settings))
+        search = await self._stack.enter_async_context(
+            build_search_client(self._settings, firecrawl=research)
+        )
         # Phase 7 (ADR 0013): one shared LLM rate limiter for all three role models (aggregate
         # cap on the single endpoint), and the transient-retry policy for the gating nodes.
         limiter = llm_rate_limiter(self._settings)
@@ -263,6 +283,17 @@ class Runtime:
             retry_policy=transient_retry_policy(self._settings.RETRY_MAX_ATTEMPTS),
             completion_notifier=self._completion_notifier,  # Phase 9 terminal notify node
         )
+        if self._settings.OPENAI_AGENT_MODEL:
+            from .agent import build_planner
+
+            self.conversation = Conversation(
+                self,
+                self._settings.CHECKPOINT_DB_PATH,
+                build_planner(agent_model(self._settings, limiter)),
+                research=research,
+                max_searches=self._settings.AGENT_MAX_SEARCHES,
+                max_titles=self._settings.AGENT_MAX_IMPORT_TITLES,
+            )
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -353,25 +384,35 @@ class Runtime:
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         async with sem:
+            async with self._identity_lock:
+                if entry.page_id in self._inflight:
+                    return _TRANSIENT
+                self._inflight.add(entry.page_id)
             try:
-                config: RunnableConfig = {
-                    # thread_id = page_id keys the checkpoint (ADR 0006/0007), so a Phase-6b
-                    # paused run resumes on this same key. run_name names the LangSmith trace;
-                    # `origin` foreshadows the Phase 9 Slack `add` path (ADR 0001).
-                    "configurable": {"thread_id": entry.page_id},
-                    "run_name": entry.title or "(blank Entry)",
-                    "metadata": {"page_id": entry.page_id, "origin": "sweep"},
-                }
-                # Phase 7 (ADR 0013): cap intra-graph parallel-node execution (fan-out lanes)
-                # on top of the across-Entry sweep semaphore. 0 = unset → let LangGraph decide.
-                if self._settings.GRAPH_MAX_CONCURRENCY > 0:
-                    config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
-                final_state = await self._graph.ainvoke(
-                    {"page_id": entry.page_id}, config=config
-                )
-                if await self._handle_pause(entry, final_state):
-                    return _AWAITING
-                return final_state.get("status", "pending")
+                async with self._page_lock(entry.page_id):
+                    current = await self._notion.get_entry(entry.page_id)
+                    if current.removed:
+                        return "removed"
+                    if current.status not in (None, "pending"):
+                        return current.status
+                    config = self._graph_config(current, "sweep")
+                    final_state = await self._graph.ainvoke(
+                        {
+                            "page_id": entry.page_id,
+                            "resolved_imdb_id": None,
+                            "skip_type_backfill": False,
+                            "origin": "sweep",
+                            "auto_resolved": False,
+                            "notify_channel": None,
+                            "notify_user": None,
+                            "notify_thread_ts": None,
+                            "original_request": "",
+                        },
+                        config=config,
+                    )
+                    if await self._handle_pause(current, final_state):
+                        return _AWAITING
+                    return final_state.get("status", "pending")
             except Exception:
                 log.exception(
                     "reconcile: transient error on %r (%s) — left pending",
@@ -379,6 +420,8 @@ class Runtime:
                     entry.page_id,
                 )
                 return _TRANSIENT
+            finally:
+                self._inflight.discard(entry.page_id)
 
     async def _handle_pause(self, entry: Entry, final_state: dict) -> bool:
         """If a run paused at `interrupt()`: mark awaiting_input + post the picker. → paused?
@@ -389,7 +432,8 @@ class Runtime:
         `thread_id = page_id`; `update_notion` never ran, so we write `awaiting_input` here so
         the next sweep skips it (the filter queries empty/pending only) and an out-of-band
         resume finishes it. Posting the picker is best-effort — a Slack failure must not fail
-        the caller; the row stays awaiting_input for the next `@movie-bot run` / `--enrich`.
+        the caller; the row stays awaiting_input for the next assistant reconcile request or
+        `--enrich`.
         Returns True when it handled a pause, False for a terminal run.
         """
         interrupts = final_state.get("__interrupt__")
@@ -423,6 +467,346 @@ class Runtime:
         """Best-effort pre-create dedupe for Slack `add` (Phase 9): an Entry, or None."""
         return await self._notion.find_by_title(title)
 
+    async def list_watchlist(self, unwatched: bool = False) -> list[Entry]:
+        """Read visible Watchlist Entries independently of the reconcile queue."""
+        return await self._notion.list_watchlist(unwatched)
+
+    async def ensure_watchlist_schema(self, *, create_identity: bool = False) -> dict:
+        """Validate Watchlist properties; add IMDb ID only when explicitly requested."""
+        return await self._notion.ensure_schema(create_identity=create_identity)
+
+    async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
+        """Return canonical OMDb identity candidates for a conversational title."""
+        requested_type = {
+            "movie": "Movie",
+            "tv": "TV Show",
+            "series": "TV Show",
+            "Movie": "Movie",
+            "TV Show": "TV Show",
+        }.get(media_type or "")
+        candidates = await self._omdb.search(query, requested_type)
+        return [
+            {
+                "title": candidate.title,
+                "year": parse_year(candidate.year),
+                "imdb_id": candidate.imdb_id,
+                "media_type": self._canonical_media_type(candidate.media_type),
+            }
+            for candidate in candidates
+        ]
+
+    async def validate_identity(self, imdb_id: str) -> dict:
+        """Fetch an IMDb ID from OMDb and return its verified canonical identity."""
+        key = imdb_id.strip()
+        if not key:
+            raise ValueError("IMDb ID is required")
+        details = await self._omdb.details(key)
+        if details.get("Response") != "True" or details.get("imdbID") != key:
+            raise ValueError(f"OMDb did not validate IMDb ID {key!r}")
+        title = details.get("Title")
+        media_type = self._canonical_media_type(details.get("Type"))
+        if not isinstance(title, str) or not title.strip() or media_type is None:
+            raise ValueError(f"OMDb returned incomplete identity for {key!r}")
+        return {
+            "imdb_id": key,
+            "title": title.strip(),
+            "year": parse_year(details.get("Year")),
+            "media_type": media_type,
+        }
+
+    @staticmethod
+    def _canonical_media_type(value: str | None) -> str | None:
+        return {"movie": "movie", "series": "tv", "episode": "tv"}.get(value or "")
+
+    @staticmethod
+    def _identity_confirmation(entry: Entry, identity: dict) -> dict:
+        return {"page_id": entry.page_id, "existing_title": entry.title, "identity": identity}
+
+    async def add_resolved(
+        self,
+        imdb_id: str,
+        original_request: str,
+        channel: str,
+        user: str,
+        thread_ts: str,
+        request_key: str,
+    ) -> dict:
+        """Identity-dedupe, create a pending Entry, then enrich its page out-of-band."""
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        identity = await self.validate_identity(imdb_id)
+        async with self._identity_lock:
+            try:
+                existing = await self._notion.find_by_imdb_id(identity["imdb_id"])
+            except Exception:
+                log.exception("could not reconcile IMDb identity before add")
+                return {
+                    "status": "clarification_required",
+                    "title": identity["title"],
+                    "reason": "Could not check identities; verify legacy IMDb IDs first.",
+                }
+            if existing is not None:
+                return {
+                    "status": "already_present",
+                    "page_id": existing.page_id,
+                    "title": existing.title,
+                }
+            try:
+                legacy = await self._notion.find_all_by_title(identity["title"])
+            except Exception:
+                log.exception("could not check exact-title legacy entries before add")
+                return {
+                    "status": "clarification_required",
+                    "title": identity["title"],
+                    "reason": "Could not verify legacy entries; verify legacy IMDb IDs first.",
+                }
+            unknown = next((entry for entry in legacy if entry.imdb_id is None), None)
+            if unknown is not None:
+                return {
+                    "status": "clarification_required",
+                    "page_id": unknown.page_id,
+                    "title": unknown.title,
+                    "reason": "An existing Entry needs its IMDb match confirmed.",
+                    "identity_confirmation": self._identity_confirmation(unknown, identity),
+                }
+            try:
+                visible = await self._notion.list_watchlist()
+            except Exception:
+                log.exception("could not scan legacy entries before add")
+                return {
+                    "status": "clarification_required",
+                    "title": identity["title"],
+                    "reason": "Could not verify legacy entries; verify legacy IMDb IDs first.",
+                }
+            unidentified = [entry for entry in visible if entry.imdb_id is None]
+            if len(unidentified) > 25:
+                return {
+                    "status": "clarification_required",
+                    "title": identity["title"],
+                    "reason": "Over 25 legacy entries; verify legacy IMDb IDs first.",
+                }
+            for entry in unidentified:
+                if not entry.title or not entry.title.strip():
+                    return {
+                        "status": "clarification_required",
+                        "page_id": entry.page_id,
+                        "title": identity["title"],
+                        "reason": "A legacy entry has no title; verify legacy IMDb IDs first.",
+                    }
+                try:
+                    candidates = await self.resolve_title(entry.title)
+                except Exception:
+                    log.exception("could not resolve legacy title %r before add", entry.title)
+                    return {
+                        "status": "clarification_required",
+                        "page_id": entry.page_id,
+                        "title": identity["title"],
+                        "reason": "Legacy title lookup failed; verify legacy IMDb IDs first.",
+                    }
+                if not candidates:
+                    return {
+                        "status": "clarification_required",
+                        "page_id": entry.page_id,
+                        "title": identity["title"],
+                        "reason": "Legacy title unresolved; verify legacy IMDb IDs first.",
+                    }
+                if any(
+                    candidate["imdb_id"] == identity["imdb_id"] for candidate in candidates
+                ):
+                    return {
+                        "status": "clarification_required",
+                        "page_id": entry.page_id,
+                        "title": entry.title,
+                        "reason": "An existing Entry may be the same work under another name.",
+                        "identity_confirmation": self._identity_confirmation(entry, identity),
+                    }
+            created = await self._notion.create_resolved_entry(
+                title=identity["title"],
+                media_type=identity["media_type"],
+                imdb_id=identity["imdb_id"],
+            )
+            if created["status"] == "created":
+                self._inflight.add(created["entry"].page_id)
+        status = created["status"]
+        if status == "uncertain":
+            return {"status": "uncertain", "page_id": None, "title": identity["title"]}
+        entry = created["entry"]
+        if status == "existing":
+            return {
+                "status": "already_present",
+                "page_id": entry.page_id,
+                "title": entry.title,
+            }
+        result = await self._enrich_resolved_entry(
+            entry,
+            identity["imdb_id"],
+            original_request,
+            channel,
+            user,
+            thread_ts,
+        )
+        return {**result, "page_id": entry.page_id}
+
+    async def mutate_entry(
+        self,
+        page_id: str,
+        operation: str,
+        *,
+        channel: str,
+        user: str,
+        thread_ts: str,
+        request_key: str,
+        original_request: str,
+    ) -> dict:
+        """Apply one supported recoverable Watchlist operation to a current Entry."""
+        async with self._identity_lock:
+            if page_id in self._inflight:
+                return {"status": "busy", "page_id": page_id}
+            self._inflight.add(page_id)
+        try:
+            async with self._page_lock(page_id):
+                entry = await self._notion.get_entry(page_id)
+                if entry.removed:
+                    return {
+                        "status": "already_removed",
+                        "page_id": page_id,
+                        "title": entry.title,
+                    }
+                if operation == "remove":
+                    removed = await self._notion.soft_remove(page_id)
+                    return {"status": "removed", "page_id": page_id, "title": removed.title}
+                if operation in {"watched", "unwatched"}:
+                    updated = await self._notion.update_watched(
+                        page_id, operation == "watched"
+                    )
+                    return {"status": operation, "page_id": page_id, "title": updated.title}
+                if operation != "refresh":
+                    raise ValueError(f"Unsupported Watchlist operation: {operation!r}")
+                if not entry.imdb_id:
+                    return {
+                        "status": "clarification_required",
+                        "page_id": page_id,
+                        "title": entry.title,
+                    }
+                identity = await self.validate_identity(entry.imdb_id)
+            result = await self._enrich_resolved_entry(
+                entry,
+                identity["imdb_id"],
+                original_request,
+                channel,
+                user,
+                thread_ts,
+                skip_type_backfill=True,
+            )
+            return {**result, "page_id": page_id}
+        finally:
+            self._inflight.discard(page_id)
+
+    def _graph_config(
+        self, entry: Entry, origin: str, run_name: str | None = None
+    ) -> RunnableConfig:
+        config: RunnableConfig = {
+            "configurable": {"thread_id": entry.page_id},
+            "run_name": run_name if run_name is not None else entry.title or "(blank Entry)",
+            "metadata": {"page_id": entry.page_id, "origin": origin},
+        }
+        if self._settings.GRAPH_MAX_CONCURRENCY > 0:
+            config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
+        return config
+
+    async def _stream_enrichment(
+        self,
+        entry: Entry,
+        initial_state: dict,
+        *,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+        run_name: str | None = None,
+    ) -> ResumeResult:
+        """Stream a page-locked run; its checkpoint owns final state and durable resume."""
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        config = self._graph_config(entry, SLACK_ORIGIN, run_name)
+        interrupts = None
+        async for update in self._graph.astream(
+            initial_state, config=config, stream_mode="updates"
+        ):
+            if "__interrupt__" in update:
+                interrupts = update["__interrupt__"]
+            if progress is not None:
+                for node_name in update:
+                    event_id = _PROGRESS_EVENT_AFTER_NODE.get(node_name)
+                    if event_id is not None:
+                        await self._report_progress(progress, event_id)
+        snapshot = await self._graph.aget_state(config)
+        final_state = dict(snapshot.values)
+        if interrupts:
+            final_state["__interrupt__"] = interrupts
+        if await self._handle_pause(entry, final_state):
+            await self._report_progress(progress, _PROGRESS_HITL_REQUIRED)
+            return ResumeResult(status=_AWAITING)
+        return ResumeResult.from_state(final_state)
+
+    async def _enrich_resolved_entry(
+        self,
+        entry: Entry,
+        imdb_id: str,
+        original_request: str,
+        channel: str,
+        user: str,
+        thread_ts: str,
+        *,
+        skip_type_backfill: bool = False,
+    ) -> dict:
+        """Run the existing page-keyed graph with a prevalidated identity selected."""
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        page_id = entry.page_id
+        try:
+            async with self._page_lock(page_id):
+                initial_state = {
+                    "page_id": page_id,
+                    "resolved_imdb_id": imdb_id,
+                    "skip_type_backfill": skip_type_backfill,
+                    "origin": SLACK_ORIGIN,
+                    "notify_channel": channel,
+                    "notify_user": user,
+                    "notify_thread_ts": thread_ts,
+                    "original_request": original_request,
+                }
+                result = await self._stream_enrichment(entry, initial_state)
+                return {"status": result.status, "title": result.title or entry.title}
+        finally:
+            self._inflight.discard(page_id)
+
+    async def confirm_legacy_identity(
+        self,
+        page_id: str,
+        imdb_id: str,
+        expected_title: str,
+    ) -> dict:
+        """Fill only a missing identity after the user confirms the exact existing Entry."""
+        from .models import PROP_IMDB_ID
+
+        identity = await self.validate_identity(imdb_id)
+        async with self._identity_lock, self._page_lock(page_id):
+            entry = await self._notion.get_entry(page_id)
+            if entry.removed or entry.title != expected_title:
+                raise ValueError("The existing Entry changed; request a new confirmation.")
+            if entry.imdb_id and entry.imdb_id != imdb_id:
+                raise ValueError("The existing Entry now has a different IMDb identity.")
+            existing = await self._notion.find_by_imdb_id(imdb_id)
+            if existing is not None and existing.page_id != page_id:
+                raise ValueError("Another Entry already has this IMDb identity.")
+            if not entry.imdb_id:
+                await self._notion.update_entry(
+                    page_id,
+                    {PROP_IMDB_ID: {"rich_text": [{"text": {"content": imdb_id}}]}},
+                )
+            return {
+                "status": "already_present",
+                "page_id": page_id,
+                "title": entry.title,
+                "reason": f"Confirmed as {identity['title']}. "
+                "Its IMDb ID is saved; no duplicate was added.",
+            }
+
     async def create_and_enrich(
         self,
         title: str,
@@ -448,55 +832,36 @@ class Runtime:
         Slack click / the 6d timeout — same as a swept row.
         """
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
-        entry = await self._notion.create_entry(title)
+        async with self._identity_lock:
+            entry = await self._notion.create_entry(title)
+            self._inflight.add(entry.page_id)
         page_id = entry.page_id
         log.info("add: created page %s for %r — enriching out-of-band", page_id, title)
         await self._report_progress(progress, _PROGRESS_NOTION_CREATED)
         # Hold the page_id in-flight until its terminal/awaiting_input write lands (inside
         # _handle_pause or update_notion), so the sweep never sees it while still `pending`.
-        self._inflight.add(page_id)
         try:
-            config: RunnableConfig = {
-                "configurable": {"thread_id": page_id},
-                "run_name": title,
-                "metadata": {"page_id": page_id, "origin": SLACK_ORIGIN},
-            }
-            if self._settings.GRAPH_MAX_CONCURRENCY > 0:
-                config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
-            initial_state = {
-                "page_id": page_id,
-                "origin": SLACK_ORIGIN,
-                "notify_channel": channel,
-                "notify_user": user,
-                "notify_thread_ts": thread_ts,
-            }
-            # Stream state updates so Slack reflects nodes that have actually completed.
-            # The checkpointer remains authoritative for the final state and durable resume.
-            interrupts = None
-            async for update in self._graph.astream(
-                initial_state, config=config, stream_mode="updates"
-            ):
-                if "__interrupt__" in update:
-                    interrupts = update["__interrupt__"]
-                for node_name in update:
-                    event_id = _PROGRESS_EVENT_AFTER_NODE.get(node_name)
-                    if event_id is not None:
-                        await self._report_progress(progress, event_id)
-
-            snapshot = await self._graph.aget_state(config)
-            final_state = dict(snapshot.values)
-            if interrupts:
-                final_state["__interrupt__"] = interrupts
-            if await self._handle_pause(entry, final_state):
-                await self._report_progress(progress, _PROGRESS_HITL_REQUIRED)
-                return AddOutcome(page_id=page_id, status=_AWAITING, title=title)
-            result = ResumeResult.from_state(final_state)
-            return AddOutcome(
-                page_id=page_id,
-                status=result.status,
-                title=result.title or title,
-                year=result.year,
-            )
+            async with self._page_lock(page_id):
+                initial_state = {
+                    "page_id": page_id,
+                    "resolved_imdb_id": None,
+                    "skip_type_backfill": False,
+                    "auto_resolved": False,
+                    "origin": SLACK_ORIGIN,
+                    "original_request": "",
+                    "notify_channel": channel,
+                    "notify_user": user,
+                    "notify_thread_ts": thread_ts,
+                }
+                result = await self._stream_enrichment(
+                    entry, initial_state, progress=progress, run_name=title
+                )
+                return AddOutcome(
+                    page_id=page_id,
+                    status=result.status,
+                    title=result.title or title,
+                    year=result.year,
+                )
         finally:
             self._inflight.discard(page_id)
 
@@ -537,6 +902,20 @@ class Runtime:
         people clicking — we return the stored result without re-invoking, so the graph never
         re-runs `update_notion` or double-writes Notion.
         """
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        async with self._identity_lock:
+            if page_id in self._inflight:
+                return ResumeResult(status="busy")
+            self._inflight.add(page_id)
+        try:
+            async with self._page_lock(page_id):
+                return await self._resume_locked(page_id, chosen_imdb_id, auto_resolved)
+        finally:
+            self._inflight.discard(page_id)
+
+    async def _resume_locked(
+        self, page_id: str, chosen_imdb_id: str, auto_resolved: bool
+    ) -> ResumeResult:
         assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
         config: RunnableConfig = {"configurable": {"thread_id": page_id}}
         state = await self._graph.aget_state(config)

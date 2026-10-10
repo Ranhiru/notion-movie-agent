@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     OPENAI_EXTRACTION_MODEL: str = ""
     OPENAI_DISAMBIGUATION_MODEL: str = ""
     OPENAI_JUDGE_MODEL: str = ""
+    OPENAI_AGENT_MODEL: str = ""
+    OPENAI_AGENT_REASONING_EFFORT: str = ""
+    AGENT_MAX_SEARCHES: int = 3
+    AGENT_MAX_IMPORT_TITLES: int = 25
     # OpenRouter unified reasoning control, per role (ADR 0011 amended). Empty = omit the
     # `reasoning` field entirely, which is the safe default: a local llama.cpp/unsloth server
     # rejects an unknown field, and only OpenRouter interprets it. These are temperature=0

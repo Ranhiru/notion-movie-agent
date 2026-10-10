@@ -33,14 +33,17 @@ _PROVIDER_CLIENTS = {
 
 
 @contextlib.asynccontextmanager
-async def build_search_client(settings: Settings) -> AsyncIterator[SearchClient]:
+async def build_search_client(
+    settings: Settings, *, firecrawl: FirecrawlClient | None = None
+) -> AsyncIterator[SearchClient]:
     """Yield the RT `SearchClient` for `SEARCH_PROVIDERS`, closing its clients on exit.
 
     One configured provider → that bare client; several → a `RoundRobinSearchClient` that
     rotates the lead per Entry (ADR 0003). Unknown names are logged and skipped; if nothing
     valid remains, falls back to a bare `FirecrawlClient` (Firecrawl is the always-present
     primary from Phase 4). Every concrete client built here is closed when the context exits,
-    so callers manage a single lifecycle.
+    so callers manage a single lifecycle. An injected Firecrawl client is borrowed and remains
+    owned by its caller, allowing conversational research to share the RT rate limiter.
     """
     named: list[tuple[str, SearchClient]] = []
     for name in settings.search_providers:
@@ -48,11 +51,18 @@ async def build_search_client(settings: Settings) -> AsyncIterator[SearchClient]
         if client_cls is None:
             log.warning("search: unknown provider %r in SEARCH_PROVIDERS — skipping", name)
             continue
-        named.append((name, client_cls(settings)))
+        client = (
+            firecrawl
+            if name == "firecrawl" and firecrawl is not None
+            else client_cls(settings)
+        )
+        named.append((name, client))
 
     if not named:
         log.warning("search: no valid providers configured — defaulting to firecrawl")
-        named = [("firecrawl", FirecrawlClient(settings))]
+        named = [
+            ("firecrawl", firecrawl if firecrawl is not None else FirecrawlClient(settings))
+        ]
 
     if len(named) == 1:
         log.info("rt_search: single provider %s (no rotation)", named[0][0])
@@ -65,4 +75,6 @@ async def build_search_client(settings: Settings) -> AsyncIterator[SearchClient]
         yield search
     finally:
         for _, client in named:
+            if client is firecrawl:  # The caller owns the shared client's lifecycle.
+                continue
             await client.aclose()  # type: ignore[attr-defined]  # concrete clients have aclose

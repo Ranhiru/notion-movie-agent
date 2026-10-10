@@ -6,19 +6,14 @@ A single outbound WebSocket carries all inbound interaction, so there's no publi
 1. **HITL disambiguation (ADR 0006):** when a reconcile run pauses at `interrupt()`, `Runtime`
    calls `post_picker` — a Block Kit prompt of the OMDb candidates is posted to
    `#notion-movie-db`. The button click resumes the paused graph with the chosen imdbID.
-2. **Manual run:** an `@movie-bot run` app-mention triggers `reconcile()` (under the same
-   single-flight lock as the cron; ADR 0001).
-3. **`@movie-bot add <title>` (Phase 9 / ADR 0012):** an app mention originates an Entry from
-   Slack. The handler schedules the dedupe / create / out-of-band enrich in a background task;
-   progress is rendered as a streamed grouped task plan, while the completion ping is posted
-   as a reply in the mention's thread by the graph's terminal `notify` node
-   (via `post_completion`, bound into `Runtime`). A run may only reach `done`/`failed` much
-   later — after a disambiguation click or the 6d auto-resolve.
+2. **Watchlist conversations:** app mentions and replies in the originating thread go through
+   the conversational agent. Its tools read Watchlist data, stage user-requested changes, and
+   run an explicit reconcile sweep through the shared `Runtime`.
 
 `Runtime` and this transport are mutually referential — the sweep posts *to* Slack (via
 `Runtime.set_notifier(post_picker)` + `Runtime.bind_completion_notifier(post_completion)`) and
-Slack interactions call *back into* `Runtime.resume` / `.reconcile` / `.create_and_enrich`.
-`_serve` wires all three, then runs the cron loop and the Socket Mode listener concurrently.
+Slack interactions call *back into* the conversation tools and `Runtime.resume`. `_serve` wires
+the notifier, then runs the cron loop and the Socket Mode listener concurrently.
 """
 
 from __future__ import annotations
@@ -28,10 +23,13 @@ import contextlib
 import json
 import logging
 import re
+from collections.abc import Coroutine
+from html import escape
 from typing import TYPE_CHECKING, Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 
 from .config import Settings
 
@@ -45,16 +43,142 @@ log = logging.getLogger(__name__)
 _MAX_CANDIDATES = 5
 _BUTTON_LABEL_MAX = 70
 _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 … pick:4
+_APPROVAL_ACTION = re.compile(r"^watchlist:(approve|deny)$")
+_SELECTION_ACTION = "watchlist:selection"
+_IDENTITY_ACTION = re.compile(r"^identity:(confirm|deny)$")
+
+
+def _button(action_id: str, label: str, value: str, *, primary: bool = False) -> dict:
+    button = {
+        "type": "button",
+        "action_id": action_id,
+        "text": {"type": "plain_text", "text": label},
+        "value": value,
+    }
+    if primary:
+        button["style"] = "primary"
+    return button
+
+
+def _context_block(text: str) -> dict:
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+
+def _identity_confirmation_blocks(confirmation: dict, thread_ts: str) -> list[dict]:
+    identity = confirmation["identity"]
+    title = escape(identity["title"], quote=False)
+    existing = escape(confirmation["existing_title"], quote=False)
+    page_id = confirmation["page_id"].replace("-", "")
+    year = identity.get("year") or "Year unknown"
+    kind = identity.get("media_type") or "Type unknown"
+    imdb_id = identity["imdb_id"]
+    value = json.dumps(
+        {
+            "request_key": confirmation["request_key"],
+            "token": confirmation["token"],
+            "thread_ts": thread_ts,
+        }
+    )
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Confirm an existing Watchlist Entry"},
+        },
+        *_section_blocks(
+            f"Your Watchlist already contains <https://www.notion.so/{page_id}|{existing}>, "
+            "but its IMDb ID is missing.\n"
+            f"Is it the same work as *{title}* ({year}) · {kind}?\n"
+            f"<https://www.imdb.com/title/{imdb_id}/|View IMDb match>"
+        ),
+        _context_block(
+            "Confirming saves the IMDb ID on this existing Entry. "
+            "Your other fields stay unchanged and no duplicate is added. "
+            "Expires in 30 minutes."
+        ),
+        {
+            "type": "actions",
+            "elements": [
+                _button("identity:confirm", "Yes, same movie or show", value, primary=True),
+                _button("identity:deny", "Not a match", value),
+            ],
+        },
+    ]
+
+
+def _approval_blocks(response: str, thread_ts: str) -> list[dict]:
+    """Render the persisted preview with selectable changes and decision buttons."""
+    token = re.search(r"`approve ([0-9a-f]{16})`", response)
+    if token is None:
+        return _section_blocks(response)
+    lines = [line for line in response.splitlines() if re.match(r"^\d+\. ", line)]
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Review Watchlist changes"}}
+    ]
+    options = []
+    labels = {
+        "add": "Add",
+        "remove": "Remove",
+        "watched": "Mark watched",
+        "unwatched": "Mark unwatched",
+        "refresh": "Refresh enrichment",
+    }
+    for index, line in enumerate(lines, 1):
+        label = re.sub(
+            r"^\d+\. (\w+):",
+            lambda m, index=index: f"{index}. {labels.get(m[1], m[1])} —",
+            line,
+        )
+        heading, description = label.split(" —", 1)
+        blocks.extend(
+            _section_blocks(
+                f"*{escape(heading, quote=False)}* —{escape(description, quote=False)}"
+            )
+        )
+        options.append(
+            {"text": {"type": "plain_text", "text": label[:75]}, "value": str(index)}
+        )
+    blocks.append(
+        _context_block(
+            "Select the changes to apply, then approve. "
+            "Deny cancels the whole plan. This approval expires in 30 minutes."
+        )
+    )
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": "watchlist_selection",
+            "elements": [
+                {
+                    "type": "multi_static_select",
+                    "action_id": _SELECTION_ACTION,
+                    "placeholder": {"type": "plain_text", "text": "Select changes"},
+                    "options": options,
+                    "initial_options": options,
+                }
+            ],
+        }
+    )
+    for notice in response.splitlines()[len(lines) + 2 :]:
+        if notice.strip():
+            blocks.extend(_section_blocks(escape(notice, quote=False)))
+    value = json.dumps({"token": token[1], "thread_ts": thread_ts})
+    blocks.append(
+        {
+            "type": "actions",
+            "elements": [
+                _button("watchlist:approve", "Approve selected", value, primary=True),
+                _button("watchlist:deny", "Deny", value),
+            ],
+        }
+    )
+    return blocks
+
+
 # The manual-input escape hatch (6e): deliberately outside the `pick:\d+` regex so the
 # candidate-button handler can never receive it. `block_id` carries the page_id (see below).
 _MANUAL_ACTION = "manual:submit"
 _MANUAL_BLOCK_PREFIX = "manual_input:"
 _IMDB_ID = re.compile(r"tt\d+")  # matches a full imdb.com/title/tt… URL or a bare tt… id
-# Slack renders a bot mention as `<@BOT_USER_ID>`. Commands must immediately follow the
-# leading mention; the argument remains untouched apart from surrounding whitespace.
-_MENTION_COMMAND = re.compile(
-    r"^\s*<@[^>]+>(?:\s+(?P<command>\S+))?(?:\s+(?P<argument>.*?))?\s*$"
-)
 
 # IMDb title page for a given imdbID — rendered as a clickable link in the picker.
 _IMDB_URL = "https://www.imdb.com/title/{}/"
@@ -182,229 +306,8 @@ def _resolved_blocks(user: str | None, label: str, imdb_url: str, status: str) -
     )
 
 
-def parse_mention_command(text: str) -> tuple[str, str] | None:
-    """Parse Slack's ``<@BOT_ID> command argument`` app-mention text.
-
-    Returns a case-folded command plus its trimmed argument. ``None`` means the event did not
-    start with a Slack mention, which is malformed for this listener but useful to handle
-    defensively in tests and synthetic payloads.
-    """
-    match = _MENTION_COMMAND.fullmatch(text)
-    if match is None:
-        return None
-    return (match.group("command") or "").casefold(), (match.group("argument") or "").strip()
-
-
-# Slack rotates these while the title-specific assistant status is visible. Keep this exact
-# production-themed set stable: it is deliberate product copy, not transport-neutral runtime
-# progress (and every item is comfortably below Slack's status limits).
-LOADING_MESSAGES = [
-    "Rewinding the tape for clues…",
-    "Checking continuity with the script supervisor…",
-    "Sending the title through casting…",
-    "Asking the projectionist to focus…",
-    "Searching the backlot for the right cut…",
-    "Comparing notes in the writers’ room…",
-    "Checking whether this is the reboot…",
-    "Waiting for the post-credits scene…",
-    "Polishing the ratings montage…",
-    "Rolling credits on the paperwork…",
-]
-
-# `task_display_mode="plan"` groups these stable task IDs into a single plan. Task titles are
-# Slack-owned copy (all <256 chars); Runtime only emits the stable event IDs mapped below.
-_PLAN_TASKS = [
-    ("deduplication", "Check for an existing watchlist entry"),
-    ("notion_creation", "Create the Notion watchlist entry"),
-    ("database_search", "Search the watchlist database"),
-    ("title_matching", "Find the best title match"),
-    ("disambiguation", "Resolve title disambiguation"),
-    ("omdb_details", "Fetch OMDb details"),
-    ("rotten_tomatoes", "Fetch Rotten Tomatoes ratings"),
-    ("source_comparison", "Compare source results"),
-    ("verification", "Verify the resolved match"),
-    ("confidence", "Assess enrichment confidence"),
-    ("notion_update", "Update the Notion watchlist entry"),
-]
-_TASK_TITLES = dict(_PLAN_TASKS)
-
-# One transport-neutral event may close one task and begin another. `_TaskStream` supplies any
-# missing `in_progress` step before a terminal status, keeping every task transition valid even
-# when graph routing skips `disambiguate` (the one-candidate path).
-_EVENT_TASK_UPDATES: dict[str, tuple[tuple[str, str], ...]] = {
-    "deduplication.started": (("deduplication", "in_progress"),),
-    "deduplication.duplicate": (("deduplication", "complete"),),
-    "deduplication.complete": (
-        ("deduplication", "complete"),
-        ("notion_creation", "in_progress"),
-    ),
-    "notion.creation.complete": (
-        ("notion_creation", "complete"),
-        ("database_search", "in_progress"),
-        ("rotten_tomatoes", "in_progress"),
-    ),
-    "database.read.complete": (
-        ("database_search", "complete"),
-        ("title_matching", "in_progress"),
-    ),
-    "omdb.search.complete": (
-        ("title_matching", "complete"),
-        ("disambiguation", "in_progress"),
-    ),
-    "title.disambiguation.complete": (
-        ("disambiguation", "complete"),
-        ("omdb_details", "in_progress"),
-    ),
-    "omdb.details.complete": (
-        ("title_matching", "complete"),
-        ("disambiguation", "complete"),
-        ("omdb_details", "complete"),
-    ),
-    "rotten_tomatoes.complete": (("rotten_tomatoes", "complete"),),
-    "sources.compare.complete": (
-        ("source_comparison", "complete"),
-        ("verification", "in_progress"),
-    ),
-    "match.verification.complete": (
-        ("verification", "complete"),
-        ("confidence", "in_progress"),
-    ),
-    "confidence.assessment.complete": (
-        ("confidence", "complete"),
-        ("notion_update", "in_progress"),
-    ),
-    "notion.update.complete": (("notion_update", "complete"),),
-    # An HITL pause is an intentional terminal point for this stream. `error` makes the
-    # blocked task visible; the threaded picker directly beneath it supplies the next action.
-    "human_input.required": (("disambiguation", "error"),),
-}
-
-
-class _TaskStream:
-    """Best-effort lifecycle for one Slack grouped task plan."""
-
-    def __init__(
-        self,
-        client: Any,
-        *,
-        title: str,
-        channel: str,
-        team_id: str | None,
-        user_id: str | None,
-        thread_ts: str,
-        set_status: Any,
-    ) -> None:
-        self._client = client
-        self._title = title
-        self._channel = channel
-        self._team_id = team_id
-        self._user_id = user_id
-        self._thread_ts = thread_ts
-        self._set_status = set_status
-        self._ts: str | None = None
-        self._stopped = False
-        self._statuses = dict.fromkeys(_TASK_TITLES, "pending")
-
-    async def start(self) -> None:
-        """Open the threaded stream, then set the title-specific rotating status."""
-        try:
-            response = await self._client.chat_startStream(
-                channel=self._channel,
-                thread_ts=self._thread_ts,
-                recipient_team_id=self._team_id,
-                recipient_user_id=self._user_id,
-                task_display_mode="plan",
-            )
-            self._ts = response.get("ts")
-        except Exception:  # noqa: BLE001 - Slack UI must never gate durable enrichment
-            log.exception("slack: failed to start add task stream for %r", self._title)
-
-        if self._set_status is not None:
-            try:
-                await self._set_status(
-                    status=f"Adding {self._title} to your watchlist…",
-                    loading_messages=LOADING_MESSAGES,
-                )
-            except Exception:  # noqa: BLE001 - status rotation is a best-effort enhancement
-                log.exception("slack: failed to set add loading status for %r", self._title)
-
-    async def initialize(self) -> None:
-        """Publish the whole pending plan through appendStream."""
-        await self._append(
-            [self._chunk(task_id, "pending") for task_id, _title in _PLAN_TASKS]
-        )
-
-    async def emit(self, event_id: str) -> None:
-        """Translate one stable runtime/transport event into task-update transitions."""
-        if event_id == "workflow.error":
-            chunks: list[dict] = []
-            for task_id, status in self._statuses.items():
-                if status == "in_progress":
-                    chunks.extend(self._transition(task_id, "error"))
-            await self._append(chunks)
-            return
-
-        updates = _EVENT_TASK_UPDATES.get(event_id)
-        if updates is None:
-            log.warning("slack: ignoring unknown progress event %r", event_id)
-            return
-        chunks = []
-        for task_id, status in updates:
-            chunks.extend(self._transition(task_id, status))
-        if (
-            self._statuses["omdb_details"] == "complete"
-            and self._statuses["rotten_tomatoes"] == "complete"
-            and self._statuses["source_comparison"] == "pending"
-        ):
-            chunks.extend(self._transition("source_comparison", "in_progress"))
-        await self._append(chunks)
-
-    def _transition(self, task_id: str, target: str) -> list[dict]:
-        current = self._statuses[task_id]
-        if current == target or current in {"complete", "error"}:
-            return []
-        chunks: list[dict] = []
-        if current == "pending" and target in {"complete", "error"}:
-            self._statuses[task_id] = "in_progress"
-            chunks.append(self._chunk(task_id, "in_progress"))
-        self._statuses[task_id] = target
-        chunks.append(self._chunk(task_id, target))
-        return chunks
-
-    @staticmethod
-    def _chunk(task_id: str, status: str) -> dict:
-        return {
-            "type": "task_update",
-            "id": task_id,
-            "title": _TASK_TITLES[task_id],
-            "status": status,
-        }
-
-    async def _append(self, chunks: list[dict]) -> None:
-        if self._ts is None or not chunks:
-            return
-        try:
-            await self._client.chat_appendStream(
-                channel=self._channel,
-                ts=self._ts,
-                chunks=chunks,
-            )
-        except Exception:  # noqa: BLE001 - task progress is best-effort
-            log.exception("slack: failed to append add task progress for %r", self._title)
-
-    async def stop(self) -> None:
-        """Stop an opened stream exactly once, including on pause/failure/duplicate."""
-        if self._ts is None or self._stopped:
-            return
-        self._stopped = True
-        try:
-            await self._client.chat_stopStream(channel=self._channel, ts=self._ts)
-        except Exception:  # noqa: BLE001 - task UI must never change enrichment outcome
-            log.exception("slack: failed to stop add task stream for %r", self._title)
-
-
 class SlackTransport:
-    """Bolt Socket Mode app wiring the HITL picker + mention commands to a `Runtime`."""
+    """Bolt Socket Mode app wiring the HITL picker + Watchlist conversations to a Runtime."""
 
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
@@ -419,6 +322,20 @@ class SlackTransport:
         self._register()
 
     def _register(self) -> None:
+        @self._app.action(_IDENTITY_ACTION)
+        async def handle_identity(ack, body, action, client) -> None:  # noqa: ANN001
+            await ack()
+            self._schedule(self._handle_identity_confirmation(body, action, client))
+
+        @self._app.action(_SELECTION_ACTION)
+        async def handle_selection(ack) -> None:  # noqa: ANN001
+            await ack()
+
+        @self._app.action(_APPROVAL_ACTION)
+        async def handle_approval(ack, body, action, client) -> None:  # noqa: ANN001
+            await ack()
+            self._schedule(self._handle_approval(body, action, client))
+
         @self._app.action(_PICK_ACTION)
         async def handle_pick(ack, body, action, client, logger) -> None:  # noqa: ANN001
             """A candidate button was clicked → resume the paused run with that imdbID."""
@@ -442,19 +359,7 @@ class SlackTransport:
             )
 
             # resume() is a no-op on an already-finished thread, so a double-click is safe.
-            result = await self._runtime.resume(page_id, imdb_id)
-            label = result.title or imdb_id
-            if result.year:
-                label += f" ({result.year})"
-            imdb_url = _IMDB_URL.format(imdb_id)
-            await client.chat_update(
-                channel=channel,
-                ts=ts,
-                text=f"Resolved: {label} → {result.status}",  # notification fallback
-                blocks=_resolved_blocks(user, label, imdb_url, result.status),
-                unfurl_links=False,  # the IMDb link is for clicking, not a preview card
-                unfurl_media=False,
-            )
+            await self._resolve_picker(page_id, imdb_id, user, channel, ts, client)
 
         @self._app.action(_MANUAL_ACTION)
         async def handle_manual(ack, body, action, client, logger) -> None:  # noqa: ANN001
@@ -499,144 +404,306 @@ class SlackTransport:
                 text=f"Resolving {imdb_id}…",
                 blocks=_section_blocks(f"⏳ <@{user}> entered *{imdb_id}* — resolving…"),
             )
-            result = await self._runtime.resume(page_id, imdb_id)
-            label = result.title or imdb_id
-            if result.year:
-                label += f" ({result.year})"
-            imdb_url = _IMDB_URL.format(imdb_id)
-            await client.chat_update(
-                channel=channel,
-                ts=ts,
-                text=f"Resolved: {label} → {result.status}",  # notification fallback
-                blocks=_resolved_blocks(user, label, imdb_url, result.status),
-                unfurl_links=False,
-                unfurl_media=False,
-            )
+            await self._resolve_picker(page_id, imdb_id, user, channel, ts, client)
 
         @self._app.event("app_mention")
-        async def handle_mention(body, event, say, set_status, logger) -> None:  # noqa: ANN001
-            """Dispatch `@movie-bot add <title>` and `@movie-bot run`."""
+        async def handle_mention(body, event, say) -> None:  # noqa: ANN001
+            """Dispatch app mentions through the conversational assistant."""
             team_id = body.get("team_id") or event.get("team")
-            await self._handle_mention(event, say, logger, set_status, team_id)
+            await self._handle_mention(event, say, team_id)
 
-    async def _handle_mention(
-        self, event, say, logger, set_status=None, team_id: str | None = None
-    ) -> None:  # noqa: ANN001
-        """Handle one app mention without coupling tests to Bolt's listener registry."""
-        parsed = parse_mention_command(event.get("text", ""))
-        if parsed is None:
-            await say("Mention me with `add <title>` or `run`.")
-            return
+        @self._app.event("message")
+        async def handle_thread(body, event, say) -> None:  # noqa: ANN001
+            if not event.get("thread_ts") or re.match(r"^\s*<@", event.get("text", "")):
+                return
+            if getattr(self._runtime, "conversation", None) is not None:
+                self._schedule_conversation(
+                    event, say, body.get("team_id") or event.get("team")
+                )
 
-        command, argument = parsed
-        if command == "run":
-            logger.info("slack: manual run requested")
-            await say("Running a reconcile sweep…")
-            summary = await self._runtime.reconcile()
-            await say(f"reconcile: {summary}")
-            return
-
-        if command != "add":
-            await say("Mention me with `add <title>` or `run`.")
-            return
-        if not argument:
-            await say(
-                "Usage: `@NotionMovieAgent add <title>` — e.g. `@NotionMovieAgent add Dune`"
-            )
-            return
-
-        channel = event.get("channel")
-        if not channel:  # every app_mention event carries one — defensive only
-            await say("Couldn't tell which channel to reply in — try again.")
-            return
-        # A top-level mention starts a new thread; a mention made inside an existing thread
-        # keeps using that thread's root. Slack's assistant status and the eventual answer must
-        # target the same root timestamp.
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        if not thread_ts:  # every real message event carries ts — defensive only
-            await say("Couldn't tell which message to reply to — try again.")
-            return
-        user = event.get("user")
-        logger.info("slack: mention add %r from %s in %s", argument, user, channel)
-        task = asyncio.create_task(
-            self._add_flow(
-                argument,
-                channel,
-                team_id or event.get("team"),
-                user,
-                thread_ts,
-                set_status,
-            )
+    async def _resolve_picker(self, page_id, imdb_id, user, channel, ts, client) -> None:
+        result = await self._runtime.resume(page_id, imdb_id)
+        label = result.title or imdb_id
+        if result.year:
+            label += f" ({result.year})"
+        await client.chat_update(
+            channel=channel,
+            ts=ts,
+            text=f"Resolved: {label} → {result.status}",
+            blocks=_resolved_blocks(user, label, _IMDB_URL.format(imdb_id), result.status),
+            unfurl_links=False,
+            unfurl_media=False,
         )
+
+    async def _handle_mention(self, event, say, team_id: str | None = None) -> None:  # noqa: ANN001
+        """Handle one app mention without coupling tests to Bolt's listener registry."""
+        conversation = getattr(self._runtime, "conversation", None)
+        if conversation is None:
+            await say(
+                "The conversational Watchlist assistant is not configured. "
+                "Set OPENAI_AGENT_MODEL to enable it."
+            )
+            return
+        self._schedule_conversation(event, say, team_id)
+
+    def _schedule_conversation(self, event, say, team_id=None) -> None:  # noqa: ANN001
+        self._schedule(self.handle_conversation(event, say, team_id))
+
+    def _schedule(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _add_flow(
-        self,
-        title: str,
-        channel: str,
-        team_id: str | None,
-        user: str | None,
-        thread_ts: str,
-        set_status,
-    ) -> None:  # noqa: ANN001
-        """Background worker for mention `add`: dedupe → create + enrich out-of-band (Phase 9).
+    async def handle_conversation(self, event, say, team_id=None) -> None:  # noqa: ANN001
+        """Reply in the originating thread using the durable conversation Runtime."""
+        conversation = self._runtime.conversation
+        assert conversation is not None
+        if (
+            event.get("bot_id")
+            or event.get("subtype")
+            or not all(event.get(k) for k in ("channel", "ts", "text"))
+        ):
+            return
+        channel = event["channel"]
+        thread_ts = event.get("thread_ts") or event["ts"]
+        status = "active"
+        progress_ts = None
+        replied = False
+        ignored = False
+        heartbeat = None
+        try:
+            message = await self._app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="💭 Working on your request…",
+            )
+            if isinstance(message["ts"], str):
+                progress_ts = message["ts"]
+        except Exception:
+            log.exception("Could not post conversation progress")
 
-        Runs after the event listener schedules it. On a dedupe hit it posts "already on your
-        watchlist" and creates nothing (ADR 0012 — best-effort dedupe). Otherwise it delegates
-        to `Runtime.create_and_enrich`, which creates the page and runs the graph under the
-        in-flight guard; the done/failed ping is the graph's `notify` node, so a run that
-        pauses for disambiguation still pings this channel on resolve. Progress is a threaded
-        `chat.startStream` plan made of `task_update` chunks; the assistant status supplies the
-        title-specific loading-message rotation. Final outcomes use `chat.postMessage` with the
-        original `thread_ts`, so the channel only gets a thread indicator.
-        """
+        async def progress(text: str) -> None:
+            if progress_ts:
+                await self._app.client.chat_update(
+                    channel=channel,
+                    ts=progress_ts,
+                    text=escape(text, quote=False),
+                    blocks=[],
+                )
 
-        stream = _TaskStream(
-            self._app.client,
-            title=title,
-            channel=channel,
-            team_id=team_id,
-            user_id=user,
-            thread_ts=thread_ts,
-            set_status=set_status,
-        )
-        await stream.start()
-        await stream.initialize()
+        async def reply(**kwargs) -> None:
+            nonlocal replied
+            if progress_ts and not replied:
+                await self._app.client.chat_update(
+                    channel=channel,
+                    ts=progress_ts,
+                    text=kwargs["text"],
+                    blocks=kwargs.get("blocks", []),
+                )
+            else:
+                await say(**kwargs)
+            replied = True
+
+        async def keep_status() -> None:
+            while True:
+                await asyncio.sleep(60)
+                await self._conversation_status(channel, thread_ts, "processing")
 
         try:
-            await stream.emit("deduplication.started")
-            existing = await self._runtime.find_duplicate(title)
-            if existing is not None:
-                await stream.emit("deduplication.duplicate")
-                text = (
-                    f"*{existing.title}* is already on the watchlist "
-                    f"(status: *{existing.status or 'unset'}*) — nothing added."
-                )
-                await self._app.client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
-                )
+            await self._conversation_status(channel, thread_ts, "processing")
+            heartbeat = asyncio.create_task(keep_status())
+            response = await conversation.handle(event, team_id, progress=progress)
+            if response is None:
+                ignored = True
                 return
-            await stream.emit("deduplication.complete")
-            await self._runtime.create_and_enrich(
-                title,
-                channel=channel,
-                user=user,
-                # Persist the request thread root with the graph. If enrichment pauses for
-                # human input, its eventual completion still replies to the original mention.
-                thread_ts=thread_ts,
-                progress=stream.emit,
+            if response.startswith("Approve this exact action list"):
+                status = "suspended"
+                await reply(
+                    text=re.sub(
+                        r"^Reply `approve .*?$",
+                        "Use the Approve or Deny buttons below.",
+                        response,
+                        flags=re.MULTILINE,
+                    ),
+                    thread_ts=thread_ts,
+                    blocks=_approval_blocks(response, thread_ts),
+                )
+            else:
+                await reply(text=response, thread_ts=thread_ts)
+                for identity_reply in self._identity_replies(event, team_id):
+                    status = "suspended"
+                    await reply(**identity_reply)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+            if progress_ts and not replied:
+                try:
+                    if ignored:
+                        await self._app.client.chat_delete(channel=channel, ts=progress_ts)
+                    else:
+                        await self._app.client.chat_update(
+                            channel=channel,
+                            ts=progress_ts,
+                            blocks=[],
+                            text="The request ended without a reply. "
+                            "Please retry or clarify your request.",
+                        )
+                except Exception:
+                    log.exception("Could not finalize conversation progress")
+            await self._conversation_status(channel, thread_ts, status)
+
+    def _identity_replies(self, event: dict, team_id: str | None) -> list[dict]:
+        get_confirmations = getattr(self._runtime.conversation, "identity_confirmations", None)
+        confirmations = get_confirmations(event, team_id) if get_confirmations else []
+        thread_ts = event.get("thread_ts") or event["ts"]
+        return [
+            {
+                "text": (
+                    f"Does your existing Entry {c['existing_title']} match "
+                    f"{c['identity']['title']} "
+                    f"({c['identity'].get('year') or 'year unknown'})? "
+                    "Confirm to save its IMDb ID, or reject to leave it unchanged."
+                ),
+                "thread_ts": thread_ts,
+                "blocks": _identity_confirmation_blocks(c, thread_ts),
+            }
+            for c in confirmations
+        ]
+
+    async def _handle_identity_confirmation(self, body, action, client) -> None:  # noqa: ANN001
+        decision = action["action_id"]
+        if decision not in {"identity:confirm", "identity:deny"}:
+            return
+        data = json.loads(action["value"])
+        channel, thread_ts = body["channel"]["id"], data["thread_ts"]
+        event = {
+            "user": body.get("user", {}).get("id"),
+            "channel": channel,
+            "thread_ts": thread_ts,
+        }
+        conversation = self._runtime.conversation
+        assert conversation is not None
+        team_id = body.get("team", {}).get("id")
+        status = "active"
+        await self._conversation_status(channel, thread_ts, "processing")
+        try:
+            response = await conversation.decide_identity(
+                data["request_key"],
+                data["token"],
+                event,
+                team_id,
+                confirmed=decision == "identity:confirm",
             )
-        except Exception:
-            log.exception("slack: add %r failed", title)
-            await stream.emit("workflow.error")
-            with contextlib.suppress(Exception):
-                text = f"Couldn't add *{title}* — something went wrong. Try again?"
-                await self._app.client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
+            if response is not None:
+                source_event = event | {"ts": data["request_key"].rsplit(":", 1)[-1]}
+                pending = next(
+                    (
+                        c
+                        for c in conversation.identity_confirmations(source_event, team_id)
+                        if c["token"] == data["token"]
+                    ),
+                    None,
+                )
+                blocks = _section_blocks(response)
+                if pending:
+                    status = "suspended"
+                    blocks += _identity_confirmation_blocks(pending, thread_ts)
+                await client.chat_update(
+                    channel=channel,
+                    ts=body["message"]["ts"],
+                    text=response,
+                    blocks=blocks,
                 )
         finally:
-            await stream.stop()
+            await self._conversation_status(channel, thread_ts, status)
+
+    async def _handle_approval(self, body, action, client) -> None:  # noqa: ANN001
+        """Buttons reuse the durable approval path without invoking the model."""
+        user = body.get("user", {}).get("id")
+        data = json.loads(action["value"])
+        token, thread_ts = data["token"], data["thread_ts"]
+        decision = action["action_id"].split(":")[-1]
+        if decision not in {"approve", "deny"} or not re.fullmatch(r"[0-9a-f]{16}", token):
+            return
+        channel = body["channel"]["id"]
+        text = f"{decision} {token}"
+        if decision == "approve":
+            selection = (
+                body.get("state", {})
+                .get("values", {})
+                .get("watchlist_selection", {})
+                .get(_SELECTION_ACTION)
+            )
+            if selection is not None:
+                selected = selection.get("selected_options") or []
+                if not selected:
+                    await client.chat_postEphemeral(
+                        channel=channel,
+                        user=user,
+                        text="Select at least one change, or deny the plan.",
+                    )
+                    return
+                numbers = [option["value"] for option in selected]
+                if not all(re.fullmatch(r"[1-9]\d*", number) for number in numbers):
+                    return
+                text += " " + ",".join(numbers)
+        action_ts = action.get("action_ts", body["message"]["ts"])
+        event = {
+            "user": user,
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "ts": f"decision:{token}:{decision}:{action_ts}",
+            "text": text,
+        }
+        await self._conversation_status(channel, thread_ts, "processing")
+        status = "active"
+        try:
+            conversation = self._runtime.conversation
+            assert conversation is not None
+            response = await conversation.handle(event, body.get("team", {}).get("id"))
+            if response is not None:
+                await client.chat_update(
+                    channel=channel,
+                    ts=body["message"]["ts"],
+                    text=response,
+                    blocks=_section_blocks(response),
+                )
+                for reply in self._identity_replies(event, body.get("team", {}).get("id")):
+                    status = "suspended"
+                    await client.chat_postMessage(channel=channel, **reply)
+        finally:
+            await self._conversation_status(channel, thread_ts, status)
+
+    async def _conversation_status(self, channel: str, thread_ts: str, status: str) -> None:
+        """Native Slack loading UI is best effort and never blocks a Watchlist request."""
+        try:
+            # Use api_call until the installed SDK exposes the agent sessions method.
+            await self._app.client.api_call(
+                "agents.sessions.setStatus",
+                json={"channel_id": channel, "thread_ts": thread_ts, "status": status},
+            )
+        except SlackApiError as exc:
+            error = exc.response.get("error")
+            if error not in {
+                "feature_disabled",
+                "unknown_method",
+                "method_not_supported_for_channel_type",
+            }:
+                log.warning("Slack agent session status rejected: %s", error)
+                return
+            log.info("Slack agent session status unavailable (%s); using thread status", error)
+            try:
+                await self._app.client.assistant_threads_setStatus(
+                    channel_id=channel,
+                    thread_ts=thread_ts,
+                    status="is working…" if status == "processing" else "",
+                )
+            except Exception:
+                log.exception("Could not update Slack assistant thread status")
+        except Exception:
+            log.exception("Could not update Slack agent session status")
 
     async def post_completion(
         self, channel: str, text: str, thread_ts: str | None = None
@@ -692,5 +759,18 @@ class SlackTransport:
 
     async def start(self) -> None:
         """Open the Socket Mode WebSocket and process events until cancelled."""
+        if self._runtime.conversation is not None:
+            for reply in await self._runtime.conversation.recover():
+                confirmations = reply.pop("identity_confirmations", [])
+                await self._app.client.chat_postMessage(**reply)
+                for confirmation in confirmations:
+                    await self._app.client.chat_postMessage(
+                        **reply,
+                        blocks=_identity_confirmation_blocks(confirmation, reply["thread_ts"]),
+                    )
+                if confirmations:
+                    await self._conversation_status(
+                        reply["channel"], reply["thread_ts"], "suspended"
+                    )
         log.info("slack: starting Socket Mode listener")
         await self._handler.start_async()

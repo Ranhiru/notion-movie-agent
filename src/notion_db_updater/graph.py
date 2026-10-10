@@ -66,6 +66,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import NotRequired, TypedDict
 
 from langchain_openai import ChatOpenAI
@@ -77,7 +78,7 @@ from pydantic import BaseModel, Field
 
 from .models import Entry, enrichment_properties, notion_type_value
 from .notion import NotionClient
-from .omdb import Candidate, OMDbClient, details_fields, normalize_title
+from .omdb import Candidate, OMDbClient, details_fields, imdb_identity, normalize_title
 from .rt import build_rt_subgraph, extract_rt_page, synopsis_region
 from .schema import Confidence, EnrichedEntry, normalize_media_type
 from .search import RTHit, SearchClient
@@ -128,6 +129,8 @@ class EnrichmentState(TypedDict):
     chosen_imdb_id: NotRequired[
         str | None
     ]  # resolved candidate: single pick / pre-filter / human
+    resolved_imdb_id: NotRequired[str | None]  # explicit ID selected by a Runtime operation
+    skip_type_backfill: NotRequired[bool]
     best_guess_imdb_id: NotRequired[
         str | None
     ]  # pre-filter's pick — stashed for the 6d timeout
@@ -161,6 +164,9 @@ class EnrichmentState(TypedDict):
     # Timestamp of the Slack request's thread root. Persisted so a terminal notify after a
     # human resume (or stale auto-resolve) still replies beneath the original mention.
     notify_thread_ts: NotRequired[str | None]
+    # Conversation-provided evidence is retained for the Judge; a proposed IMDb ID is not
+    # treated as unquestionable ground truth.
+    original_request: NotRequired[str]
     # Legacy (pre-threaded-status UI): timestamp of the bot's visible progress message. Keep
     # the checkpoint channel readable, but never treat it as a user-message thread root.
     notify_message_ts: NotRequired[str | None]
@@ -176,12 +182,58 @@ class EnrichmentState(TypedDict):
     judge_reason: NotRequired[str]
 
 
-async def read_page(state: EnrichmentState, *, notion: NotionClient) -> dict:
-    """Fetch the Entry; a blank entry is a definitive skip (don't search OMDb for "")."""
+async def read_page(state: EnrichmentState, *, notion: NotionClient, omdb: OMDbClient) -> dict:
+    """Fetch the Entry and reset per-run choices left in a reused page checkpoint."""
     entry = await notion.get_entry(state["page_id"])
+    candidates = []
+    if entry.title and imdb_identity(entry.title):
+        candidates = await omdb.search(entry.title, entry.media_type)
+        if candidates:
+            if (
+                state.get("resolved_imdb_id")
+                and state.get("resolved_imdb_id") != candidates[0].imdb_id
+            ):
+                raise ValueError("Entry link does not match the requested IMDb identity")
+            entry = replace(entry, title=candidates[0].title)
+    fresh = {
+        "entry": entry,
+        "status": "pending",
+        "note": "",
+        "candidates": candidates,
+        "chosen_imdb_id": state.get("resolved_imdb_id"),
+        "best_guess_imdb_id": None,
+        "confident": False,
+        "disambiguation_reason": "",
+        "auto_resolved": False,
+        "imdb_id": None,
+        "imdb_rating": None,
+        "plot": None,
+        "genre": None,
+        "omdb_title": None,
+        "year": None,
+        "omdb_type": None,
+        "rt_candidates": [],
+        "rt_url": None,
+        "rt_title": None,
+        "rt_year": None,
+        "rt_plot": None,
+        "rt_critic": None,
+        "rt_audience": None,
+        "enriched": None,
+        "sources_used": [],
+        "wrong_match": False,
+        "judge_reason": "",
+    }
     if not entry.title:
-        return {"entry": entry, "status": "failed", "note": "blank Entry — skipped"}
-    return {"entry": entry}
+        return {
+            **fresh,
+            "status": "failed",
+            "chosen_imdb_id": None,
+            "note": "blank Entry — skipped",
+        }
+    if imdb_identity(entry.title) and not candidates:
+        return {**fresh, "status": "failed", "note": "IMDb identity not found in OMDb"}
+    return fresh
 
 
 async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
@@ -199,6 +251,12 @@ async def omdb_search(state: EnrichmentState, *, omdb: OMDbClient) -> dict:
     """
     if state.get("status") == "failed":
         return {}  # read_page already resolved this (blank Entry) → omdb_details will no-op
+
+    if state.get("resolved_imdb_id"):
+        return {"candidates": [], "chosen_imdb_id": state.get("resolved_imdb_id")}
+    candidates = state.get("candidates")
+    if candidates:
+        return {"candidates": candidates, "chosen_imdb_id": candidates[0].imdb_id}
 
     entry = state.get("entry")
     assert entry is not None and entry.title is not None  # guaranteed by read_page
@@ -231,6 +289,8 @@ def route_after_search(state: EnrichmentState) -> str:
     """
     if state.get("status") == "failed":
         return "omdb_details"  # blank Entry — passthrough, keeps the failed status
+    if state.get("resolved_imdb_id"):
+        return "omdb_details"
     candidates = state.get("candidates") or []
     if len(candidates) > 1:
         return "disambiguate"
@@ -504,10 +564,17 @@ async def judge(state: EnrichmentState, *, llm: ChatOpenAI) -> dict:
         )
         return _judge_result(state, entry, confidence, wrong_match, reason)
 
+    request_evidence = (
+        f"Original user request: {state.get('original_request')!r}\n"
+        "Use it as evidence for whether the selected IMDb Identity fits.\n\n"
+        if state.get("original_request")
+        else ""
+    )
     prompt = (
         "You are auditing a movie/TV enrichment for a wrong match. Two independent lanes "
         "resolved this with no shared key, so they may have landed on different titles.\n\n"
-        "OMDb (metadata lane):\n"
+        + request_evidence
+        + "OMDb (metadata lane):\n"
         f"  title: {state.get('omdb_title')!r}\n  year: {state.get('year')}\n"
         f"  imdb_id: {state.get('imdb_id')}\n"
         f"  imdb_rating: {state.get('imdb_rating')} (0-10)\n"
@@ -587,7 +654,16 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
     the same way.
     """
     enriched = state.get("enriched")
-    notion_type = notion_type_value(enriched.media_type) if enriched is not None else None
+    resolved_imdb_id = state.get("resolved_imdb_id")
+    if resolved_imdb_id:
+        current = await notion.get_entry(state["page_id"])
+        if current.removed or current.imdb_id != resolved_imdb_id:
+            raise ValueError("Entry identity changed or was removed during enrichment")
+    notion_type = (
+        notion_type_value(enriched.media_type)
+        if enriched is not None and not state.get("skip_type_backfill")
+        else None
+    )
     props = enrichment_properties(
         imdb_rating=state.get("imdb_rating"),
         plot=state.get("plot"),
@@ -595,6 +671,11 @@ async def update_notion(state: EnrichmentState, *, notion: NotionClient) -> dict
         rt_critic=state.get("rt_critic"),
         rt_audience=state.get("rt_audience"),
         notion_type=notion_type,
+        imdb_id=(
+            enriched.imdb_id
+            if enriched is not None and getattr(notion, "identity_enabled", False)
+            else None
+        ),
         status=state.get("status", "pending"),
     )
     entry = await notion.update_entry(state["page_id"], props)
@@ -692,7 +773,9 @@ def build_graph(
     g = StateGraph(EnrichmentState)
     # Gating nodes carry the RetryPolicy (ADR 0013); best-effort / no-IO nodes don't.
     g.add_node(
-        "read_page", functools.partial(read_page, notion=notion), retry_policy=retry_policy
+        "read_page",
+        functools.partial(read_page, notion=notion, omdb=omdb_client),
+        retry_policy=retry_policy,
     )
     g.add_node(
         "omdb_search",

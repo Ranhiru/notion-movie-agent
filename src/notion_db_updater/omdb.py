@@ -15,12 +15,34 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
 from .config import Settings
 
 _API = "https://www.omdbapi.com/"
+
+
+def imdb_identity(value: str) -> str | None:
+    """Recognize a bare IMDb ID or one IMDb title URL, including Slack link markup."""
+    value = value.strip()
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1].split("|", 1)[0]
+    if re.fullmatch(r"tt\d{7,12}", value):
+        return value
+    try:
+        url = urlsplit(value)
+        if url.scheme not in {"http", "https"} or url.hostname not in {
+            "imdb.com",
+            "www.imdb.com",
+            "m.imdb.com",
+        }:
+            return None
+    except ValueError:
+        return None
+    match = re.fullmatch(r"/title/(tt\d{7,12})/?", url.path)
+    return match[1] if match else None
 
 
 def _omdb_type(media_type: str | None) -> str | None:
@@ -170,11 +192,19 @@ class OMDbClient:
         return await self._get(params)
 
     async def search(self, title: str, media_type: str | None = None) -> list[Candidate]:
-        """Search OMDb (`?s=`) for a title; return the candidate list.
+        """Search a title (`?s=`), or resolve an IMDb link/ID directly (`?i=`).
 
         `media_type` is the Notion `Type` ("Movie" | "TV Show" | None); when set it narrows
         the search via OMDb's `type` param. A definitive not-found returns ``[]``.
         """
+        identity = imdb_identity(title)
+        if identity:
+            data = await self.details(identity)
+            if data.get("Response") != "True":
+                return []
+            if data.get("imdbID") != identity or not _clean(data.get("Title")):
+                raise ValueError("OMDb returned an invalid IMDb identity")
+            return [Candidate.from_search(data)]
         params: dict = {"s": title}
         omdb_type = _omdb_type(media_type)
         if omdb_type:

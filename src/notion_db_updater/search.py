@@ -22,6 +22,7 @@ The concrete clients (`FirecrawlClient`, and the Phase 8 `TavilyClient` / `ExaCl
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -157,6 +158,7 @@ async def post_json(
     *,
     limiter: AsyncLimiter,
     max_retries: int,
+    max_response_bytes: int | None = None,
 ) -> dict:
     """POST `body` to `path`, acquiring `limiter`, with the shared transient-retry loop.
 
@@ -166,12 +168,28 @@ async def post_json(
     exponential backoff otherwise. A non-transient error (a 4xx, a parse failure) or exhausted
     retries raises — the RT subgraph swallows that as best-effort (ADR 0004), so a transient
     blip never leaks up to fail the Entry. Structurally mirrors `NotionClient._request`.
+    `max_response_bytes` bounds decoded response bytes before JSON parsing when supplied.
     """
     for attempt in range(max_retries):
         try:
             async with limiter:
-                resp = await client.post(path, json=body)
-            resp.raise_for_status()
+                request = client.build_request("POST", path, json=body)
+                resp = await client.send(request, stream=max_response_bytes is not None)
+                try:
+                    resp.raise_for_status()
+                    if max_response_bytes is not None:
+                        content = bytearray()
+                        async for chunk in resp.aiter_bytes():
+                            if len(content) + len(chunk) > max_response_bytes:
+                                raise ValueError(
+                                    "Provider response exceeds the retrieval size limit"
+                                )
+                            content.extend(chunk)
+                        # Decode only after enforcing the ceiling on decoded response bytes.
+                        return json.loads(content)
+                    return resp.json()
+                finally:
+                    await resp.aclose()
         except httpx.TransportError:
             if attempt + 1 >= max_retries:
                 raise
@@ -182,7 +200,6 @@ async def post_json(
                 raise
             await asyncio.sleep(_retry_delay(exc, attempt))
             continue
-        return resp.json()
     raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
 
 

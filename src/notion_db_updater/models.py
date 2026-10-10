@@ -21,6 +21,8 @@ PROP_RT_AUDIENCE = "RT Audience Score"  # number
 PROP_PLOT = "Plot Summary"  # rich_text
 PROP_GENRE = "Genre"  # rich_text
 PROP_STATUS = "Enrichment Status"  # select [pending, awaiting_input, done, failed]
+PROP_WATCHED = "Watched"  # checkbox
+PROP_IMDB_ID = "IMDb ID"  # rich_text
 
 # Every §8 property the agent reads — used for the drift check on a real row.
 EXPECTED_PROPERTIES = (
@@ -32,6 +34,8 @@ EXPECTED_PROPERTIES = (
     PROP_PLOT,
     PROP_GENRE,
     PROP_STATUS,
+    PROP_WATCHED,
+    PROP_IMDB_ID,
 )
 
 
@@ -60,6 +64,14 @@ def _rich_text(props: dict, prop: str) -> str | None:
     return text or None
 
 
+def _checkbox(props: dict, prop: str) -> bool | None:
+    value = props.get(prop)
+    if not isinstance(value, dict) or value.get("type") != "checkbox":
+        return None
+    checked = value.get("checkbox")
+    return checked if isinstance(checked, bool) else None
+
+
 # Reverse of `schema.normalize_media_type`: the contract's {movie, tv} domain → the Notion
 # `Type` select's option names. Used by `update_notion` to write the OMDb-resolved `media_type`
 # back to `Type` on every enriched Entry (backfilling a blank and correcting a wrong one).
@@ -79,6 +91,7 @@ def enrichment_properties(
     rt_critic: int | None = None,
     rt_audience: int | None = None,
     notion_type: str | None = None,
+    imdb_id: str | None = None,
     status: str,
 ) -> dict:
     """Serialize enrichment results into a Notion `properties` payload (the write-back of §8).
@@ -104,6 +117,8 @@ def enrichment_properties(
         props[PROP_RT_AUDIENCE] = {"number": rt_audience}
     if notion_type is not None:
         props[PROP_TYPE] = {"select": {"name": notion_type}}
+    if imdb_id is not None:
+        props[PROP_IMDB_ID] = {"rich_text": [{"text": {"content": imdb_id}}]}
     return props
 
 
@@ -120,6 +135,9 @@ class Entry:
     plot: str | None
     genre: str | None
     status: str | None  # pending | awaiting_input | done | failed | None (unset)
+    watched: bool | None = None
+    imdb_id: str | None = None
+    removed: bool = False
 
     @classmethod
     def from_page(cls, page: dict) -> Entry:
@@ -135,4 +153,7 @@ class Entry:
             plot=_rich_text(props, PROP_PLOT),
             genre=_rich_text(props, PROP_GENRE),
             status=_select_name(props, PROP_STATUS),
+            watched=_checkbox(props, PROP_WATCHED),
+            imdb_id=_rich_text(props, PROP_IMDB_ID),
+            removed=bool(page.get("archived") or page.get("in_trash")),
         )

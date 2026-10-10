@@ -1,4 +1,7 @@
-"""Async Firecrawl client — the RT lane's primary provider (ADR 0003, Phase 4).
+"""Async Firecrawl client for RT enrichment and conversational web research.
+
+Conversation uses general `/search` results and `/scrape` markdown. The same client and
+rate limiter serve both flows; supplied URLs are never fetched by the bot directly.
 
 In production we start from a *title*, not a URL, and RT slugs aren't derivable from a title
 (`/m/parasite_2019`, `/tv/the_last_of_us`). So the flow DISCOVERS the page (proven 4/4 by
@@ -38,7 +41,7 @@ _WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
 
 class FirecrawlClient:
-    """Thin async wrapper over Firecrawl `/search` (scoped to rottentomatoes.com).
+    """Async Firecrawl search and scraping for RT enrichment and conversation research.
 
     Use as an async context manager so the HTTP connection pool is closed::
 
@@ -46,14 +49,16 @@ class FirecrawlClient:
             candidates = await fc.search_rt_candidates("Dune: Part Two", "Movie")
     """
 
-    def __init__(self, settings: Settings) -> None:
-        self._client = httpx.AsyncClient(
+    def __init__(self, settings: Settings, *, http: httpx.AsyncClient | None = None) -> None:
+        self._owns_client = http is None
+        self._client = http or httpx.AsyncClient(
             base_url=_API,
             headers={
                 "Authorization": f"Bearer {settings.FIRECRAWL_API_KEY}",
                 "Content-Type": "application/json",
             },
             timeout=120.0,
+            trust_env=False,
         )
         # One limiter per client instance; there is one shared FirecrawlClient per process, so
         # this is effectively a process-global throttle (≤ FIRECRAWL_RPM/min) over the sweep
@@ -68,7 +73,8 @@ class FirecrawlClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
     async def _search(self, query: str, limit: int = 5) -> list[dict]:
         """POST /v2/search, scraping each hit to markdown inline.
@@ -104,6 +110,55 @@ class FirecrawlClient:
             }
             for h in hits
         ]
+
+    async def search(self, query: str) -> list[dict[str, str]]:
+        """Return up to five general web results without paying for inline scrapes."""
+        data = await post_json(
+            self._client,
+            "/search",
+            {"query": query, "limit": 5, "sources": ["web"]},
+            limiter=self._limiter,
+            max_retries=self._max_retries,
+            max_response_bytes=1_000_000,
+        )
+        if data.get("success") is not True:
+            raise ValueError("Firecrawl search failed")
+        return [
+            {
+                "url": str(hit.get("url") or ""),
+                "title": str(hit.get("title") or ""),
+                "content": str(hit.get("description") or ""),
+            }
+            for hit in (data.get("data", {}).get("web") or [])[:5]
+            if isinstance(hit, dict)
+        ]
+
+    async def fetch_page(self, url: str) -> str:
+        """Return Firecrawl scrape markdown; Firecrawl owns URL handling and redirects."""
+        data = await post_json(
+            self._client,
+            "/scrape",
+            {
+                "url": url,
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+                "skipTlsVerification": False,
+                "maxAge": _WEEK_MS,
+            },
+            limiter=self._limiter,
+            max_retries=self._max_retries,
+            max_response_bytes=1_000_000,
+        )
+        if data.get("success") is not True or not isinstance(data.get("data"), dict):
+            raise ValueError("Firecrawl page retrieval failed")
+        page = data["data"]
+        metadata = page.get("metadata") or {}
+        if metadata.get("error") or metadata.get("statusCode", 200) >= 400:
+            raise ValueError("Firecrawl could not read the supplied page")
+        markdown = page.get("markdown")
+        if not isinstance(markdown, str) or not markdown.strip():
+            raise ValueError("Firecrawl returned no page content")
+        return markdown
 
     async def search_rt_candidates(
         self, title: str, media_type: str | None = None
