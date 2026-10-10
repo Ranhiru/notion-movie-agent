@@ -253,10 +253,6 @@ class Runtime:
         # Fail before serving requests if the Watchlist identity/viewing properties drifted.
         # Schema changes remain explicit through ensure_watchlist_schema(create_identity=True).
         if self._settings.OPENAI_AGENT_MODEL:
-            if not self._settings.SLACK_OWNER_USER_ID:
-                raise ValueError(
-                    "SLACK_OWNER_USER_ID is required when OPENAI_AGENT_MODEL is set"
-                )
             await self._notion.ensure_schema(create_identity=False)
         # Open the durable checkpointer (thread_id = page_id) and compile the one graph reused
         # across entries. `open_checkpointer` applies the state-type allowlist + runs setup()
@@ -293,7 +289,6 @@ class Runtime:
             self.conversation = Conversation(
                 self,
                 self._settings.CHECKPOINT_DB_PATH,
-                self._settings.SLACK_OWNER_USER_ID,
                 build_planner(agent_model(self._settings, limiter)),
                 research=research,
                 max_searches=self._settings.AGENT_MAX_SEARCHES,

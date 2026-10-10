@@ -145,7 +145,6 @@ class _Harness:
         conversation = Conversation(
             self.runtime,
             self.db_path,
-            self.settings.SLACK_OWNER_USER_ID,
             build_planner(agent_model(self.settings)),
             research=self.runtime.research,
         )
@@ -159,7 +158,6 @@ def _harness(settings: Settings, db_path: str) -> _Harness:
     conversation = Conversation(
         runtime,
         db_path,
-        settings.SLACK_OWNER_USER_ID,
         build_planner(agent_model(settings)),
         research=runtime.research,
     )
@@ -179,7 +177,7 @@ async def _send(
     event = {
         "text": event_text,
         "channel": "C-FIXTURE",
-        "user": harness.settings.SLACK_OWNER_USER_ID,
+        "user": "fixture-user",
         "ts": ts,
         "team": "T-FIXTURE",
     }
@@ -235,9 +233,9 @@ async def evaluate(settings: Settings) -> list[tuple[str, bool, str]]:
             )
             ids = {entry.imdb_id for entry in harness.runtime.entries.values()}
             expected = {"tt1091191", "tt0265086"}
-            if not expected <= ids:
-                raise AssertionError(f"Expected both movie identities, got {sorted(ids)}")
-            return "both known IMDb identities were added"
+            if ids != expected:
+                raise AssertionError(f"Expected only requested identities, got {sorted(ids)}")
+            return "only the two requested IMDb identities were added"
 
         results.append(await _run_scenario("multi-title add", multi_add(), settings))
 
@@ -360,8 +358,6 @@ def main() -> int:
         settings = get_settings()
         if not settings.OPENAI_AGENT_MODEL:
             raise ValueError("OPENAI_AGENT_MODEL must be configured for live evaluation")
-        if not settings.SLACK_OWNER_USER_ID:
-            raise ValueError("SLACK_OWNER_USER_ID must be configured for live evaluation")
         results = asyncio.run(evaluate(settings))
     except Exception as exc:
         print(f"Evaluation could not start: {_safe_error(exc, settings)}", file=sys.stderr)

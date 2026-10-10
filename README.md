@@ -62,8 +62,8 @@ restart` mid-wait → the paused graph resumes from the volume-backed `.sqlite`.
 
 ## Conversational Movie Bot
 
-Configure `OPENAI_AGENT_MODEL` with a tool-calling model and `SLACK_OWNER_USER_ID` with
-your Slack user ID. An empty agent-model setting retains the existing add/run behavior.
+Configure `OPENAI_AGENT_MODEL` with a tool-calling model. All incoming user messages and
+interactive actions are treated as yours; no Slack user allowlist is configured.
 The agent uses the existing endpoint, API key, retry policy, and optional reasoning setting.
 
 Verify the live schema, then explicitly add the missing `IMDb ID` rich-text property:
@@ -76,7 +76,7 @@ uv run python -m notion_db_updater --prepare-watchlist
 The preparation command validates the existing `Watched` checkbox and adds only a missing
 identity property. A matching legacy title or alias shows a confirmation card with the existing
 Notion Entry and proposed IMDb title, year, and type. Confirming fills only the missing IMDb ID;
-rejecting leaves the Entry unchanged. Confirmations are owner-only, expire after 30 minutes,
+rejecting leaves the Entry unchanged. Confirmations expire after 30 minutes,
 and survive restarts. Changed or removed Entries are rechecked before any write.
 The check is bounded to 25 unidentified legacy Entries; unresolved titles still need manual
 verification. Pending sweep Entries populate their
@@ -111,8 +111,7 @@ Default recommendations use up to five existing unchecked Watched Entries. Expli
 can search outside the Watchlist; suggestions do not Add anything. Web research uses Firecrawl
 search and cites its evidence. Initial limits are three searches and 25 staged actions per request;
 the supplied page is scraped once through Firecrawl, without crawling linked pages.
-Page retrieval rejects private network addresses before submission and validates the returned
-page URL. Firecrawl handles network access and redirects remotely; the bot never connects
+Firecrawl owns URL validation, DNS resolution, network access, and redirects; the bot never connects
 to supplied pages directly. Provider responses have a 1 MB ceiling and page text has a
 64,000-character agent-context ceiling. Limits are reported with an explicit continuation
 option. Raise the configuration ceilings deliberately after evaluating behavior.

@@ -312,7 +312,6 @@ class SlackTransport:
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
         self._runtime = runtime
-        self._owner = settings.SLACK_OWNER_USER_ID
         # Socket Mode needs no signing secret (no inbound HTTP). The bot token authorizes
         # chat.postMessage / chat.update; the app token opens the WebSocket.
         self._app = AsyncApp(token=settings.SLACK_BOT_TOKEN)
@@ -344,8 +343,6 @@ class SlackTransport:
             data = json.loads(action["value"])
             page_id, imdb_id = data["page_id"], data["imdb_id"]
             user = body.get("user", {}).get("id")
-            if self._owner and user != self._owner:
-                return
             picked = action.get("text", {}).get("text") or imdb_id  # the button label
             channel, ts = body["channel"]["id"], body["message"]["ts"]
             logger.info("slack: pick %s for page %s by %s", imdb_id, page_id, user)
@@ -375,8 +372,6 @@ class SlackTransport:
             await ack()
             channel, ts = body["channel"]["id"], body["message"]["ts"]
             user = body.get("user", {}).get("id")
-            if self._owner and user != self._owner:
-                return
             block_id = action.get("block_id", "")
             page_id = block_id[len(_MANUAL_BLOCK_PREFIX) :]
             raw = (action.get("value") or "").strip()
@@ -464,8 +459,7 @@ class SlackTransport:
         conversation = self._runtime.conversation
         assert conversation is not None
         if (
-            event.get("user") != self._owner
-            or event.get("bot_id")
+            event.get("bot_id")
             or event.get("subtype")
             or not all(event.get(k) for k in ("channel", "ts", "text"))
         ):
@@ -579,14 +573,16 @@ class SlackTransport:
         ]
 
     async def _handle_identity_confirmation(self, body, action, client) -> None:  # noqa: ANN001
-        if body.get("user", {}).get("id") != self._owner:
-            return
         decision = action["action_id"]
         if decision not in {"identity:confirm", "identity:deny"}:
             return
         data = json.loads(action["value"])
         channel, thread_ts = body["channel"]["id"], data["thread_ts"]
-        event = {"user": self._owner, "channel": channel, "thread_ts": thread_ts}
+        event = {
+            "user": body.get("user", {}).get("id"),
+            "channel": channel,
+            "thread_ts": thread_ts,
+        }
         conversation = self._runtime.conversation
         assert conversation is not None
         team_id = body.get("team", {}).get("id")
@@ -624,10 +620,8 @@ class SlackTransport:
             await self._conversation_status(channel, thread_ts, status)
 
     async def _handle_approval(self, body, action, client) -> None:  # noqa: ANN001
-        """Buttons reuse the durable, owner-bound approval path without invoking the model."""
+        """Buttons reuse the durable approval path without invoking the model."""
         user = body.get("user", {}).get("id")
-        if user != self._owner:
-            return
         data = json.loads(action["value"])
         token, thread_ts = data["token"], data["thread_ts"]
         decision = action["action_id"].split(":")[-1]

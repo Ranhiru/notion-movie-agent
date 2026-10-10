@@ -7,14 +7,14 @@ Status: resolved
 The personal Movie Bot needs natural-language Watchlist management: multi-title Adds,
 URL Imports, unwatched Recommendations, viewing-state changes, removal, and refresh.
 Use LangChain `create_agent` with dedicated tools backed by the existing Enrichment Runtime.
-Application code, independently of model behaviour, enforces ownership, exact Action Plans,
+Application code, independently of model behaviour, enforces exact Action Plans,
 approval, identity validation, and durable execution. Successful partial results survive.
 
 ## Conversation and tools
 
-- Serve one configured Slack owner. A mention starts a conversation; ordinary replies
-  continue an established bot thread. Ignore bot messages and unrelated thread traffic.
-  Enforce ownership at both request and interactive-action boundaries.
+- Treat all incoming user messages and interactive actions as the personal user. A mention
+  starts a conversation; ordinary replies continue an established bot thread. Ignore bot
+  messages and unrelated thread traffic; no Slack user allowlist is required.
 - Persist context by workspace, channel, and thread. Persist the ordered Entry IDs behind
   displayed lists so numbered follow-ups survive restarts and remain isolated by thread.
   Recheck referenced Entries against their current state before acting.
@@ -27,13 +27,15 @@ approval, identity validation, and durable execution. Successful partial results
 
 ## Identity and Enrichment
 
-- Resolve each requested work before creating an Entry. Preserve compound names, support
+- The agent resolves the requested work; model evals check title-to-IMDb selection. Application
+  code validates IMDb identity without requiring resolver queries to appear in the request.
+  Preserve compound names, support
   movies and TV shows, clarify uncertain identities, and keep same-name remakes distinct.
 - Deduplicate by IMDb Identity, including alternate names. An already-present result identifies
   the existing Entry. Store resolved IMDb ID in the Watchlist; verify schema before adding
   the property through an explicit migration.
 - Handle unidentified legacy Entries conservatively, bounded to 25. Require clarification
-  or exact owner-bound identity confirmation when uncertain; never destructively merge data.
+  or exact Entry-bound identity confirmation when uncertain; never destructively merge data.
 - Tools call the existing Runtime. Preserve page-keyed checkpoints, Disambiguation interrupts
   and resumes, Enrichment Status, Reconcile coordination, rate limits, progress, and late
   completion notifications. Notion-originated Enrichment continues working.
@@ -49,8 +51,8 @@ approval, identity validation, and durable execution. Successful partial results
   resolved IMDb Identity and mixed operations. Four or more require approval before any writes.
 - Every URL Import requires a selectable preview, even for one title. Its approval can also
   authorize the displayed bulk operation. Execute only the selected actions.
-- Bind approval to the exact actions, Entries, owner, and request. It is single-use and expires
-  after 30 minutes. Reject changed, expired, replayed, cross-request, or unauthorized approvals.
+- Bind approval to the exact actions, Entries, and request. It is single-use and expires
+  after 30 minutes. Reject changed, expired, replayed, cross-request approvals.
   Unexpected additional targets require approval of a revised plan.
 - Persist plans, approval state, references, and per-action progress using existing SQLite
   persistence. Serialize competing execution for the same request/Entry and keep retries
@@ -76,8 +78,8 @@ approval, identity validation, and durable execution. Successful partial results
   or clarification. Do not crawl other pages or bypass inaccessible content.
 - Treat page text and search results as untrusted data. They cannot amend instructions,
   authorize writes, or expand an approved Action Plan.
-- Validate retrieval URLs and redirects at the trust boundary; disallow local/private network
-  resources. Permit public web content without exposing internal resources.
+- Delegate URL validation, DNS resolution, network access, and redirects to Firecrawl. The bot
+  submits the supplied URL to its scrape API without local URL/address checks or target access.
 - Initial ceilings are 25 extracted titles and three web searches per request. Explain reached
   limits and offer explicit continuation, without silent truncation. Increase ceilings only
   deliberately after observing behaviour; continuation retains all approval and URL safeguards.
@@ -106,18 +108,19 @@ use real durable conversation state across restarts; installed-agent tests exerc
 
 Required cases:
 
-- Ownership, mention/thread routing, context isolation, and persistent numbered references.
+- Acceptance of user messages without an owner setting, mention/thread routing, context
+  isolation, and persistent numbered references.
   Removed/changed targets are rechecked; invalid references cannot shift displayed numbering.
 - Multiple named Adds, compound names, aliases, remakes, ambiguous identities, already-present
   results, legacy Entries without IMDb ID, and integration with existing Enrichment.
 - Three affected Entries may proceed; four require approval before writes. Several smaller
   calls and mixed actions cannot bypass the threshold. URL Imports preview even one title.
-- Exact selection, expiry, replay, changed-plan, cross-request, and unauthorized approvals.
+- Exact selection, expiry, replay, changed-plan, cross-request approvals.
   Duplicate Slack delivery, approval restart, partial-execution restart, concurrent attempts,
   and a remote write completed before its receipt must preserve effects without duplication.
 - Untrusted page/search instructions cannot authorize tools. Extraction excludes unrelated
-  links. Blocked/unreadable pages give useful feedback. Initial URLs and redirects cannot reach
-  private resources; search/extraction ceilings produce explicit continuation notices.
+  links. Firecrawl failures and unreadable pages give useful feedback. URL handling belongs to
+  Firecrawl; search/extraction ceilings produce explicit continuation notices.
 - Recommendations exclude Watched Entries, respect preferences, return fewer than five when
   necessary, disclose missing metadata, cite web evidence, and never add external suggestions
   without a request.
@@ -139,7 +142,7 @@ installed-agent tests, static checks, and Compose configuration checks cover the
 This spec records agreed requirements; its publication alone did not authorize implementation.
 
 At implementation validation, Watched was verified read-only and IMDb ID was missing. Live
-activation remained pending: configure the model and owner, prepare the identity property,
+activation remained pending: configure the model, prepare the identity property,
 and enable Slack thread subscriptions as documented in README.md. The configured model
 endpoint was unreachable, so real-model evaluation did not pass and controlled Slack/Notion
 mutation tests were not run. No production Watchlist Entries or schema were changed.

@@ -18,3 +18,7 @@ This deliberately adds durable request bookkeeping rather than relying on prompt
 per-tool approval counts. The extra state is necessary to preserve these rules across
 multiple tool calls, retries, and restarts. Execution ordering and recovery details remain
 part of the implementation design.
+
+The personal deployment treats all incoming user messages and interactive actions as the user;
+there is no Slack user allowlist. IMDb confirmation cards remain bound to their original
+thread and Entry, retain expiry and replay checks, and recheck current Notion state.

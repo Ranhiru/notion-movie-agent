@@ -82,7 +82,6 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         for outcome in (None, RuntimeError("Planner failed"), asyncio.CancelledError()):
             with self.subTest(outcome=outcome):
                 transport = object.__new__(SlackTransport)
-                transport._owner = "U123"
                 client = AsyncMock()
                 client.chat_postMessage.return_value = {"ts": "progress-1"}
                 transport._app = SimpleNamespace(client=client)
@@ -106,7 +105,6 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_working_message_and_real_tool_progress_precede_final_reply(self):
         transport = object.__new__(SlackTransport)
-        transport._owner = "U123"
         client = AsyncMock()
         client.chat_postMessage.return_value = {"ts": "progress-1"}
         transport._app = SimpleNamespace(client=client)
@@ -189,7 +187,6 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(outcome=outcome):
                 transport = object.__new__(SlackTransport)
-                transport._owner = "U123"
                 client = AsyncMock()
                 transport._app = SimpleNamespace(client=client)
 
@@ -225,9 +222,8 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
                     client.api_call.await_args.kwargs["json"]["status"], final_status
                 )
 
-    async def test_status_failure_does_not_block_reply_or_allow_other_users(self) -> None:
+    async def test_status_failure_does_not_block_reply(self) -> None:
         transport = object.__new__(SlackTransport)
-        transport._owner = "U123"
         client = AsyncMock()
         client.api_call.side_effect = RuntimeError("Status unavailable")
         transport._app = SimpleNamespace(client=client)
@@ -238,18 +234,12 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("notion_db_updater.slack", level="ERROR"):
             await transport.handle_conversation(event, say, "T123")
         say.assert_awaited_once_with(text="Done.", thread_ts="1")
-        client.api_call.reset_mock()
-        conversation.handle.reset_mock()
-        await transport.handle_conversation(event | {"user": "OTHER"}, say, "T123")
-        client.api_call.assert_not_awaited()
-        conversation.handle.assert_not_awaited()
 
     async def test_mention_routes_free_form_request_to_conversation(self) -> None:
         transport = object.__new__(SlackTransport)
         transport._tasks = set()
         conversation = SimpleNamespace(handle=AsyncMock(return_value="Sweep started."))
         transport._runtime = SimpleNamespace(conversation=conversation)
-        transport._owner = "U123"
         transport._app = SimpleNamespace(client=AsyncMock())
         say = AsyncMock()
         event = {

@@ -201,7 +201,7 @@ class _StructuredModel:
 class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def _restart(self):
         self.runtime.conversation = Conversation(
-            self.runtime, self.runtime.conversation.db_path, "UOWNER", self._plan
+            self.runtime, self.runtime.conversation.db_path, self._plan
         )
 
     def _legacy_page(self, title: str, page_id: str = "legacy-page") -> dict:
@@ -234,6 +234,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_confirmation_saves_only_id_and_is_durable_and_single_use(self):
         body, action = await self._legacy_confirmation(alias=True)
+        body["user"] = {"id": "ANYUSER"}
         before = deepcopy(self.store.pages["legacy-page"]["properties"])
         self._restart()
         update = AsyncMock(wraps=self.notion.update_entry)
@@ -292,14 +293,8 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.notion.update_entry.assert_not_awaited()
         self.assertEqual(self.store.create_count, 0)
 
-    async def test_legacy_confirmation_rejects_other_users_and_changed_entry(self):
+    async def test_legacy_confirmation_rechecks_changed_entry(self):
         body, action = await self._legacy_confirmation()
-        await self.transport._handle_identity_confirmation(
-            body | {"user": {"id": "OTHER"}},
-            action,
-            self.transport._app.client,
-        )
-        self.assertIsNone((await self.notion.get_entry("legacy-page")).imdb_id)
         self.store.pages["legacy-page"]["properties"][PROP_IMDB_ID] = _text_property(
             "rich_text", "tt0000002"
         )
@@ -424,14 +419,12 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.conversation = Conversation(
             self.runtime,
             str(Path(self.temp.name) / "conversations.sqlite"),
-            "UOWNER",
             self._plan,
         )
         await self.runtime.ensure_watchlist_schema()
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = self.runtime
         self.transport._tasks = set()
-        self.transport._owner = "UOWNER"
         self.transport._app = SimpleNamespace(client=AsyncMock())
         self.say = AsyncMock()
         self._request_num = 0
@@ -451,7 +444,6 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     Action(
                         operation="add",
                         imdb_id=candidates[0]["imdb_id"],
-                        resolution_query=query,
                     )
                 )
             return Reply(text="Staged the resolved title.")

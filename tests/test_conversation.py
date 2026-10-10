@@ -17,14 +17,6 @@ from notion_db_updater.slack import SlackTransport
 
 
 class FixtureRuntime:
-    title_by_id = {
-        "tt0000001": "Lone Survivor",
-        "tt0000002": "Black Hawk Down",
-        "tt0000003": "Jaws",
-        "tt0000004": "Alien",
-        "tt0000009": "Movie nine",
-    }
-
     def __init__(self):
         self.entries = {}
         self.writes = []
@@ -39,17 +31,6 @@ class FixtureRuntime:
             "year": 2020,
             "media_type": "Movie",
         }
-
-    async def resolve_title(self, query, media_type=None):
-        imdb_id = next(
-            (
-                key
-                for key, title in self.title_by_id.items()
-                if title.casefold() == query.casefold()
-            ),
-            None,
-        )
-        return [await self.validate_identity(imdb_id)] if imdb_id else []
 
     async def add_resolved(self, imdb_id, original_request, **kwargs):
         for entry in self.entries.values():
@@ -121,6 +102,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_approve_button_applies_only_selection_once(self):
         body, action = await self.button_plan(selected=(2, 4))
+        body["user"] = {"id": "another-user"}
         client = self.transport._app.client
         await self.transport._handle_approval(body, action, client)
         await self.transport._handle_approval(body, action, client)
@@ -141,11 +123,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.writes, [])
         self.assertEqual(await self.transport._runtime.conversation.recover(), [])
 
-    async def test_buttons_reject_other_users_empty_selection_and_expired_plan(self):
+    async def test_buttons_reject_empty_selection_and_expired_plan(self):
         body, action = await self.button_plan(selected=())
         client = self.transport._app.client
-        await self.transport._handle_approval(body | {"user": {"id": "other"}}, action, client)
-        client.chat_update.assert_not_awaited()
         await self.transport._handle_approval(body, action, client)
         client.chat_postEphemeral.assert_awaited_once()
         pending = self.conversation._load("request:T:C:1")
@@ -179,29 +159,21 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             if "http://" in context.request["text"] or "https://" in context.request["text"]:
                 context.request["imported"] = True
             for action in actions:
-                if action.operation == "add" and not context.request.get("imported"):
-                    query = action.resolution_query or self.runtime.title_by_id.get(
-                        action.imdb_id
-                    )
-                    if query:
-                        await context.resolve_title(query)
-                        action = action.model_copy(update={"resolution_query": query})
                 context.stage(action)
             return reply
 
         self.planner = planner
         self.conversation = Conversation(
-            self.runtime, str(Path(self.temp.name) / "state.sqlite"), "owner", planner
+            self.runtime, str(Path(self.temp.name) / "state.sqlite"), planner
         )
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = SimpleNamespace(conversation=self.conversation)
         self.transport._tasks = set()
-        self.transport._owner = "owner"
         self.transport._app = SimpleNamespace(client=AsyncMock())
 
     def restart(self):
         self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
+            self.runtime, self.conversation.db_path, self.planner
         )
 
     def stage_adds(self, *numbers):
@@ -267,10 +239,11 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.mention(f"approve {token}", ts="2", thread_ts="1")
         self.assertEqual(len(self.runtime.writes), 4)
 
-    async def test_unauthorized_caller_is_ignored(self):
-        reply = await self.mention("remove everything", user="stranger")
-        reply.assert_not_called()
-        self.assertEqual(self.runtime.writes, [])
+    async def test_messages_are_accepted_without_configuring_an_owner(self):
+        self.stage_adds(1)
+        reply = await self.mention("add Lone Survivor", user="any-user")
+        self.assertEqual(self.runtime.writes, [("add", "tt0000001")])
+        self.assertIn("done", reply.call_args.kwargs["text"])
 
     async def test_url_import_always_previews_and_can_select_one_entry(self):
         self.stage_adds(1, 2)
@@ -374,7 +347,37 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(research.search.await_count, 3)
         self.assertIn("Search limit reached", reply.call_args.kwargs["text"])
 
-    async def test_page_redirect_to_private_network_is_blocked_at_conversation_boundary(self):
+    async def test_page_url_and_redirect_handling_are_delegated_to_firecrawl(self):
+        url = "https://example.com:8443/list#movies"
+        for metadata in ({}, {"url": "http://127.0.0.1/private"}):
+            with self.subTest(metadata=metadata):
+                requests = []
+
+                def respond(request, requests=requests, metadata=metadata):
+                    requests.append(request)
+                    return httpx.Response(
+                        200,
+                        json={
+                            "success": True,
+                            "data": {"markdown": "Movie list", "metadata": metadata},
+                        },
+                    )
+
+                async with httpx.AsyncClient(
+                    base_url="https://api.firecrawl.dev/v2",
+                    transport=httpx.MockTransport(respond),
+                ) as http:
+                    research = FirecrawlClient(
+                        Settings(NOTION_MOVIE_DB_TOKEN="fixture", _env_file=None), http=http
+                    )
+                    with patch("socket.getaddrinfo") as dns:
+                        self.assertEqual(await research.fetch_page(url), "Movie list")
+                    dns.assert_not_called()
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(str(requests[0].url), "https://api.firecrawl.dev/v2/scrape")
+                self.assertEqual(json.loads(requests[0].content)["url"], url)
+
+    async def test_firecrawl_failure_blocks_import_without_guessed_writes(self):
         requests = []
 
         def respond(request):
@@ -384,8 +387,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
                 json={
                     "success": True,
                     "data": {
-                        "markdown": "Untrusted redirected content",
-                        "metadata": {"url": "http://127.0.0.1/private"},
+                        "markdown": "",
+                        "metadata": {"error": "Page retrieval failed", "statusCode": 403},
                     },
                 },
             )
@@ -415,7 +418,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["formats"], ["markdown"])
             self.assertFalse(payload["skipTlsVerification"])
             self.assertEqual(self.runtime.writes, [])
-            self.assertIn("could not be read safely", reply.call_args.kwargs["text"])
+            self.assertIn("could not be read", reply.call_args.kwargs["text"])
 
     async def test_pending_approval_is_single_use_and_replaced_plans_invalidate_it(self):
         self.stage_adds(1, 2, 3, 4)
@@ -435,9 +438,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.mention("add Lone Survivor and Black Hawk Down")
         self.runtime.add_resolved = original
-        restarted = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        restarted = Conversation(self.runtime, self.conversation.db_path, self.planner)
         recovered = await restarted.recover()
         self.assertEqual(self.runtime.writes, [("add", "tt0000001"), ("add", "tt0000002")])
         self.assertEqual(recovered[0]["thread_ts"], "1")

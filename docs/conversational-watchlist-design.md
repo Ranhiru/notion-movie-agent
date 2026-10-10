@@ -46,8 +46,8 @@ in README.md.
   following other pages, and three web searches per request. Explain limits and offer an
   explicit continuation when reached.
 - Require a mention to start a conversation and accept ordinary replies in that bot thread.
-  Restrict callers to the user's configured Slack user ID, even though the workspace is
-  currently accessible only to them.
+  Treat all user messages and interactive actions as the personal user; no Slack user
+  allowlist is required.
 - Prepare the complete action list before executing writes. Unexpected additional targets
   pause execution and require approval of a revised plan; no silent expansion is permitted.
 - Refresh may replace machine-managed ratings, plot, and genre, while preserving watched
@@ -75,7 +75,7 @@ IMDb identity property or reading watched state; existing unidentified Entries n
 conservative matching and clarification when uncertain.
 
 Leave runnable deterministic checks for request-wide approval enforcement, identity-based
-deduplication, partial success, restart/retry recovery, caller authorization, and untrusted
+deduplication, partial success, restart/retry recovery, user-message routing, and untrusted
 page content. Exercise real model tool calls separately against fixture-backed tools to
 measure behavior without making production writes. Use a dedicated Notion test database
 for subsequent controlled integration checks.

@@ -36,11 +36,6 @@ class FixtureRuntime:
             "media_type": "movie",
         }
 
-    async def resolve_title(self, query, media_type=None):
-        if query != "Verified Movie":
-            return []
-        return [await self.validate_identity("tt0000001")]
-
     async def add_resolved(self, imdb_id, original_request, **kwargs):
         self.writes.append(("add", imdb_id))
         return {"title": "Verified Movie", "status": "added", "page_id": "page-new"}
@@ -59,22 +54,17 @@ class GuardrailConversationTests(unittest.IsolatedAsyncioTestCase):
 
         async def planner(messages, context):
             for action in self.planned_actions:
-                if action.operation == "add" and action.imdb_id == "tt0000001":
-                    await context.resolve_title("Verified Movie")
-                    action = action.model_copy(update={"resolution_query": "Verified Movie"})
                 context.stage(action)
             return Reply(text="Prepared")
 
         self.conversation = Conversation(
             self.runtime,
             str(Path(self.temp.name) / "state.sqlite"),
-            "owner",
             planner,
         )
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = SimpleNamespace(conversation=self.conversation)
         self.transport._tasks = set()
-        self.transport._owner = "owner"
         self.transport._app = SimpleNamespace(client=AsyncMock())
 
     async def mention(self, text: str):

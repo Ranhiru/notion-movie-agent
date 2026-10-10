@@ -125,7 +125,6 @@ class Settings(BaseSettings):
     SLACK_BOT_TOKEN: str = ""
     SLACK_APP_TOKEN: str = ""
     SLACK_CHANNEL: str = "#notion-movie-db"
-    SLACK_OWNER_USER_ID: str = ""
 
     # --- LangSmith tracing (ON from Phase 1; pure config) ---
     LANGSMITH_TRACING: bool = True

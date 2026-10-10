@@ -40,16 +40,14 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.runtime = FixtureRuntime(FixtureResearchClient())
         self.models: list[ScriptedToolModel] = []
-        owner = "owner"
         self.conversation = Conversation(
             self.runtime,
             str(Path(self.temp.name) / "conversation.sqlite"),
-            owner,
             self._planner(
                 tool_call("resolve_title", {"query": "Lone Survivor"}, "resolve-1"),
                 tool_call(
                     "add_entry",
-                    {"imdb_id": "tt1091191", "resolution_query": "Lone Survivor"},
+                    {"imdb_id": "tt1091191"},
                     "add-1",
                 ),
                 reply_call("Added Lone Survivor.", [], "reply-1"),
@@ -59,7 +57,6 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport = object.__new__(SlackTransport)
         self.transport._runtime = cast(Any, SimpleNamespace(conversation=self.conversation))
         self.transport._tasks = set()
-        self.transport._owner = self.conversation.owner
         self.transport._app = SimpleNamespace(client=AsyncMock())
 
     def _planner(self, *responses: AIMessage):
@@ -106,43 +103,17 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.reconcile.assert_awaited_once_with()
         self.assertEqual(result, "The pending Entry was enriched.")
 
-    async def test_agent_cannot_add_a_different_valid_identity(self) -> None:
+    async def test_unverified_imdb_identity_still_requires_clarification(self) -> None:
         self.conversation.planner = self._planner(
-            tool_call("resolve_title", {"query": "Lone Survivor"}, "resolve-1"),
-            tool_call(
-                "add_entry",
-                {"imdb_id": "tt0133093", "resolution_query": "Lone Survivor"},
-                "add-1",
-            ),
-            reply_call("Added The Matrix.", [], "reply-1"),
+            tool_call("add_entry", {"imdb_id": "tt9999999"}, "add-invalid"),
+            reply_call("Added a movie.", [], "reply-invalid"),
         )
-        result = await self._send("Add Lone Survivor", ts="wrong-id", mention=True)
+        with self.assertLogs("notion_db_updater.conversation", level="ERROR"):
+            result = await self._send("Add Lone Survivor", ts="invalid-id", mention=True)
         self.assertIn("clarification_required", result)
         self.assertEqual(self.runtime.writes, [])
 
-    async def test_agent_cannot_swap_ids_between_grounded_title_resolutions(self) -> None:
-        self.conversation.planner = self._planner(
-            tool_call("resolve_title", {"query": "Lone Survivor"}, "resolve-lone"),
-            tool_call("resolve_title", {"query": "The Matrix"}, "resolve-matrix"),
-            tool_call(
-                "add_entry",
-                {"imdb_id": "tt0133093", "resolution_query": "Lone Survivor"},
-                "add-lone",
-            ),
-            tool_call(
-                "add_entry",
-                {"imdb_id": "tt1091191", "resolution_query": "The Matrix"},
-                "add-matrix",
-            ),
-            reply_call("Added both titles.", [], "reply-batch"),
-        )
-        result = await self._send(
-            "Add Lone Survivor and The Matrix", ts="swapped-ids", mention=True
-        )
-        self.assertEqual(result.count("clarification_required"), 2)
-        self.assertEqual(self.runtime.writes, [])
-
-    async def test_grounded_alias_resolution_can_add_canonical_identity(self) -> None:
+    async def test_alias_can_resolve_with_a_query_not_quoted_in_the_request(self) -> None:
         identity = {
             "imdb_id": "tt1091191",
             "title": "The Lord of the Rings",
@@ -151,7 +122,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         }
 
         async def resolve_title(query: str, media_type: str | None = None) -> list[dict]:
-            self.assertEqual(query, "LOTR")
+            self.assertEqual(query, "The Lord of the Rings")
             return [identity]
 
         async def validate_identity(imdb_id: str) -> dict:
@@ -166,10 +137,10 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.validate_identity = validate_identity
         self.runtime.add_resolved = add_resolved
         self.conversation.planner = self._planner(
-            tool_call("resolve_title", {"query": "LOTR"}, "resolve-alias"),
+            tool_call("resolve_title", {"query": "The Lord of the Rings"}, "resolve-alias"),
             tool_call(
                 "add_entry",
-                {"imdb_id": "tt1091191", "resolution_query": "LOTR"},
+                {"imdb_id": "tt1091191"},
                 "add-alias",
             ),
             reply_call("Added The Lord of the Rings.", [], "reply-alias"),
@@ -177,24 +148,6 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         result = await self._send("Add LOTR", ts="alias", mention=True)
         self.assertIn("The Lord of the Rings", result)
         self.assertEqual(self.runtime.writes, [("add", "tt1091191")])
-
-    async def test_incidental_generic_query_does_not_ground_an_add(self) -> None:
-        async def resolve_any_query(query: str, media_type: str | None = None) -> list[dict]:
-            return [await self.runtime.validate_identity("tt1091191")]
-
-        self.runtime.resolve_title = resolve_any_query
-        self.conversation.planner = self._planner(
-            tool_call("resolve_title", {"query": "movie"}, "resolve-generic"),
-            tool_call(
-                "add_entry",
-                {"imdb_id": "tt1091191", "resolution_query": "movie"},
-                "add-generic",
-            ),
-            reply_call("Added Lone Survivor.", [], "reply-generic"),
-        )
-        result = await self._send("Add a movie", ts="generic", mention=True)
-        self.assertIn("clarification_required", result)
-        self.assertEqual(self.runtime.writes, [])
 
     async def test_recommendation_references_survive_restart_and_follow_up(self) -> None:
         await self.runtime.add_resolved("tt1091191", "fixture", "C", "owner", "1", "seed")
@@ -220,7 +173,6 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.conversation = Conversation(
             self.runtime,
             str(Path(self.temp.name) / "conversation.sqlite"),
-            "owner",
             self.conversation.planner,
             research=self.runtime.research,
         )

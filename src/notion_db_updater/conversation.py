@@ -22,7 +22,6 @@ log = logging.getLogger(__name__)
 class Action(BaseModel):
     operation: Literal["add", "remove", "watched", "unwatched", "refresh"]
     imdb_id: str | None = None
-    resolution_query: str | None = None
     page_id: str | None = None
     reference: int | None = Field(default=None, ge=1)
 
@@ -43,7 +42,6 @@ class RequestTools:
     max_searches: int = 3
     max_titles: int = 25
     notices: list[str] = field(default_factory=list)
-    resolved_ids: dict[str, set[str]] = field(default_factory=dict)
     progress: Callable[[str], Awaitable[None]] | None = None
 
     def stage(self, action: Action) -> str:
@@ -75,16 +73,7 @@ class RequestTools:
 
     async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
         await _report_progress(self.progress, f"🔎 Finding an IMDb match for {query[:180]}…")
-        candidates = await self.runtime.resolve_title(query, media_type)
-        if not self.request.get("imported") and _query_is_grounded(
-            query, self.request.get("text", "")
-        ):
-            self.resolved_ids.setdefault(_normalize_query(query), set()).update(
-                candidate["imdb_id"]
-                for candidate in candidates
-                if isinstance(candidate.get("imdb_id"), str)
-            )
-        return candidates
+        return await self.runtime.resolve_title(query, media_type)
 
     async def reference(self, index: int) -> dict | str:
         if not 1 <= index <= len(self.references):
@@ -140,7 +129,7 @@ class RequestTools:
             self.request["import_failed"] = True
             self.persist()
             log.exception("URL extraction failed")
-            return "The supplied page could not be read safely. Ask for an accessible URL."
+            return "The supplied page could not be read. Ask for an accessible URL."
 
 
 Planner = Callable[[list[dict], RequestTools], Awaitable[Reply]]
@@ -156,59 +145,18 @@ async def _report_progress(
             log.exception("Could not report conversation progress")
 
 
-def _query_is_grounded(query: str, request_text: str) -> bool:
-    """Accept only a meaningful resolver query quoted as a phrase in the request."""
-
-    phrase = _normalize_query(query)
-    if not phrase:
-        return False
-    ignored = {
-        "a",
-        "an",
-        "add",
-        "anything",
-        "film",
-        "for",
-        "it",
-        "movie",
-        "movies",
-        "please",
-        "series",
-        "show",
-        "something",
-        "that",
-        "the",
-        "this",
-        "tv",
-        "watchlist",
-        "what",
-        "work",
-    }
-    if all(word in ignored for word in phrase.split()):
-        return False
-    request = f" {_normalize_query(request_text)} "
-    return f" {phrase} " in request
-
-
-def _normalize_query(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
-
-
 class Conversation:
     def __init__(
         self,
         runtime: Any,
         db_path: str,
-        owner: str,
         planner: Planner,
         *,
         research: Any = None,
         max_searches: int = 3,
         max_titles: int = 25,
     ):
-        if not owner:
-            raise ValueError("SLACK_OWNER_USER_ID is required for conversations")
-        self.runtime, self.db_path, self.owner, self.planner = runtime, db_path, owner, planner
+        self.runtime, self.db_path, self.planner = runtime, db_path, planner
         self.lock = asyncio.Lock()
         self.research, self.max_searches, self.max_titles = research, max_searches, max_titles
         with closing(sqlite3.connect(db_path)) as db:
@@ -238,7 +186,7 @@ class Conversation:
     def identity_confirmations(self, event: dict, team_id: str | None) -> list[dict]:
         """Return persisted matches for this request, for Slack's confirmation cards."""
         team = team_id or event.get("team")
-        if not team or event.get("user") != self.owner:
+        if not team:
             return []
         key = f"request:{team}:{event['channel']}:{event['ts']}"
         request = self._load(key)
@@ -266,14 +214,14 @@ class Conversation:
         *,
         confirmed: bool,
     ) -> str | None:
-        """Confirm a legacy identity, bound to its owner, original thread, and Entry."""
-        if event.get("user") != self.owner or not team_id:
+        """Confirm a legacy identity, bound to its original thread and Entry."""
+        if not team_id:
             return None
         async with self.lock:
             request = self._load(request_key)
             thread_key = f"thread:{team_id}:{event['channel']}:{event['thread_ts']}"
-            if request.get("user") != self.owner or request.get("thread_key") != thread_key:
-                return "This confirmation does not belong to this conversation."
+            if request.get("thread_key") != thread_key:
+                return "This confirmation belongs to another thread."
             action = next(
                 (
                     a
@@ -344,7 +292,7 @@ class Conversation:
                 ).fetchall()
             for key, data in rows:
                 request = json.loads(data)
-                if request.get("status") != "executing" or request.get("user") != self.owner:
+                if request.get("status") != "executing":
                     continue
                 response = await self._execute(key, request)
                 thread_key = request.get("thread_key")
@@ -376,7 +324,7 @@ class Conversation:
         *,
         progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
-        if event.get("user") != self.owner or event.get("bot_id") or event.get("subtype"):
+        if event.get("bot_id") or event.get("subtype"):
             return None
         if not all(event.get(k) for k in ("channel", "ts", "text")):
             return None
@@ -408,7 +356,6 @@ class Conversation:
                 pending = self._load(pending_key) if pending_key else {}
                 if (
                     pending.get("token") != denial[1]
-                    or pending.get("user") != self.owner
                     or pending.get("status") != "pending"
                     or pending.get("expires", 0) <= time.time()
                 ):
@@ -429,7 +376,6 @@ class Conversation:
                 pending = self._load(pending_key) if pending_key else {}
                 if (
                     pending.get("token") != approval[1]
-                    or pending.get("user") != self.owner
                     or pending.get("status") not in {"pending", "executing"}
                     or (
                         pending.get("status") == "pending"
@@ -469,7 +415,7 @@ class Conversation:
             request = previous or {
                 "text": text,
                 "channel": event["channel"],
-                "user": self.owner,
+                "user": event.get("user", ""),
                 "thread_ts": thread,
                 "key": request_key,
                 "thread_key": key,
@@ -560,21 +506,6 @@ class Conversation:
                         log.exception("Could not verify IMDb Identity for staged Add")
                         reason = (
                             "Could not verify this IMDb Identity; confirm the title and retry."
-                        )
-                    if (
-                        reason is None
-                        and not context.request.get("imported")
-                        and (
-                            action.resolution_query is None
-                            or action.imdb_id
-                            not in context.resolved_ids.get(
-                                _normalize_query(action.resolution_query), set()
-                            )
-                        )
-                    ):
-                        reason = (
-                            "This IMDb Identity was not returned for its grounded title "
-                            "resolution; please clarify which work to add."
                         )
                 if reason:
                     prepared.setdefault("title", action.imdb_id or "Unresolved Add")
