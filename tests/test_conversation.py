@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -94,9 +95,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def button_plan(self, decision="approve", selected=(1, 2, 3, 4)):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
-        )
+        self.stage_adds(1, 2, 3, 4)
         reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         blocks = reply.call_args.kwargs["blocks"]
         self.assertEqual(blocks[0]["text"]["text"], "Review Watchlist changes")
@@ -135,9 +134,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         body, action = await self.button_plan(decision="deny")
         await self.transport._handle_approval(body, action, self.transport._app.client)
         self.assertEqual(self.runtime.writes, [])
-        self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        self.restart()
         await self.transport._handle_approval(
             body, action | {"action_id": "watchlist:approve"}, self.transport._app.client
         )
@@ -202,6 +199,24 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport._owner = "owner"
         self.transport._app = SimpleNamespace(client=AsyncMock())
 
+    def restart(self):
+        self.transport._runtime.conversation = Conversation(
+            self.runtime, self.conversation.db_path, "owner", self.planner
+        )
+
+    def stage_adds(self, *numbers):
+        self.scripts.append([Action(operation="add", imdb_id=f"tt000000{n}") for n in numbers])
+
+    def interrupt_after_add(self):
+        original = self.runtime.add_resolved
+
+        async def interrupted(imdb_id, original_request, **kwargs):
+            await original(imdb_id, original_request, **kwargs)
+            raise asyncio.CancelledError
+
+        self.runtime.add_resolved = interrupted
+        return original
+
     async def mention(self, text, *, ts="1", user="owner", thread_ts=None):
         say = AsyncMock()
         event = {"text": f"<@BOT> {text}", "channel": "C", "user": user, "ts": ts}
@@ -209,16 +224,11 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             event["thread_ts"] = thread_ts
         await self.transport._handle_mention(event, say, team_id="T")
         if self.transport._tasks:
-            await __import__("asyncio").gather(*self.transport._tasks)
+            await asyncio.gather(*self.transport._tasks)
         return say
 
     async def test_two_named_movies_are_added_as_separate_entries(self):
-        self.scripts.append(
-            [
-                Action(operation="add", imdb_id="tt0000001"),
-                Action(operation="add", imdb_id="tt0000002"),
-            ]
-        )
+        self.stage_adds(1, 2)
         reply = await self.mention("add Lone Survivor and Black Hawk Down")
         self.assertEqual(self.runtime.writes, [("add", "tt0000001"), ("add", "tt0000002")])
         self.assertIn("Movie tt0000001", reply.call_args.kwargs["text"])
@@ -248,9 +258,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(Conversation._explicit_action(text, "add"))
 
     async def test_four_separate_tool_calls_wait_for_request_wide_approval(self):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
-        )
+        self.stage_adds(1, 2, 3, 4)
         reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         self.assertEqual(self.runtime.writes, [])
         preview = reply.call_args.kwargs["text"]
@@ -265,9 +273,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.writes, [])
 
     async def test_url_import_always_previews_and_can_select_one_entry(self):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 3)]
-        )
+        self.stage_adds(1, 2)
         reply = await self.mention("add movies from https://example.com/top10")
         self.assertEqual(self.runtime.writes, [])
         token = self.approval_token(reply)
@@ -285,9 +291,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.writes.clear()
         self.scripts.append(([], Reply(text="1. A movie", references=["page-tt0000001"])))
         await self.mention("recommend something unwatched")
-        self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        self.restart()
         self.scripts.append([Action(operation="watched", reference=1)])
         reply = AsyncMock()
         await self.transport.handle_conversation(
@@ -305,14 +309,10 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
 
     async def test_pending_preview_survives_restart_without_replanning(self):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
-        )
+        self.stage_adds(1, 2, 3, 4)
         reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         token = self.approval_token(reply)
-        self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        self.restart()
         await self.mention(f"approve {token}", ts="2", thread_ts="1")
         self.assertEqual(len(self.runtime.writes), 4)
 
@@ -325,39 +325,25 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             return await original(imdb_id, original_request, **kwargs)
 
         self.runtime.add_resolved = fail_second
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 4)]
-        )
+        self.stage_adds(1, 2, 3)
         with self.assertLogs("notion_db_updater.conversation", level="ERROR"):
             reply = await self.mention("add Lone Survivor, Black Hawk Down and Jaws")
         self.assertEqual(self.runtime.writes, [("add", "tt0000001"), ("add", "tt0000003")])
         self.assertIn("Movie tt0000002: failed", reply.call_args.kwargs["text"])
 
     async def test_restart_after_remote_write_does_not_repeat_completed_effect(self):
-        import asyncio
-
-        original = self.runtime.add_resolved
-
-        async def interrupted(imdb_id, original_request, **kwargs):
-            await original(imdb_id, original_request, **kwargs)
-            raise asyncio.CancelledError
-
-        self.runtime.add_resolved = interrupted
+        original = self.interrupt_after_add()
         self.scripts.append([Action(operation="add", imdb_id="tt0000001")])
         with self.assertRaises(asyncio.CancelledError):
             await self.mention("add Lone Survivor")
         self.runtime.add_resolved = original
-        self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        self.restart()
         reply = await self.mention("add Lone Survivor")
         self.assertEqual(self.runtime.writes, [("add", "tt0000001")])
         self.assertIn("recovered", reply.call_args.kwargs["text"])
 
     async def test_expired_approval_cannot_write(self):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
-        )
+        self.stage_adds(1, 2, 3, 4)
         with patch("notion_db_updater.conversation.time.time", return_value=100):
             reply = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         token = self.approval_token(reply)
@@ -432,9 +418,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("could not be read safely", reply.call_args.kwargs["text"])
 
     async def test_pending_approval_is_single_use_and_replaced_plans_invalidate_it(self):
-        self.scripts.append(
-            [Action(operation="add", imdb_id=f"tt000000{i}") for i in range(1, 5)]
-        )
+        self.stage_adds(1, 2, 3, 4)
         preview = await self.mention("add Lone Survivor, Black Hawk Down, Jaws and Alien")
         token = self.approval_token(preview)
         self.scripts.append([Action(operation="add", imdb_id="tt0000009")])
@@ -446,21 +430,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_recovery_completes_unstarted_actions_without_repeating_effects(
         self,
     ):
-        import asyncio
-
-        original = self.runtime.add_resolved
-
-        async def interrupted(imdb_id, original_request, **kwargs):
-            await original(imdb_id, original_request, **kwargs)
-            raise asyncio.CancelledError
-
-        self.runtime.add_resolved = interrupted
-        self.scripts.append(
-            [
-                Action(operation="add", imdb_id="tt0000001"),
-                Action(operation="add", imdb_id="tt0000002"),
-            ]
-        )
+        original = self.interrupt_after_add()
+        self.stage_adds(1, 2)
         with self.assertRaises(asyncio.CancelledError):
             await self.mention("add Lone Survivor and Black Hawk Down")
         self.runtime.add_resolved = original
@@ -474,17 +445,10 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await restarted.recover(), [])
 
     async def test_added_summary_numbers_survive_restart_for_followup(self):
-        self.scripts.append(
-            [
-                Action(operation="add", imdb_id="tt0000001"),
-                Action(operation="add", imdb_id="tt0000002"),
-            ]
-        )
+        self.stage_adds(1, 2)
         reply = await self.mention("add Lone Survivor and Black Hawk Down")
         self.assertIn("2. Movie tt0000002", reply.call_args.kwargs["text"])
-        self.transport._runtime.conversation = Conversation(
-            self.runtime, self.conversation.db_path, "owner", self.planner
-        )
+        self.restart()
         self.scripts.append([Action(operation="watched", reference=2)])
         await self.mention("mark the second watched", ts="2", thread_ts="1")
         self.assertTrue(self.runtime.entries["page-tt0000002"].watched)

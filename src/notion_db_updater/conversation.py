@@ -228,6 +228,13 @@ class Conversation:
             )
             db.commit()
 
+    def _save_exchange(self, key: str, state: dict, text: str, response: str) -> None:
+        """Append one exchange without changing this path's references or approval state."""
+        state.setdefault("messages", []).extend(
+            [{"role": "user", "content": text}, {"role": "assistant", "content": response}]
+        )
+        self._save(key, state)
+
     def identity_confirmations(self, event: dict, team_id: str | None) -> list[dict]:
         """Return persisted matches for this request, for Slack's confirmation cards."""
         team = team_id or event.get("team")
@@ -346,13 +353,7 @@ class Conversation:
                     state.pop("pending", None)
                     state["references"] = request.get("references", [])
                     state["identity_request"] = key
-                    state.setdefault("messages", []).extend(
-                        [
-                            {"role": "user", "content": request["text"]},
-                            {"role": "assistant", "content": response},
-                        ]
-                    )
-                    self._save(thread_key, state)
+                    self._save_exchange(thread_key, state, request["text"], response)
                 replies.append(
                     {
                         "channel": request["channel"],
@@ -398,18 +399,8 @@ class Conversation:
                 return self._preview(previous)
             if previous.get("status") == "executing":
                 response = await self._execute(request_key, previous, progress=progress)
-                self._save(
-                    key,
-                    state
-                    | {
-                        "references": previous.get("references", []),
-                        "messages": state.get("messages", [])
-                        + [
-                            {"role": "user", "content": text},
-                            {"role": "assistant", "content": response},
-                        ],
-                    },
-                )
+                state["references"] = previous.get("references", [])
+                self._save_exchange(key, state, text, response)
                 return response
             denial = re.fullmatch(r"deny\s+([0-9a-f]{16})", text)
             if denial:
@@ -429,13 +420,7 @@ class Conversation:
                 assert isinstance(pending_key, str)
                 self._save(pending_key, pending)
                 state.pop("pending", None)
-                state.setdefault("messages", []).extend(
-                    [
-                        {"role": "user", "content": text},
-                        {"role": "assistant", "content": response},
-                    ]
-                )
-                self._save(key, state)
+                self._save_exchange(key, state, text, response)
                 self._save(request_key, {"response": response})
                 return response
             approval = re.fullmatch(r"approve\s+([0-9a-f]{16})(?:\s+([\d, ]+))?", text)
@@ -477,13 +462,7 @@ class Conversation:
                 state.pop("pending", None)
                 state["references"] = pending.get("references", [])
                 state["identity_request"] = pending_key
-                state.setdefault("messages", []).extend(
-                    [
-                        {"role": "user", "content": text},
-                        {"role": "assistant", "content": response},
-                    ]
-                )
-                self._save(key, state)
+                self._save_exchange(key, state, text, response)
                 self._save(request_key, {"response": response})
                 return response
             messages = state.get("messages", []) + [{"role": "user", "content": text}]

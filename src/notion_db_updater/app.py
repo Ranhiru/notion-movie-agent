@@ -400,13 +400,7 @@ class Runtime:
                         return "removed"
                     if current.status not in (None, "pending"):
                         return current.status
-                    config: RunnableConfig = {
-                        "configurable": {"thread_id": entry.page_id},
-                        "run_name": current.title or "(blank Entry)",
-                        "metadata": {"page_id": entry.page_id, "origin": "sweep"},
-                    }
-                    if self._settings.GRAPH_MAX_CONCURRENCY > 0:
-                        config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
+                    config = self._graph_config(current, "sweep")
                     final_state = await self._graph.ainvoke(
                         {
                             "page_id": entry.page_id,
@@ -529,6 +523,10 @@ class Runtime:
     def _canonical_media_type(value: str | None) -> str | None:
         return {"movie": "movie", "series": "tv", "episode": "tv"}.get(value or "")
 
+    @staticmethod
+    def _identity_confirmation(entry: Entry, identity: dict) -> dict:
+        return {"page_id": entry.page_id, "existing_title": entry.title, "identity": identity}
+
     async def add_resolved(
         self,
         imdb_id: str,
@@ -573,11 +571,7 @@ class Runtime:
                     "page_id": unknown.page_id,
                     "title": unknown.title,
                     "reason": "An existing Entry needs its IMDb match confirmed.",
-                    "identity_confirmation": {
-                        "page_id": unknown.page_id,
-                        "existing_title": unknown.title,
-                        "identity": identity,
-                    },
+                    "identity_confirmation": self._identity_confirmation(unknown, identity),
                 }
             try:
                 visible = await self._notion.list_watchlist()
@@ -628,11 +622,7 @@ class Runtime:
                         "page_id": entry.page_id,
                         "title": entry.title,
                         "reason": "An existing Entry may be the same work under another name.",
-                        "identity_confirmation": {
-                            "page_id": entry.page_id,
-                            "existing_title": entry.title,
-                            "identity": identity,
-                        },
+                        "identity_confirmation": self._identity_confirmation(entry, identity),
                     }
             created = await self._notion.create_resolved_entry(
                 title=identity["title"],
@@ -716,6 +706,49 @@ class Runtime:
         finally:
             self._inflight.discard(page_id)
 
+    def _graph_config(
+        self, entry: Entry, origin: str, run_name: str | None = None
+    ) -> RunnableConfig:
+        config: RunnableConfig = {
+            "configurable": {"thread_id": entry.page_id},
+            "run_name": run_name if run_name is not None else entry.title or "(blank Entry)",
+            "metadata": {"page_id": entry.page_id, "origin": origin},
+        }
+        if self._settings.GRAPH_MAX_CONCURRENCY > 0:
+            config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
+        return config
+
+    async def _stream_enrichment(
+        self,
+        entry: Entry,
+        initial_state: dict,
+        *,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+        run_name: str | None = None,
+    ) -> ResumeResult:
+        """Stream a page-locked run; its checkpoint owns final state and durable resume."""
+        assert self._graph is not None, "graph not compiled — use `async with Runtime()`"
+        config = self._graph_config(entry, SLACK_ORIGIN, run_name)
+        interrupts = None
+        async for update in self._graph.astream(
+            initial_state, config=config, stream_mode="updates"
+        ):
+            if "__interrupt__" in update:
+                interrupts = update["__interrupt__"]
+            if progress is not None:
+                for node_name in update:
+                    event_id = _PROGRESS_EVENT_AFTER_NODE.get(node_name)
+                    if event_id is not None:
+                        await self._report_progress(progress, event_id)
+        snapshot = await self._graph.aget_state(config)
+        final_state = dict(snapshot.values)
+        if interrupts:
+            final_state["__interrupt__"] = interrupts
+        if await self._handle_pause(entry, final_state):
+            await self._report_progress(progress, _PROGRESS_HITL_REQUIRED)
+            return ResumeResult(status=_AWAITING)
+        return ResumeResult.from_state(final_state)
+
     async def _enrich_resolved_entry(
         self,
         entry: Entry,
@@ -732,13 +765,6 @@ class Runtime:
         page_id = entry.page_id
         try:
             async with self._page_lock(page_id):
-                config: RunnableConfig = {
-                    "configurable": {"thread_id": page_id},
-                    "run_name": entry.title or "(blank Entry)",
-                    "metadata": {"page_id": page_id, "origin": SLACK_ORIGIN},
-                }
-                if self._settings.GRAPH_MAX_CONCURRENCY > 0:
-                    config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
                 initial_state = {
                     "page_id": page_id,
                     "resolved_imdb_id": imdb_id,
@@ -749,19 +775,7 @@ class Runtime:
                     "notify_thread_ts": thread_ts,
                     "original_request": original_request,
                 }
-                interrupts = None
-                async for update in self._graph.astream(
-                    initial_state, config=config, stream_mode="updates"
-                ):
-                    if "__interrupt__" in update:
-                        interrupts = update["__interrupt__"]
-                snapshot = await self._graph.aget_state(config)
-                final_state = dict(snapshot.values)
-                if interrupts:
-                    final_state["__interrupt__"] = interrupts
-                if await self._handle_pause(entry, final_state):
-                    return {"status": _AWAITING, "title": entry.title}
-                result = ResumeResult.from_state(final_state)
+                result = await self._stream_enrichment(entry, initial_state)
                 return {"status": result.status, "title": result.title or entry.title}
         finally:
             self._inflight.discard(page_id)
@@ -833,13 +847,6 @@ class Runtime:
         # _handle_pause or update_notion), so the sweep never sees it while still `pending`.
         try:
             async with self._page_lock(page_id):
-                config: RunnableConfig = {
-                    "configurable": {"thread_id": page_id},
-                    "run_name": title,
-                    "metadata": {"page_id": page_id, "origin": SLACK_ORIGIN},
-                }
-                if self._settings.GRAPH_MAX_CONCURRENCY > 0:
-                    config["max_concurrency"] = self._settings.GRAPH_MAX_CONCURRENCY
                 initial_state = {
                     "page_id": page_id,
                     "resolved_imdb_id": None,
@@ -851,27 +858,9 @@ class Runtime:
                     "notify_user": user,
                     "notify_thread_ts": thread_ts,
                 }
-                # Stream state updates so Slack reflects nodes that have actually completed.
-                # The checkpointer remains authoritative for final state and durable resume.
-                interrupts = None
-                async for update in self._graph.astream(
-                    initial_state, config=config, stream_mode="updates"
-                ):
-                    if "__interrupt__" in update:
-                        interrupts = update["__interrupt__"]
-                    for node_name in update:
-                        event_id = _PROGRESS_EVENT_AFTER_NODE.get(node_name)
-                        if event_id is not None:
-                            await self._report_progress(progress, event_id)
-
-                snapshot = await self._graph.aget_state(config)
-                final_state = dict(snapshot.values)
-                if interrupts:
-                    final_state["__interrupt__"] = interrupts
-                if await self._handle_pause(entry, final_state):
-                    await self._report_progress(progress, _PROGRESS_HITL_REQUIRED)
-                    return AddOutcome(page_id=page_id, status=_AWAITING, title=title)
-                result = ResumeResult.from_state(final_state)
+                result = await self._stream_enrichment(
+                    entry, initial_state, progress=progress, run_name=title
+                )
                 return AddOutcome(
                     page_id=page_id,
                     status=result.status,

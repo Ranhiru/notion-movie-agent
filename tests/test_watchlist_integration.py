@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -198,17 +199,26 @@ class _StructuredModel:
 
 
 class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def _legacy_confirmation(self, *, alias=False):
-        title = "Arrakis: The Desert" if alias else "Arrival"
-        props = _properties(title)
-        props[PROP_WATCHED] = {"type": "checkbox", "checkbox": True}
-        props[PROP_STATUS] = {"type": "select", "select": {"name": "done"}}
-        self.store.pages["legacy-page"] = {
-            "id": "legacy-page",
-            "properties": props,
+    def _restart(self):
+        self.runtime.conversation = Conversation(
+            self.runtime, self.runtime.conversation.db_path, "UOWNER", self._plan
+        )
+
+    def _legacy_page(self, title: str, page_id: str = "legacy-page") -> dict:
+        page = {
+            "id": page_id,
+            "properties": _properties(title),
             "archived": False,
             "in_trash": False,
         }
+        self.store.pages[page_id] = page
+        return page
+
+    async def _legacy_confirmation(self, *, alias=False):
+        title = "Arrakis: The Desert" if alias else "Arrival"
+        props = self._legacy_page(title)["properties"]
+        props[PROP_WATCHED] = {"type": "checkbox", "checkbox": True}
+        props[PROP_STATUS] = {"type": "select", "select": {"name": "done"}}
         await self._add("Dune" if alias else "Arrival")
         blocks = self.say.await_args_list[-1].kwargs["blocks"]
         action = blocks[-1]["elements"][0]
@@ -224,13 +234,8 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_confirmation_saves_only_id_and_is_durable_and_single_use(self):
         body, action = await self._legacy_confirmation(alias=True)
-        before = json.loads(json.dumps(self.store.pages["legacy-page"]["properties"]))
-        self.runtime.conversation = Conversation(
-            self.runtime,
-            self.runtime.conversation.db_path,
-            "UOWNER",
-            self._plan,
-        )
+        before = deepcopy(self.store.pages["legacy-page"]["properties"])
+        self._restart()
         update = AsyncMock(wraps=self.notion.update_entry)
         self.notion.update_entry = update
         await self.transport._handle_identity_confirmation(
@@ -242,12 +247,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
         props = self.store.pages["legacy-page"]["properties"]
         self.assertEqual({k: v for k, v in props.items() if k != PROP_IMDB_ID}, before)
         self.assertEqual(self.store.create_count, 0)
-        self.runtime.conversation = Conversation(
-            self.runtime,
-            self.runtime.conversation.db_path,
-            "UOWNER",
-            self._plan,
-        )
+        self._restart()
         await self.transport._handle_identity_confirmation(
             body, action, self.transport._app.client
         )
@@ -258,7 +258,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_confirmation_rejection_leaves_entry_unchanged(self):
         body, action = await self._legacy_confirmation()
-        before = json.loads(json.dumps(self.store.pages))
+        before = deepcopy(self.store.pages)
         await self.transport._handle_identity_confirmation(
             body,
             action | {"action_id": "identity:deny"},
@@ -455,22 +455,17 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             return Reply(text="Staged the resolved title.")
-        if lowered == "mark watched":
+        operations = {
+            "mark watched": ("watched", "Marking it watched."),
+            "mark unwatched": ("unwatched", "Marking it unwatched."),
+            "refresh": ("refresh", "Refreshing it."),
+            "remove": ("remove", "Removing it."),
+        }
+        if lowered in operations:
+            operation, response = operations[lowered]
             entry = (await tools.watchlist())[0]
-            tools.stage(Action(operation="watched", page_id=entry["page_id"]))
-            return Reply(text="Marking it watched.")
-        if lowered == "mark unwatched":
-            entry = (await tools.watchlist())[0]
-            tools.stage(Action(operation="unwatched", page_id=entry["page_id"]))
-            return Reply(text="Marking it unwatched.")
-        if lowered == "refresh":
-            entry = (await tools.watchlist())[0]
-            tools.stage(Action(operation="refresh", page_id=entry["page_id"]))
-            return Reply(text="Refreshing it.")
-        if lowered == "remove":
-            entry = (await tools.watchlist())[0]
-            tools.stage(Action(operation="remove", page_id=entry["page_id"]))
-            return Reply(text="Removing it.")
+            tools.stage(Action(operation=operation, page_id=entry["page_id"]))
+            return Reply(text=response)
         return Reply(text="Please clarify.")
 
     async def _ask(self, text: str) -> str:
@@ -518,12 +513,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_legacy_exact_title_requires_clarification_without_create(
         self,
     ) -> None:
-        self.store.pages["legacy-page"] = {
-            "id": "legacy-page",
-            "properties": _properties("Arrival"),
-            "archived": False,
-            "in_trash": False,
-        }
+        self._legacy_page("Arrival", "legacy-page")
 
         reply = await self._add("Arrival")
 
@@ -533,12 +523,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_legacy_alias_requires_clarification_without_create(
         self,
     ) -> None:
-        self.store.pages["legacy-alias"] = {
-            "id": "legacy-alias",
-            "properties": _properties("Arrakis: The Desert"),
-            "archived": False,
-            "in_trash": False,
-        }
+        self._legacy_page("Arrakis: The Desert", "legacy-alias")
 
         reply = await self._add("Dune")
 
@@ -550,12 +535,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_too_many_unknown_legacy_entries_require_verification(self) -> None:
         for index in range(26):
             page_id = f"legacy-{index}"
-            self.store.pages[page_id] = {
-                "id": page_id,
-                "properties": _properties(f"Unindexed title {index}"),
-                "archived": False,
-                "in_trash": False,
-            }
+            self._legacy_page(f"Unindexed title {index}", page_id)
 
         reply = await self._add("Dune")
 
@@ -565,12 +545,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.pages), 26)
 
     async def test_unresolvable_unknown_legacy_entry_requires_verification(self) -> None:
-        self.store.pages["legacy-unresolved"] = {
-            "id": "legacy-unresolved",
-            "properties": _properties("Unindexed title"),
-            "archived": False,
-            "in_trash": False,
-        }
+        self._legacy_page("Unindexed title", "legacy-unresolved")
 
         reply = await self._add("Dune")
 
