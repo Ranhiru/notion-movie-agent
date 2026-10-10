@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 class Action(BaseModel):
     operation: Literal["add", "remove", "watched", "unwatched", "refresh"]
     imdb_id: str | None = None
+    resolution_query: str | None = None
     page_id: str | None = None
     reference: int | None = Field(default=None, ge=1)
 
@@ -42,6 +43,7 @@ class RequestTools:
     max_searches: int = 3
     max_titles: int = 25
     notices: list[str] = field(default_factory=list)
+    resolved_ids: dict[str, set[str]] = field(default_factory=dict)
 
     def stage(self, action: Action) -> str:
         """Propose an action; staging never performs a Watchlist write."""
@@ -65,7 +67,16 @@ class RequestTools:
         ]
 
     async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
-        return await self.runtime.resolve_title(query, media_type)
+        candidates = await self.runtime.resolve_title(query, media_type)
+        if not self.request.get("imported") and _query_is_grounded(
+            query, self.request.get("text", "")
+        ):
+            self.resolved_ids.setdefault(_normalize_query(query), set()).update(
+                candidate["imdb_id"]
+                for candidate in candidates
+                if isinstance(candidate.get("imdb_id"), str)
+            )
+        return candidates
 
     async def reference(self, index: int) -> dict | str:
         if not 1 <= index <= len(self.references):
@@ -123,6 +134,44 @@ class RequestTools:
 
 
 Planner = Callable[[list[dict], RequestTools], Awaitable[Reply]]
+
+
+def _query_is_grounded(query: str, request_text: str) -> bool:
+    """Accept only a meaningful resolver query quoted as a phrase in the request."""
+
+    phrase = _normalize_query(query)
+    if not phrase:
+        return False
+    ignored = {
+        "a",
+        "an",
+        "add",
+        "anything",
+        "film",
+        "for",
+        "it",
+        "movie",
+        "movies",
+        "please",
+        "series",
+        "show",
+        "something",
+        "that",
+        "the",
+        "this",
+        "tv",
+        "watchlist",
+        "what",
+        "work",
+    }
+    if all(word in ignored for word in phrase.split()):
+        return False
+    request = f" {_normalize_query(request_text)} "
+    return f" {phrase} " in request
+
+
+def _normalize_query(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 class Conversation:
@@ -371,6 +420,21 @@ class Conversation:
                         log.exception("Could not verify IMDb Identity for staged Add")
                         reason = (
                             "Could not verify this IMDb Identity; confirm the title and retry."
+                        )
+                    if (
+                        reason is None
+                        and not context.request.get("imported")
+                        and (
+                            action.resolution_query is None
+                            or action.imdb_id
+                            not in context.resolved_ids.get(
+                                _normalize_query(action.resolution_query), set()
+                            )
+                        )
+                    ):
+                        reason = (
+                            "This IMDb Identity was not returned for its grounded title "
+                            "resolution; please clarify which work to add."
                         )
                 if reason:
                     prepared.setdefault("title", action.imdb_id or "Unresolved Add")
