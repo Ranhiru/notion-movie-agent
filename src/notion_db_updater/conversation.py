@@ -212,6 +212,105 @@ class Conversation:
             )
             db.commit()
 
+    def identity_confirmations(self, event: dict, team_id: str | None) -> list[dict]:
+        """Return persisted matches for this request, for Slack's confirmation cards."""
+        team = team_id or event.get("team")
+        if not team or event.get("user") != self.owner:
+            return []
+        key = f"request:{team}:{event['channel']}:{event['ts']}"
+        request = self._load(key)
+        if not request.get("actions"):
+            thread = event.get("thread_ts") or event["ts"]
+            state = self._load(f"thread:{team}:{event['channel']}:{thread}")
+            key = state.get("identity_request", "")
+            request = self._load(key) if key else {}
+        return [
+            confirmation | {"request_key": key}
+            for action in request.get("actions", [])
+            if (confirmation := action.get("result", {}).get("identity_confirmation"))
+            and confirmation.get("status") in {"pending", "executing"}
+            and (
+                confirmation["status"] == "executing" or confirmation["expires"] > time.time()
+            )
+        ]
+
+    async def decide_identity(
+        self,
+        request_key: str,
+        token: str,
+        event: dict,
+        team_id: str | None,
+        *,
+        confirmed: bool,
+    ) -> str | None:
+        """Confirm a legacy identity, bound to its owner, original thread, and Entry."""
+        if event.get("user") != self.owner or not team_id:
+            return None
+        async with self.lock:
+            request = self._load(request_key)
+            thread_key = f"thread:{team_id}:{event['channel']}:{event['thread_ts']}"
+            if request.get("user") != self.owner or request.get("thread_key") != thread_key:
+                return "This confirmation does not belong to this conversation."
+            action = next(
+                (
+                    a
+                    for a in request.get("actions", [])
+                    if a.get("result", {}).get("identity_confirmation", {}).get("token")
+                    == token
+                ),
+                None,
+            )
+            if action is None:
+                return "This confirmation is invalid or no longer available."
+            confirmation = action["result"]["identity_confirmation"]
+            if confirmation.get("status") in {"confirmed", "denied"}:
+                return confirmation["response"]
+            if confirmation.get("status") not in {"pending", "executing"} or (
+                confirmation["status"] == "pending" and confirmation["expires"] <= time.time()
+            ):
+                return (
+                    "This confirmation expired. Ask to add the title again for a fresh match."
+                )
+            if not confirmed:
+                if confirmation["status"] == "executing":
+                    return "The identity confirmation is already being applied."
+                confirmation["status"] = "denied"
+                result = {
+                    "status": "unchanged",
+                    "title": confirmation["existing_title"],
+                    "page_id": confirmation["page_id"],
+                    "reason": "Match rejected. The existing Entry was left unchanged; "
+                    "no duplicate was added.",
+                }
+            else:
+                confirmation["status"] = "executing"
+                self._save(request_key, request)
+                try:
+                    result = await self.runtime.confirm_legacy_identity(
+                        confirmation["page_id"],
+                        confirmation["identity"]["imdb_id"],
+                        confirmation["existing_title"],
+                    )
+                except ValueError as exc:
+                    confirmation["status"] = "invalid"
+                    self._save(request_key, request)
+                    return str(exc)
+                except Exception:
+                    log.exception("Could not confirm legacy identity")
+                    return (
+                        "Could not save this IMDb match. "
+                        "Retry the confirmation to check its outcome."
+                    )
+                confirmation["status"] = "confirmed"
+            confirmation["response"] = result["reason"]
+            action["result"] = result | {"identity_confirmation": confirmation}
+            response = await self._execute(request_key, request)
+            state = self._load(thread_key)
+            state["references"] = request.get("references", [])
+            state.setdefault("messages", []).append({"role": "assistant", "content": response})
+            self._save(thread_key, state)
+            return response
+
     async def recover(self) -> list[dict]:
         """Resume durable executions; pending previews still need their user's approval."""
         replies = []
@@ -230,6 +329,7 @@ class Conversation:
                     state = self._load(thread_key)
                     state.pop("pending", None)
                     state["references"] = request.get("references", [])
+                    state["identity_request"] = key
                     state.setdefault("messages", []).extend(
                         [
                             {"role": "user", "content": request["text"]},
@@ -242,6 +342,12 @@ class Conversation:
                         "channel": request["channel"],
                         "thread_ts": request["thread_ts"],
                         "text": response,
+                        "identity_confirmations": [
+                            c | {"request_key": key}
+                            for a in request["actions"]
+                            if (c := a.get("result", {}).get("identity_confirmation"))
+                            and c.get("status") in {"pending", "executing"}
+                        ],
                     }
                 )
         return replies
@@ -348,6 +454,7 @@ class Conversation:
                 response = await self._execute(pending_key, pending)
                 state.pop("pending", None)
                 state["references"] = pending.get("references", [])
+                state["identity_request"] = pending_key
                 state.setdefault("messages", []).extend(
                     [
                         {"role": "user", "content": text},
@@ -419,6 +526,7 @@ class Conversation:
             if context.notices:
                 response += "\n" + "\n".join(dict.fromkeys(context.notices))
             state.update(
+                identity_request=request_key,
                 messages=messages + [{"role": "assistant", "content": response}],
                 references=(
                     request.get("references", [])
@@ -613,6 +721,18 @@ class Conversation:
                     result = {"title": action["title"], "status": "failed"}
                 action["result"] = result
                 self._save(key, request)
+            confirmation = result.get("identity_confirmation")
+            if confirmation and not confirmation.get("token"):
+                confirmation.update(
+                    token=secrets.token_hex(8), expires=time.time() + 1800, status="pending"
+                )
+                self._save(key, request)
+            if confirmation and confirmation.get("status") in {"pending", "executing"}:
+                results.append(
+                    f"{i + 1}. {result.get('title') or action['title']}: "
+                    "Please confirm the existing Entry's IMDb match below."
+                )
+                continue
             results.append(
                 f"{i + 1}. {result.get('title') or action['title']}: {result['status']}"
                 + (f" — {result['reason']}" if result.get("reason") else "")

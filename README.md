@@ -74,10 +74,12 @@ uv run python -m notion_db_updater --prepare-watchlist
 ```
 
 The preparation command validates the existing `Watched` checkbox and adds only a missing
-identity property. Existing Entries without identity are handled conservatively: a matching
-legacy title or alias requires clarification instead of a duplicate Add. The check is bounded
-to 25 unidentified legacy Entries; unresolved titles require verification first. Set a verified IMDb ID on
-that Entry in Notion before retrying or refreshing it. Pending sweep Entries populate their
+identity property. A matching legacy title or alias shows a confirmation card with the existing
+Notion Entry and proposed IMDb title, year, and type. Confirming fills only the missing IMDb ID;
+rejecting leaves the Entry unchanged. Confirmations are owner-only, expire after 30 minutes,
+and survive restarts. Changed or removed Entries are rechecked before any write.
+The check is bounded to 25 unidentified legacy Entries; unresolved titles still need manual
+verification. Pending sweep Entries populate their
 identity during Enrichment once conversations are enabled.
 
 Slack needs `app_mention` plus message subscriptions for the channel types you use:

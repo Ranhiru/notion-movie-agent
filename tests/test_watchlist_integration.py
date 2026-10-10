@@ -198,6 +198,141 @@ class _StructuredModel:
 
 
 class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def _legacy_confirmation(self, *, alias=False):
+        title = "Arrakis: The Desert" if alias else "Arrival"
+        props = _properties(title)
+        props[PROP_WATCHED] = {"type": "checkbox", "checkbox": True}
+        props[PROP_STATUS] = {"type": "select", "select": {"name": "done"}}
+        self.store.pages["legacy-page"] = {
+            "id": "legacy-page",
+            "properties": props,
+            "archived": False,
+            "in_trash": False,
+        }
+        await self._add("Dune" if alias else "Arrival")
+        blocks = self.say.await_args_list[-1].kwargs["blocks"]
+        action = blocks[-1]["elements"][0]
+        self.assertEqual(action["action_id"], "identity:confirm")
+        self.assertEqual(self.store.create_count, 0)
+        body = {
+            "user": {"id": "UOWNER"},
+            "team": {"id": "TWORK"},
+            "channel": {"id": "CWATCH"},
+            "message": {"ts": "confirmation-1"},
+        }
+        return body, action
+
+    async def test_legacy_confirmation_saves_only_id_and_is_durable_and_single_use(self):
+        body, action = await self._legacy_confirmation(alias=True)
+        before = json.loads(json.dumps(self.store.pages["legacy-page"]["properties"]))
+        self.runtime.conversation = Conversation(
+            self.runtime,
+            self.runtime.conversation.db_path,
+            "UOWNER",
+            self._plan,
+        )
+        update = AsyncMock(wraps=self.notion.update_entry)
+        self.notion.update_entry = update
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        entry = await self.notion.get_entry("legacy-page")
+        self.assertEqual(entry.imdb_id, "tt0000001")
+        self.assertEqual(entry.title, "Arrakis: The Desert")
+        props = self.store.pages["legacy-page"]["properties"]
+        self.assertEqual({k: v for k, v in props.items() if k != PROP_IMDB_ID}, before)
+        self.assertEqual(self.store.create_count, 0)
+        self.runtime.conversation = Conversation(
+            self.runtime,
+            self.runtime.conversation.db_path,
+            "UOWNER",
+            self._plan,
+        )
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        update.assert_awaited_once()
+        self.assertIn(
+            "no duplicate", self.transport._app.client.chat_update.call_args.kwargs["text"]
+        )
+
+    async def test_legacy_confirmation_rejection_leaves_entry_unchanged(self):
+        body, action = await self._legacy_confirmation()
+        before = json.loads(json.dumps(self.store.pages))
+        await self.transport._handle_identity_confirmation(
+            body,
+            action | {"action_id": "identity:deny"},
+            self.transport._app.client,
+        )
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        self.assertEqual(self.store.pages, before)
+
+    async def test_legacy_confirmation_recovers_a_lost_save_response(self):
+        body, action = await self._legacy_confirmation()
+        original = self.notion.update_entry
+
+        async def lost_response(page_id, properties):
+            await original(page_id, properties)
+            raise httpx.ReadTimeout("save response lost")
+
+        self.notion.update_entry = lost_response
+        with self.assertLogs("notion_db_updater.conversation", level="ERROR"):
+            await self.transport._handle_identity_confirmation(
+                body, action, self.transport._app.client
+            )
+        self.assertEqual((await self.notion.get_entry("legacy-page")).imdb_id, "tt0000004")
+        blocks = self.transport._app.client.chat_update.call_args.kwargs["blocks"]
+        self.assertEqual(blocks[-1]["elements"][0]["action_id"], "identity:confirm")
+        self.notion.update_entry = AsyncMock(wraps=original)
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        self.notion.update_entry.assert_not_awaited()
+        self.assertEqual(self.store.create_count, 0)
+
+    async def test_legacy_confirmation_rejects_other_users_and_changed_entry(self):
+        body, action = await self._legacy_confirmation()
+        await self.transport._handle_identity_confirmation(
+            body | {"user": {"id": "OTHER"}},
+            action,
+            self.transport._app.client,
+        )
+        self.assertIsNone((await self.notion.get_entry("legacy-page")).imdb_id)
+        self.store.pages["legacy-page"]["properties"][PROP_IMDB_ID] = _text_property(
+            "rich_text", "tt0000002"
+        )
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        self.assertEqual((await self.notion.get_entry("legacy-page")).imdb_id, "tt0000002")
+        self.assertIn(
+            "different IMDb identity",
+            self.transport._app.client.chat_update.call_args.kwargs["text"],
+        )
+
+    async def test_legacy_confirmation_rejects_expired_and_wrong_thread_buttons(self):
+        body, action = await self._legacy_confirmation()
+        payload = json.loads(action["value"])
+        altered = payload | {"thread_ts": "other-thread"}
+        await self.transport._handle_identity_confirmation(
+            body,
+            action | {"value": json.dumps(altered)},
+            self.transport._app.client,
+        )
+        self.assertIsNone((await self.notion.get_entry("legacy-page")).imdb_id)
+        request = self.runtime.conversation._load(payload["request_key"])
+        request["actions"][0]["result"]["identity_confirmation"]["expires"] = 0
+        self.runtime.conversation._save(payload["request_key"], request)
+        await self.transport._handle_identity_confirmation(
+            body, action, self.transport._app.client
+        )
+        self.assertIsNone((await self.notion.get_entry("legacy-page")).imdb_id)
+        self.assertIn(
+            "expired", self.transport._app.client.chat_update.call_args.kwargs["text"]
+        )
+
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = _NotionStore()
@@ -392,7 +527,7 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         reply = await self._add("Arrival")
 
-        self.assertIn("clarification_required", reply)
+        self.assertIn("Confirm to save its IMDb ID", reply)
         self.assertEqual(len(self.store.pages), 1)
 
     async def test_unknown_legacy_alias_requires_clarification_without_create(
@@ -407,8 +542,8 @@ class WatchlistIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         reply = await self._add("Dune")
 
-        self.assertIn("clarification_required", reply)
-        self.assertIn("verify legacy IMDb IDs", reply)
+        self.assertIn("Confirm to save its IMDb ID", reply)
+        self.assertIn("Arrakis: The Desert match Dune", reply)
         self.assertEqual(self.store.create_count, 0)
         self.assertEqual(len(self.store.pages), 1)
 

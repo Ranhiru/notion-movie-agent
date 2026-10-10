@@ -576,7 +576,12 @@ class Runtime:
                     "status": "clarification_required",
                     "page_id": unknown.page_id,
                     "title": unknown.title,
-                    "reason": "This title may already exist; verify legacy IMDb IDs first.",
+                    "reason": "An existing Entry needs its IMDb match confirmed.",
+                    "identity_confirmation": {
+                        "page_id": unknown.page_id,
+                        "existing_title": unknown.title,
+                        "identity": identity,
+                    },
                 }
             try:
                 visible = await self._notion.list_watchlist()
@@ -626,7 +631,12 @@ class Runtime:
                         "status": "clarification_required",
                         "page_id": entry.page_id,
                         "title": entry.title,
-                        "reason": "Possible legacy alias; verify legacy IMDb IDs first.",
+                        "reason": "An existing Entry may be the same work under another name.",
+                        "identity_confirmation": {
+                            "page_id": entry.page_id,
+                            "existing_title": entry.title,
+                            "identity": identity,
+                        },
                     }
             created = await self._notion.create_resolved_entry(
                 title=identity["title"],
@@ -759,6 +769,38 @@ class Runtime:
                 return {"status": result.status, "title": result.title or entry.title}
         finally:
             self._inflight.discard(page_id)
+
+    async def confirm_legacy_identity(
+        self,
+        page_id: str,
+        imdb_id: str,
+        expected_title: str,
+    ) -> dict:
+        """Fill only a missing identity after the user confirms the exact existing Entry."""
+        from .models import PROP_IMDB_ID
+
+        identity = await self.validate_identity(imdb_id)
+        async with self._identity_lock, self._page_lock(page_id):
+            entry = await self._notion.get_entry(page_id)
+            if entry.removed or entry.title != expected_title:
+                raise ValueError("The existing Entry changed; request a new confirmation.")
+            if entry.imdb_id and entry.imdb_id != imdb_id:
+                raise ValueError("The existing Entry now has a different IMDb identity.")
+            existing = await self._notion.find_by_imdb_id(imdb_id)
+            if existing is not None and existing.page_id != page_id:
+                raise ValueError("Another Entry already has this IMDb identity.")
+            if not entry.imdb_id:
+                await self._notion.update_entry(
+                    page_id,
+                    {PROP_IMDB_ID: {"rich_text": [{"text": {"content": imdb_id}}]}},
+                )
+            return {
+                "status": "already_present",
+                "page_id": page_id,
+                "title": entry.title,
+                "reason": f"Confirmed as {identity['title']}. "
+                "Its IMDb ID is saved; no duplicate was added.",
+            }
 
     async def create_and_enrich(
         self,

@@ -43,6 +43,65 @@ _BUTTON_LABEL_MAX = 70
 _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 … pick:4
 _APPROVAL_ACTION = re.compile(r"^watchlist:(approve|deny)$")
 _SELECTION_ACTION = "watchlist:selection"
+_IDENTITY_ACTION = re.compile(r"^identity:(confirm|deny)$")
+
+
+def _identity_confirmation_blocks(confirmation: dict, thread_ts: str) -> list[dict]:
+    identity = confirmation["identity"]
+    title = escape(identity["title"], quote=False)
+    existing = escape(confirmation["existing_title"], quote=False)
+    page_id = confirmation["page_id"].replace("-", "")
+    year = identity.get("year") or "Year unknown"
+    kind = identity.get("media_type") or "Type unknown"
+    imdb_id = identity["imdb_id"]
+    value = json.dumps(
+        {
+            "request_key": confirmation["request_key"],
+            "token": confirmation["token"],
+            "thread_ts": thread_ts,
+        }
+    )
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Confirm an existing Watchlist Entry"},
+        },
+        *_section_blocks(
+            f"Your Watchlist already contains <https://www.notion.so/{page_id}|{existing}>, "
+            "but its IMDb ID is missing.\n"
+            f"Is it the same work as *{title}* ({year}) · {kind}?\n"
+            f"<https://www.imdb.com/title/{imdb_id}/|View IMDb match>"
+        ),
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Confirming saves the IMDb ID on this existing Entry. "
+                    "Your other fields stay unchanged and no duplicate is added. "
+                    "Expires in 30 minutes.",
+                }
+            ],
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "identity:confirm",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "Yes, same movie or show"},
+                    "value": value,
+                },
+                {
+                    "type": "button",
+                    "action_id": "identity:deny",
+                    "text": {"type": "plain_text", "text": "Not a match"},
+                    "value": value,
+                },
+            ],
+        },
+    ]
 
 
 def _approval_blocks(response: str, thread_ts: str) -> list[dict]:
@@ -489,6 +548,15 @@ class SlackTransport:
         self._register()
 
     def _register(self) -> None:
+        @self._app.action(_IDENTITY_ACTION)
+        async def handle_identity(ack, body, action, client) -> None:  # noqa: ANN001
+            await ack()
+            task = asyncio.create_task(
+                self._handle_identity_confirmation(body, action, client)
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
         @self._app.action(_SELECTION_ACTION)
         async def handle_selection(ack) -> None:  # noqa: ANN001
             await ack()
@@ -661,6 +729,72 @@ class SlackTransport:
                     )
                 else:
                     await say(text=response, thread_ts=thread_ts)
+                    for reply in self._identity_replies(event, team_id):
+                        status = "suspended"
+                        await say(**reply)
+        finally:
+            await self._conversation_status(channel, thread_ts, status)
+
+    def _identity_replies(self, event: dict, team_id: str | None) -> list[dict]:
+        get_confirmations = getattr(self._runtime.conversation, "identity_confirmations", None)
+        confirmations = get_confirmations(event, team_id) if get_confirmations else []
+        thread_ts = event.get("thread_ts") or event["ts"]
+        return [
+            {
+                "text": (
+                    f"Does your existing Entry {c['existing_title']} match "
+                    f"{c['identity']['title']} "
+                    f"({c['identity'].get('year') or 'year unknown'})? "
+                    "Confirm to save its IMDb ID, or reject to leave it unchanged."
+                ),
+                "thread_ts": thread_ts,
+                "blocks": _identity_confirmation_blocks(c, thread_ts),
+            }
+            for c in confirmations
+        ]
+
+    async def _handle_identity_confirmation(self, body, action, client) -> None:  # noqa: ANN001
+        if body.get("user", {}).get("id") != self._owner:
+            return
+        decision = action["action_id"]
+        if decision not in {"identity:confirm", "identity:deny"}:
+            return
+        data = json.loads(action["value"])
+        channel, thread_ts = body["channel"]["id"], data["thread_ts"]
+        event = {"user": self._owner, "channel": channel, "thread_ts": thread_ts}
+        conversation = self._runtime.conversation
+        assert conversation is not None
+        team_id = body.get("team", {}).get("id")
+        status = "active"
+        await self._conversation_status(channel, thread_ts, "processing")
+        try:
+            response = await conversation.decide_identity(
+                data["request_key"],
+                data["token"],
+                event,
+                team_id,
+                confirmed=decision == "identity:confirm",
+            )
+            if response is not None:
+                source_event = event | {"ts": data["request_key"].rsplit(":", 1)[-1]}
+                pending = next(
+                    (
+                        c
+                        for c in conversation.identity_confirmations(source_event, team_id)
+                        if c["token"] == data["token"]
+                    ),
+                    None,
+                )
+                blocks = _section_blocks(response)
+                if pending:
+                    status = "suspended"
+                    blocks += _identity_confirmation_blocks(pending, thread_ts)
+                await client.chat_update(
+                    channel=channel,
+                    ts=body["message"]["ts"],
+                    text=response,
+                    blocks=blocks,
+                )
         finally:
             await self._conversation_status(channel, thread_ts, status)
 
@@ -705,6 +839,7 @@ class SlackTransport:
             "text": text,
         }
         await self._conversation_status(channel, thread_ts, "processing")
+        status = "active"
         try:
             conversation = self._runtime.conversation
             assert conversation is not None
@@ -716,8 +851,11 @@ class SlackTransport:
                     text=response,
                     blocks=_section_blocks(response),
                 )
+                for reply in self._identity_replies(event, body.get("team", {}).get("id")):
+                    status = "suspended"
+                    await client.chat_postMessage(channel=channel, **reply)
         finally:
-            await self._conversation_status(channel, thread_ts, "active")
+            await self._conversation_status(channel, thread_ts, status)
 
     async def _conversation_status(self, channel: str, thread_ts: str, status: str) -> None:
         """Native Slack loading UI is best effort and never blocks a Watchlist request."""
@@ -853,6 +991,16 @@ class SlackTransport:
         """Open the Socket Mode WebSocket and process events until cancelled."""
         if self._runtime.conversation is not None:
             for reply in await self._runtime.conversation.recover():
+                confirmations = reply.pop("identity_confirmations", [])
                 await self._app.client.chat_postMessage(**reply)
+                for confirmation in confirmations:
+                    await self._app.client.chat_postMessage(
+                        **reply,
+                        blocks=_identity_confirmation_blocks(confirmation, reply["thread_ts"]),
+                    )
+                if confirmations:
+                    await self._conversation_status(
+                        reply["channel"], reply["thread_ts"], "suspended"
+                    )
         log.info("slack: starting Socket Mode listener")
         await self._handler.start_async()
