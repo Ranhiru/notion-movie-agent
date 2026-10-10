@@ -2,11 +2,14 @@
 # (see [dependency-groups] in pyproject.toml). `make check` is what the git pre-push
 # hook runs; it does only static checks — no live/credentialed runs.
 
-.PHONY: help format lint typecheck check test evaluate-agent hooks secrets
+.PHONY: help build format lint typecheck check test evaluate-agent hooks secrets
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+
+build: ## Build and start Docker Compose services in the background
+	sudo docker compose up -d --build
 
 format: ## Auto-format the code (ruff)
 	uv run ruff format
