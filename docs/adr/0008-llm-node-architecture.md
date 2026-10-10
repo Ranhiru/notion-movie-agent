@@ -1,5 +1,11 @@
 # LLM nodes: per-provider extraction, disambiguation pre-filter, LLM-as-judge
 
+The optional conversational `create_agent` role sits above this fixed graph. It stages
+Watchlist tools rather than replacing the graph's extraction, Disambiguation, or Judge nodes.
+Its model and reasoning effort are configured separately. A resolved conversational IMDb
+Identity and the original user request enter the graph together so the Judge can still
+detect an agent-selected wrong match.
+
 The original "LLM merge node that reconciles three conflicting sources" (RESEARCH.md) is
 replaced. After the redesign there are two lanes, OMDb is authoritative structured JSON,
 and the RT chain yields a single winner — so there is little to *reconcile*. The

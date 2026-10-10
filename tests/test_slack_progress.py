@@ -182,6 +182,8 @@ class SlackProgressTests(unittest.IsolatedAsyncioTestCase):
         runtime._notion = _FakeNotion()
         runtime._settings = SimpleNamespace(GRAPH_MAX_CONCURRENCY=0)
         runtime._inflight = set()
+        runtime._identity_lock = asyncio.Lock()
+        runtime._page_locks = {}
         runtime._notifier = None
         progress = AsyncMock()
 

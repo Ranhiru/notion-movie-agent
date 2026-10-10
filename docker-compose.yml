@@ -29,6 +29,10 @@ services:
       OPENAI_EXTRACTION_MODEL: ${OPENAI_EXTRACTION_MODEL:-}
       OPENAI_DISAMBIGUATION_MODEL: ${OPENAI_DISAMBIGUATION_MODEL:-}
       OPENAI_JUDGE_MODEL: ${OPENAI_JUDGE_MODEL:-}
+      OPENAI_AGENT_MODEL: ${OPENAI_AGENT_MODEL:-}
+      OPENAI_AGENT_REASONING_EFFORT: ${OPENAI_AGENT_REASONING_EFFORT:-}
+      AGENT_MAX_SEARCHES: ${AGENT_MAX_SEARCHES:-3}
+      AGENT_MAX_IMPORT_TITLES: ${AGENT_MAX_IMPORT_TITLES:-25}
       OPENAI_MAX_TOKENS: ${OPENAI_MAX_TOKENS:-8192}
       LLM_RPS: ${LLM_RPS:-0}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
@@ -52,6 +56,7 @@ services:
 
       # Slack channel for the HITL picker (the bot/app *tokens* are secrets, below).
       SLACK_CHANNEL: ${SLACK_CHANNEL:-#notion-movie-db}
+      SLACK_OWNER_USER_ID: ${SLACK_OWNER_USER_ID:-}
 
       # LangSmith tracing — only the API key is a secret (below); the rest are plain config.
       LANGSMITH_TRACING: ${LANGSMITH_TRACING:-true}

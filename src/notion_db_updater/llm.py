@@ -136,3 +136,17 @@ def disambiguation_model(
         settings.OPENAI_DISAMBIGUATION_REASONING_EFFORT,
         rate_limiter,
     )
+
+
+def agent_model(
+    settings: Settings, rate_limiter: InMemoryRateLimiter | None = None
+) -> ChatOpenAI:
+    """The tool-calling conversation role, sharing endpoint and retry configuration."""
+    if not settings.OPENAI_AGENT_MODEL:
+        raise ValueError("OPENAI_AGENT_MODEL is required for conversations")
+    return _role_model(
+        settings,
+        settings.OPENAI_AGENT_MODEL,
+        settings.OPENAI_AGENT_REASONING_EFFORT,
+        rate_limiter,
+    )

@@ -1,5 +1,14 @@
 # Slack mention `add`: a second entry point via create-then-enrich, out-of-band
 
+## Conversational extension
+
+The optional conversational agent revises typed-title deduplication: it resolves IMDb Identity
+and deduplicates before creating a canonical pending Entry. Page creation still precedes
+Enrichment, preserving page-keyed checkpoints, Reconcile coordination, and late replies.
+The fixed enrichment graph accepts a prevalidated identity and original user-request evidence
+for the Judge. The legacy add/run surface remains available when the agent model is unset.
+Request-wide approval and the tool boundary are defined in ADR 0014.
+
 A Slack app mention `@NotionMovieAgent add <name>` lets a human originate an Entry instead of
 adding a row in Notion. Rather than invert the architecture, it is an **additional entry
 point**: the handler creates the Notion page exactly as a human would (Entry only, status

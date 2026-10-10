@@ -18,7 +18,16 @@ import httpx
 from aiolimiter import AsyncLimiter
 
 from .config import NOTION_VERSION, Settings
-from .models import PROP_STATUS, PROP_TITLE, Entry, enrichment_properties
+from .models import (
+    PROP_IMDB_ID,
+    PROP_STATUS,
+    PROP_TITLE,
+    PROP_TYPE,
+    PROP_WATCHED,
+    Entry,
+    enrichment_properties,
+    notion_type_value,
+)
 
 _API = "https://api.notion.com/v1"
 
@@ -54,6 +63,7 @@ class NotionClient:
 
     def __init__(self, settings: Settings) -> None:
         self._data_source_id = settings.NOTION_WATCHLIST_DATA_SOURCE_ID
+        self.identity_enabled = False
         self._client = httpx.AsyncClient(
             base_url=_API,
             headers={
@@ -102,9 +112,13 @@ class NotionClient:
             return resp
         raise AssertionError("unreachable: loop returns or raises")  # pragma: no cover
 
-    async def _query_page(self, filter_: dict, cursor: str | None = None) -> dict:
+    async def _query_page(
+        self, filter_: dict | None = None, cursor: str | None = None
+    ) -> dict:
         """Run one query page for the given filter; return the raw Notion response."""
-        body: dict = {"filter": filter_, "page_size": 100}
+        body: dict = {"page_size": 100}
+        if filter_:
+            body["filter"] = filter_
         if cursor:
             body["start_cursor"] = cursor
         resp = await self._request(
@@ -112,7 +126,7 @@ class NotionClient:
         )
         return resp.json()
 
-    async def _query_all(self, filter_: dict) -> list[Entry]:
+    async def _query_all(self, filter_: dict | None = None) -> list[Entry]:
         """Page through every row matching `filter_` and parse each into an Entry.
 
         Notion caps `page_size` at 100 and returns `has_more`/`next_cursor`; the backfill is
@@ -141,6 +155,46 @@ class NotionClient:
         """
         return await self._query_all(_AWAITING_INPUT_FILTER)
 
+    async def list_watchlist(self, unwatched: bool = False) -> list[Entry]:
+        """Return visible Entries, optionally only those explicitly marked unwatched.
+
+        Missing Watched values are unknown and are deliberately excluded from the unwatched
+        projection.
+        """
+        entries = await self._query_all(
+            {"property": PROP_WATCHED, "checkbox": {"equals": False}} if unwatched else None
+        )
+        return [entry for entry in entries if not unwatched or entry.watched is False]
+
+    async def ensure_schema(self, *, create_identity: bool = False) -> dict:
+        """Validate the conversational properties and optionally add the IMDb ID property.
+
+        Schema mutation is opt-in and should only be called by an explicit migration action.
+        """
+        resp = await self._request("GET", f"/data_sources/{self._data_source_id}")
+        schema = resp.json()
+        properties = schema.get("properties", {})
+        watched = properties.get(PROP_WATCHED, {})
+        if watched.get("type") != "checkbox":
+            raise ValueError(f"Notion property {PROP_WATCHED!r} must be a checkbox")
+        identity = properties.get(PROP_IMDB_ID, {})
+        if identity.get("type") == "rich_text":
+            self.identity_enabled = True
+            return schema
+        if identity:
+            raise ValueError(f"Notion property {PROP_IMDB_ID!r} must be rich_text")
+        if not create_identity:
+            raise ValueError(
+                f"Notion property {PROP_IMDB_ID!r} is missing; run the explicit migration"
+            )
+        updated = await self._request(
+            "PATCH",
+            f"/data_sources/{self._data_source_id}",
+            json={"properties": {PROP_IMDB_ID: {"rich_text": {}}}},
+        )
+        self.identity_enabled = True
+        return updated.json()
+
     async def get_entry(self, page_id: str) -> Entry:
         """Fetch and parse a single Entry by its Notion page id."""
         resp = await self._request("GET", f"/pages/{page_id}")
@@ -156,14 +210,81 @@ class NotionClient:
         equality: this catches an exact re-add but not variant spellings, exactly as ADR 0012
         scopes dedupe. Returns the first exact match, or None.
         """
+        entries = await self.find_all_by_title(title)
+        return entries[0] if entries else None
+
+    async def find_all_by_title(self, title: str) -> list[Entry]:
+        """Return all case-insensitive exact title matches for conservative legacy handling."""
         key = title.strip().lower()
         if not key:
-            return None
+            return []
         filter_ = {"property": PROP_TITLE, "title": {"contains": title.strip()}}
-        for entry in await self._query_all(filter_):
-            if (entry.title or "").strip().lower() == key:
-                return entry
-        return None
+        return [
+            entry
+            for entry in await self._query_all(filter_)
+            if (entry.title or "").strip().lower() == key
+        ]
+
+    async def find_by_imdb_id(self, imdb_id: str) -> Entry | None:
+        """Find an Entry with the exact stored IMDb Identity, including completed pages."""
+        key = imdb_id.strip()
+        if not key:
+            return None
+        entries = await self._query_all(
+            {"property": PROP_IMDB_ID, "rich_text": {"equals": key}}
+        )
+        return next((entry for entry in entries if entry.imdb_id == key), None)
+
+    async def create_resolved_entry(
+        self, *, title: str, media_type: str, imdb_id: str
+    ) -> dict:
+        """Create a pending page with identity already stored; reconcile uncertain POSTs.
+
+        A failed or timed out POST is never repeated blindly. We query the identity property to
+        discover a successful remote create; if it cannot be confirmed, return ``uncertain``.
+        """
+        notion_type = notion_type_value(media_type)
+        if notion_type is None:
+            raise ValueError(f"Unsupported media type: {media_type!r}")
+        props = enrichment_properties(status="pending")
+        props.update(
+            {
+                PROP_TITLE: {"title": [{"text": {"content": title.strip()}}]},
+                PROP_TYPE: {"select": {"name": notion_type}},
+                PROP_IMDB_ID: {"rich_text": [{"text": {"content": imdb_id}}]},
+            }
+        )
+        body = {
+            "parent": {"type": "data_source_id", "data_source_id": self._data_source_id},
+            "properties": props,
+        }
+        try:
+            response = await self._request("POST", "/pages", json=body)
+            entry = Entry.from_page(response.json())
+            return {"status": "created", "entry": entry}
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                raise
+            try:
+                existing = await self.find_by_imdb_id(imdb_id)
+            except Exception:
+                existing = None
+            if existing is not None:
+                return {"status": "existing", "entry": existing}
+            return {"status": "uncertain", "error": exc}
+
+    async def update_watched(self, page_id: str, watched: bool) -> Entry:
+        response = await self._request(
+            "PATCH",
+            f"/pages/{page_id}",
+            json={"properties": {PROP_WATCHED: {"checkbox": watched}}},
+        )
+        return Entry.from_page(response.json())
+
+    async def soft_remove(self, page_id: str) -> Entry:
+        """Archive the Notion page so removal remains recoverable."""
+        response = await self._request("PATCH", f"/pages/{page_id}", json={"archived": True})
+        return Entry.from_page(response.json())
 
     async def create_entry(self, title: str) -> Entry:
         """Create a new Watchlist page (Phase 9 / ADR 0012): Entry only, `Type` blank, pending.

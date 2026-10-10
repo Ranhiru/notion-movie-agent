@@ -350,6 +350,13 @@ def _configure_logging(mode: str) -> None:
     log.info("logging to %s", log_path)
 
 
+async def _watchlist_schema(create_identity: bool) -> None:
+    """Read the live schema, adding IMDb ID only on an explicit migration command."""
+    async with NotionClient(get_settings()) as client:
+        await client.ensure_schema(create_identity=create_identity)
+    print("Watchlist schema verified (Watched checkbox and IMDb ID rich_text).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -391,6 +398,16 @@ def main() -> None:
         help="run one reconcile sweep over the whole Watchlist (Phase 3 'run now')",
     )
     parser.add_argument(
+        "--prepare-watchlist",
+        action="store_true",
+        help="verify live schema and add the missing IMDb ID rich_text property",
+    )
+    parser.add_argument(
+        "--check-watchlist-schema",
+        action="store_true",
+        help="verify live Watched/IMDb ID schema without changing it",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="run the in-process reconcile cron until interrupted (Phase 3)",
@@ -418,6 +435,8 @@ def main() -> None:
     if args.generate_graph:
         _configure_logging("graph")
         asyncio.run(_generate_graph())
+    elif args.prepare_watchlist or args.check_watchlist_schema:
+        asyncio.run(_watchlist_schema(args.prepare_watchlist))
     elif args.serve:
         _configure_logging("serve")
         try:

@@ -59,3 +59,61 @@ docker compose up --build # start the always-on agent
 
 Verify durability: create an ambiguous Entry → it goes `awaiting_input` → `docker compose
 restart` mid-wait → the paused graph resumes from the volume-backed `.sqlite`.
+
+## Conversational Movie Bot
+
+Configure `OPENAI_AGENT_MODEL` with a tool-calling model and `SLACK_OWNER_USER_ID` with
+your Slack user ID. An empty agent-model setting retains the existing add/run behavior.
+The agent uses the existing endpoint, API key, retry policy, and optional reasoning setting.
+
+Verify the live schema, then explicitly add the missing `IMDb ID` rich-text property:
+
+```bash
+uv run python -m notion_db_updater --check-watchlist-schema
+uv run python -m notion_db_updater --prepare-watchlist
+```
+
+The preparation command validates the existing `Watched` checkbox and adds only a missing
+identity property. Existing Entries without identity are handled conservatively: a matching
+legacy title or alias requires clarification instead of a duplicate Add. The check is bounded
+to 25 unidentified legacy Entries; unresolved titles require verification first. Set a verified IMDb ID on
+that Entry in Notion before retrying or refreshing it. Pending sweep Entries populate their
+identity during Enrichment once conversations are enabled.
+
+Slack needs `app_mention` plus message subscriptions for the channel types you use:
+`message.channels` / `channels:history` for public channels, `message.groups` /
+`groups:history` for private channels, or `message.im` / `im:history` for DMs. Retain existing
+`app_mentions:read` and `chat:write` scopes, Socket Mode, and interactivity. Reinstall the app
+after changing scopes. See [Slack message events](https://docs.slack.dev/reference/events/message.channels/).
+
+Mention the bot to start, then reply normally within that thread:
+
+- `@Movie Bot add Lone Survivor and Black Hawk Down`
+- `@Movie Bot add the movies from https://example.com/list`
+- `@Movie Bot give me some unwatched recommendations`
+- `mark the second one watched`, `remove Black Hawk Down`, or `refresh Lone Survivor`
+
+All writes are staged before execution. Four or more distinct Entries across a request
+require approval; every URL Import requires a preview. Ambiguous write intent also gets a
+preview. Reply with the displayed `approve <token>` command, optionally selecting action
+numbers (`approve <token> 1,3`). Approval expires after 30 minutes and applies only once to
+that exact plan. Removal moves an Entry to Notion trash, and refresh preserves viewing
+state, title, type, and identity. Requests and references persist in the checkpoint database.
+
+Default recommendations use up to five existing unchecked Watched Entries. Explicit discovery
+can search outside the Watchlist; suggestions do not Add anything. Web research uses Tavily
+and cites its evidence. Initial limits are three searches and 25 staged actions per request;
+the supplied HTML page is retrieved once, without following other pages. Page retrieval
+rejects private network addresses and rechecks redirects, with a 1 MB body ceiling and a
+64,000-character agent-context ceiling. Limits are reported with an explicit continuation
+option. Raise the configuration ceilings deliberately after evaluating behavior.
+
+```bash
+make test             # deterministic tools/approvals/recovery and real graph fixtures
+make check            # formatting, lint, types
+make evaluate-agent   # opt-in real model calls; fixture tools, no Slack/Notion writes
+```
+
+Model evaluation and controlled Slack/Notion test-database verification are separate from
+deterministic tests. An interrupted external write with an unconfirmed outcome is reported
+as uncertain and is never blindly repeated. Inspect current Watchlist state before retrying.

@@ -30,16 +30,38 @@ _Avoid_: leftover, missed row
 
 **Origin**:
 Where an Entry entered the system — `sweep` (a row added in Notion, discovered by reconcile)
-or `slack` (typed via `@NotionMovieAgent add <name>`). Both produce the same pending Entry and run the
-same enrichment; Origin only governs whether the run reports its result back to Slack on
-completion.
+or `slack` (requested through the bot). Origin distinguishes where Enrichment reports its
+result; both paths enrich a Watchlist Entry.
 _Avoid_: source (means a Provider/Lane here), trigger
 
 **Add**:
-Originating an Entry from Slack via `@NotionMovieAgent add <name>`: create the Notion page the
-user would have typed, then enrich it. A second entry point alongside the Notion row, not a
-replacement.
+Originating an Entry in the Watchlist at the user's request, followed by Enrichment.
 _Avoid_: import, create row, app mention (the mechanism, not the act)
+
+**Recommendation**:
+A suggested Entry for the user to watch; by default it comes from their existing unwatched
+Watchlist. A Recommendation does not itself authorize an Add.
+_Avoid_: pick (used for Disambiguation), Candidate (an identity match)
+
+**Watched**:
+The user's recorded viewing state for an Entry, represented by the Watchlist's existing
+checkbox. Its value is authoritative when deciding whether an Entry is unwatched.
+_Avoid_: done (an Enrichment Status), Enrichment Status (metadata completion)
+
+**URL Import**:
+Adding the user's selected movies or TV shows from a preview of a list extracted from a
+web page. The page provides titles; the user's selection authorizes the Adds.
+_Avoid_: scraping (the retrieval mechanism), Enrichment (fills an existing Entry)
+
+**IMDb Identity**:
+The IMDb identifier of a specific movie or TV show, used to recognize the same work across
+different names and distinguish different works sharing a name.
+_Avoid_: title (a name can be ambiguous), page ID (identifies an Entry)
+
+**Action Plan**:
+The complete set of proposed Watchlist changes for one user request. Approval authorizes
+only the exact actions and Entries displayed in that plan.
+_Avoid_: tool call (one mechanism within a request), batch (can span several tool calls)
 
 **Lane**:
 One of the two source strategies feeding the merge step, run in parallel:

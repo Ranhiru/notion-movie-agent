@@ -409,6 +409,7 @@ class SlackTransport:
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
         self._runtime = runtime
+        self._owner = settings.SLACK_OWNER_USER_ID
         # Socket Mode needs no signing secret (no inbound HTTP). The bot token authorizes
         # chat.postMessage / chat.update; the app token opens the WebSocket.
         self._app = AsyncApp(token=settings.SLACK_BOT_TOKEN)
@@ -426,6 +427,8 @@ class SlackTransport:
             data = json.loads(action["value"])
             page_id, imdb_id = data["page_id"], data["imdb_id"]
             user = body.get("user", {}).get("id")
+            if self._owner and user != self._owner:
+                return
             picked = action.get("text", {}).get("text") or imdb_id  # the button label
             channel, ts = body["channel"]["id"], body["message"]["ts"]
             logger.info("slack: pick %s for page %s by %s", imdb_id, page_id, user)
@@ -467,6 +470,8 @@ class SlackTransport:
             await ack()
             channel, ts = body["channel"]["id"], body["message"]["ts"]
             user = body.get("user", {}).get("id")
+            if self._owner and user != self._owner:
+                return
             block_id = action.get("block_id", "")
             page_id = block_id[len(_MANUAL_BLOCK_PREFIX) :]
             raw = (action.get("value") or "").strip()
@@ -519,10 +524,26 @@ class SlackTransport:
             team_id = body.get("team_id") or event.get("team")
             await self._handle_mention(event, say, logger, set_status, team_id)
 
+        @self._app.event("message")
+        async def handle_thread(body, event, say) -> None:  # noqa: ANN001
+            if not event.get("thread_ts") or re.match(r"^\s*<@", event.get("text", "")):
+                return
+            if getattr(self._runtime, "conversation", None) is not None:
+                self._schedule_conversation(
+                    event, say, body.get("team_id") or event.get("team")
+                )
+
     async def _handle_mention(
         self, event, say, logger, set_status=None, team_id: str | None = None
     ) -> None:  # noqa: ANN001
         """Handle one app mention without coupling tests to Bolt's listener registry."""
+        conversation = getattr(self._runtime, "conversation", None)
+        if conversation is not None:
+            self._schedule_conversation(event, say, team_id)
+            return
+        owner = getattr(self, "_owner", "")
+        if owner and event.get("user") != owner:
+            return
         parsed = parse_mention_command(event.get("text", ""))
         if parsed is None:
             await say("Mention me with `add <title>` or `run`.")
@@ -570,6 +591,19 @@ class SlackTransport:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _schedule_conversation(self, event, say, team_id=None) -> None:  # noqa: ANN001
+        task = asyncio.create_task(self.handle_conversation(event, say, team_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def handle_conversation(self, event, say, team_id=None) -> None:  # noqa: ANN001
+        """Reply in the originating thread using the durable conversation Runtime."""
+        conversation = self._runtime.conversation
+        assert conversation is not None
+        response = await conversation.handle(event, team_id)
+        if response is not None:
+            await say(text=response, thread_ts=event.get("thread_ts") or event.get("ts"))
 
     async def _add_flow(
         self,
@@ -692,5 +726,8 @@ class SlackTransport:
 
     async def start(self) -> None:
         """Open the Socket Mode WebSocket and process events until cancelled."""
+        if self._runtime.conversation is not None:
+            for reply in await self._runtime.conversation.recover():
+                await self._app.client.chat_postMessage(**reply)
         log.info("slack: starting Socket Mode listener")
         await self._handler.start_async()
