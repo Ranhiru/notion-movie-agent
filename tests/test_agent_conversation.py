@@ -85,7 +85,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         return say.await_args.kwargs["text"]
 
     async def test_agent_resolves_and_stages_before_runtime_add(self) -> None:
-        result = await self._send("Add Lone Survivor", ts="1", mention=True)
+        result = await self._send("Add Lone Survivor", ts="1")
         self.assertIn("Lone Survivor", result)
         self.assertEqual(self.runtime.writes, [("add", "tt1091191")])
 

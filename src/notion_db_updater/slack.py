@@ -1,13 +1,13 @@
 """Slack Bolt (Socket Mode) transport — the app's only inbound path (ADR 0009 / 0010).
 
 A single outbound WebSocket carries all inbound interaction, so there's no public HTTP endpoint
-(works in local Docker). Three jobs:
+(works in local Docker). Two jobs:
 
 1. **HITL disambiguation (ADR 0006):** when a reconcile run pauses at `interrupt()`, `Runtime`
    calls `post_picker` — a Block Kit prompt of the OMDb candidates is posted to
    `#notion-movie-db`. The button click resumes the paused graph with the chosen imdbID.
-2. **Watchlist conversations:** app mentions and replies in the originating thread go through
-   the conversational agent. Its tools read Watchlist data, stage user-requested changes, and
+2. **Watchlist conversations:** configured-channel roots, app mentions, and thread replies
+   go through the conversational agent. Its tools read data, stage user-requested changes, and
    run an explicit reconcile sweep through the shared `Runtime`.
 
 `Runtime` and this transport are mutually referential — the sweep posts *to* Slack (via
@@ -334,6 +334,7 @@ class SlackTransport:
 
     def __init__(self, settings: Settings, runtime: Runtime) -> None:
         self._channel = settings.SLACK_CHANNEL
+        self._channel_names: dict[str, str] = {}
         self._runtime = runtime
         # Socket Mode needs no signing secret (no inbound HTTP). The bot token authorizes
         # chat.postMessage / chat.update; the app token opens the WebSocket.
@@ -438,17 +439,57 @@ class SlackTransport:
         @self._app.event("app_mention")
         async def handle_mention(body, event, say) -> None:  # noqa: ANN001
             """Dispatch app mentions through the conversational assistant."""
+            # The message listener owns roots here, including their app_mention duplicate.
+            if (
+                getattr(self._runtime, "conversation", None) is not None
+                and not event.get("thread_ts")
+                and await self._is_conversation_channel(event.get("channel", ""))
+            ):
+                return
             team_id = body.get("team_id") or event.get("team")
             await self._handle_mention(event, say, team_id)
 
         @self._app.event("message")
-        async def handle_thread(body, event, say) -> None:  # noqa: ANN001
-            if not event.get("thread_ts") or re.match(r"^\s*<@", event.get("text", "")):
-                return
-            if getattr(self._runtime, "conversation", None) is not None:
-                self._schedule_conversation(
-                    event, say, body.get("team_id") or event.get("team")
+        async def handle_message(body, event, say) -> None:  # noqa: ANN001
+            await self._handle_message(event, say, body.get("team_id") or event.get("team"))
+
+    async def _is_conversation_channel(self, channel: str) -> bool:
+        if not channel:
+            return False
+        if self._channel == channel:
+            return True
+        if re.fullmatch(r"[CG][A-Z0-9]+", self._channel):
+            return False
+        if channel not in self._channel_names:
+            try:
+                response = await self._app.client.conversations_info(channel=channel)
+                channel_info = response["channel"]
+                if not isinstance(channel_info, dict) or not isinstance(
+                    name := channel_info.get("name"), str
+                ):
+                    raise ValueError("Slack returned no channel name")
+                self._channel_names[channel] = name
+            except Exception:
+                log.exception(
+                    "Could not identify Slack channel %s; skipping automatic start", channel
                 )
+                return False
+        return self._channel_names[channel] == self._channel.removeprefix("#")
+
+    async def _handle_message(self, event, say, team_id: str | None = None) -> None:  # noqa: ANN001
+        if (
+            getattr(self._runtime, "conversation", None) is None
+            or event.get("bot_id")
+            or event.get("subtype")
+            or not all(event.get(k) for k in ("channel", "ts", "text"))
+        ):
+            return
+        if event.get("thread_ts"):
+            if re.match(r"^\s*<@", event["text"]):
+                return
+        elif not await self._is_conversation_channel(event["channel"]):
+            return
+        self._schedule_conversation(event, say, team_id)
 
     async def _resolve_picker(self, page_id, imdb_id, user, channel, ts, client) -> None:
         result = await self._runtime.resume(page_id, imdb_id)

@@ -88,16 +88,21 @@ Slack needs `app_mention` plus message subscriptions for the channel types you u
 `app_mentions:read` and `chat:write` scopes, Socket Mode, and interactivity. Reinstall the app
 after changing scopes. See [Slack message events](https://docs.slack.dev/reference/events/message.channels/).
 
-Mention the bot to start, then reply normally within that thread.
+Post a message in `SLACK_CHANNEL` (default `#notion-movie-db`) to start without tagging
+the bot, then reply normally within that thread. Each root message starts a separate
+conversation. Elsewhere, mention the bot to start. Invite the bot to the configured channel.
+`SLACK_CHANNEL` accepts a channel ID or a name with or without `#`. Name matching needs
+`channels:read` for public channels or `groups:read` for private channels; using a channel
+ID avoids this lookup. If name lookup fails, automatic starts are skipped and logged.
 
 Each request shows a working message in its thread. Real tool operations update that message
 with progress such as web searches and IMDb matching; the final answer replaces it.
 The native working indicator uses agent session status, with assistant thread status as a
 fallback when the session API is unavailable. Long requests refresh the indicator every minute.
 
-- `@Movie Bot add Lone Survivor and Black Hawk Down`
-- `@Movie Bot add the movies from https://example.com/list`
-- `@Movie Bot give me some unwatched recommendations`
+- `add Lone Survivor and Black Hawk Down`
+- `add the movies from https://example.com/list`
+- `give me some unwatched recommendations`
 - `mark the second one watched`, `remove Black Hawk Down`, or `refresh Lone Survivor`
 
 All writes are staged before execution. Four or more distinct Entries across a request
