@@ -206,6 +206,48 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Movie tt0000001", reply.call_args.kwargs["text"])
         self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
 
+    async def test_untagged_roots_have_separate_context_and_preserve_thread_references(self):
+        await self.runtime.add_resolved("tt0000001", "fixture")
+        await self.runtime.add_resolved("tt0000002", "fixture")
+        self.scripts.append(
+            ([], Reply(text="First recommendation", references=["page-tt0000001"]))
+        )
+        root = {"channel": "C", "ts": "1", "user": "owner", "text": "recommend a movie"}
+        reply = AsyncMock()
+        await self.transport.handle_conversation(root, reply, "T")
+        self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
+        self.scripts.append(
+            ([], Reply(text="Second recommendation", references=["page-tt0000002"]))
+        )
+        await self.transport.handle_conversation(root | {"ts": "2"}, reply, "T")
+        self.assertEqual(
+            self.conversation._load("thread:T:C:1")["references"], ["page-tt0000001"]
+        )
+        self.assertEqual(
+            self.conversation._load("thread:T:C:2")["references"], ["page-tt0000002"]
+        )
+        self.restart()
+        self.scripts.append(
+            ([], Reply(text="Continuing first", references=["page-tt0000001"]))
+        )
+        await self.transport.handle_conversation(
+            root | {"ts": "3", "thread_ts": "1", "text": "tell me more"}, reply, "T"
+        )
+        self.assertEqual(reply.call_args.kwargs["thread_ts"], "1")
+
+    async def test_untagged_reply_cannot_start_an_unrelated_thread(self):
+        result = await self.conversation.handle(
+            {"channel": "C", "ts": "2", "thread_ts": "1", "text": "recommend a movie"}, "T"
+        )
+        self.assertIsNone(result)
+
+    async def test_duplicate_untagged_root_does_not_repeat_writes(self):
+        self.stage_adds(1)
+        event = {"channel": "C", "ts": "1", "text": "add Lone Survivor", "user": "owner"}
+        await self.transport.handle_conversation(event, AsyncMock(), "T")
+        await self.transport.handle_conversation(event, AsyncMock(), "T")
+        self.assertEqual(self.runtime.writes, [("add", "tt0000001")])
+
     async def test_staged_single_add_does_not_require_command_keywords(self):
         self.scripts.append([Action(operation="add", imdb_id="tt0000001")])
         reply = await self.mention("I would like Lone Survivor on my Watchlist.")

@@ -1,4 +1,4 @@
-# Slack (Bolt + Socket Mode) as the only inbound path: HITL picks + mention commands
+# Slack (Bolt + Socket Mode) as the only inbound path: HITL picks + conversations
 
 The app uses the **Slack Bolt** framework in **Socket Mode** — a single outbound WebSocket
 to Slack that carries *all* inbound interaction, so the build needs no public HTTP endpoint
@@ -13,6 +13,18 @@ to Slack that carries *all* inbound interaction, so the build needs no public HT
    listener and starts the out-of-band create-then-enrich flow ([0012](./0012-slack-add-command-second-entry-point.md)).
 
 ## Tokens & config
+
+Root human text messages in `SLACK_CHANNEL` (default `#notion-movie-db`) now start
+Watchlist conversations without a mention. Replies stay in the originating thread;
+plain replies continue existing conversations. Mentions elsewhere retain their behavior.
+The message listener owns configured-channel roots, including tagged roots, so their
+duplicate `app_mention` event does not schedule another response.
+
+Subscribe to `message.channels` with `channels:history` for public channels, or
+`message.groups` with `groups:history` for private channels, and invite the bot to the channel.
+Channel-name matching uses cached `conversations.info` results and requires `channels:read`
+or `groups:read`; configured channel IDs bypass lookup. Failed lookups skip automatic
+starts without broadening channel access. Reinstall the app after changing scopes.
 
 - **`SLACK_BOT_TOKEN`** (`xoxb-…`) and **`SLACK_APP_TOKEN`** (`xapp-…`, scope
   `connections:write`) — both required for Bolt Socket Mode. Socket Mode + Interactivity must

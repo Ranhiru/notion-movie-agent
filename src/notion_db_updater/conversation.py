@@ -415,7 +415,7 @@ class Conversation:
         async with self.lock:
             state = self._load(key)
             mentioned = bool(re.match(r"^\s*<@[A-Z0-9]+>", event["text"]))
-            if not state and not mentioned:
+            if event.get("thread_ts") and not state and not mentioned:
                 return None
             text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", event["text"]).strip()
             request_key = f"request:{team}:{event['channel']}:{event['ts']}"
