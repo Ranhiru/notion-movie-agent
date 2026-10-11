@@ -31,6 +31,10 @@ returned by resolve_title for the requested work. If identity is uncertain,
 ask a concise question and stage nothing for that Entry. Preserve compound names as one title
 unless the user clearly listed separate works. Resolve same-name works with the user instead
 of guessing.
+When the user must choose an identity, put the exact resolve_title query in
+Reply.disambiguations. Slack renders its returned candidates as an interactive card,
+including manual IMDb input when none match. Do not repeat the candidates as a text list.
+Leave disambiguations empty for queries already resolved or not needing a user choice.
 
 For a numbered follow-up, call resolve_reference with the 1-based number before acting. Use
 only the page ID returned by that tool. For removal, watched-state changes, and refresh, use

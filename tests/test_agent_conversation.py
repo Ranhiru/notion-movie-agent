@@ -103,6 +103,51 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.reconcile.assert_awaited_once_with()
         self.assertEqual(result, "The pending Entry was enriched.")
 
+    async def test_agent_clarification_reaches_slack_as_candidate_card(self) -> None:
+        self.runtime.resolve_title = AsyncMock(
+            return_value=[
+                {
+                    "title": "Dark Matter",
+                    "year": 2024,
+                    "media_type": "TV Show",
+                    "imdb_id": "tt19231492",
+                    "poster": "https://example.com/poster.jpg",
+                },
+                {
+                    "title": "Dark Matter",
+                    "year": 2015,
+                    "media_type": "TV Show",
+                    "imdb_id": "tt4159076",
+                },
+            ]
+        )
+        self.conversation.planner = self._planner(
+            tool_call("resolve_title", {"query": "Dark Matter"}, "resolve-dark"),
+            tool_call(
+                "Reply",
+                {
+                    "text": "Which Dark Matter did you mean?",
+                    "disambiguations": ["Dark Matter"],
+                },
+                "reply-dark",
+            ),
+        )
+        client = self.transport._app.client
+        client.chat_postMessage.return_value = {"ts": "progress"}
+        event = {
+            "text": "<@BOT> Add Dark Matter",
+            "channel": "C",
+            "user": "owner",
+            "ts": "dark",
+            "team": "T",
+        }
+        await self.transport.handle_conversation(event, AsyncMock(), "T")
+        blocks = client.chat_update.await_args.kwargs["blocks"]
+        buttons = next(b for b in blocks if b["type"] == "actions")["elements"]
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(all(b["action_id"].startswith("conversation:pick:") for b in buttons))
+        self.assertEqual(self.runtime.writes, [])
+
     async def test_unverified_imdb_identity_still_requires_clarification(self) -> None:
         self.conversation.planner = self._planner(
             tool_call("add_entry", {"imdb_id": "tt9999999"}, "add-invalid"),

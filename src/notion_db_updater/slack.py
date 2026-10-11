@@ -32,6 +32,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 
 from .config import Settings
+from .omdb import imdb_identity
 
 if TYPE_CHECKING:
     from .app import Runtime
@@ -46,6 +47,8 @@ _PICK_ACTION = re.compile(r"^pick:\d+$")  # one action_id per button: pick:0 …
 _APPROVAL_ACTION = re.compile(r"^watchlist:(approve|deny)$")
 _SELECTION_ACTION = "watchlist:selection"
 _IDENTITY_ACTION = re.compile(r"^identity:(confirm|deny)$")
+_CONVERSATION_PICK_ACTION = re.compile(r"^conversation:pick:\d+$")
+_CONVERSATION_MANUAL_ACTION = "conversation:manual"
 
 
 def _button(action_id: str, label: str, value: str, *, primary: bool = False) -> dict:
@@ -184,12 +187,12 @@ _IMDB_ID = re.compile(r"tt\d+")  # matches a full imdb.com/title/tt… URL or a 
 _IMDB_URL = "https://www.imdb.com/title/{}/"
 
 
-def _fmt_year(year: str | None) -> str:
+def _fmt_year(year: str | int | None) -> str:
     """OMDb `Year` for display: a plain movie year ("2021") or a series range ("2013–2017").
 
     An open-ended range ("2013–", ongoing series) reads better as "2013–present".
     """
-    y = (year or "").strip()
+    y = str(year or "").strip()
     if y.endswith(("-", "–", "—")):
         y = y[:-1].strip() + "–present"
     return y
@@ -230,7 +233,7 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     candidate `actions` block is dropped (an empty `elements` array is invalid Block Kit),
     leaving the manual-input field as the sole control.
     """
-    title = payload.get("title") or "(unknown title)"
+    title = escape(payload.get("title") or "(unknown title)", quote=False)
     best_guess = payload.get("best_guess_imdb_id")
     candidates = (payload.get("candidates") or [])[:_MAX_CANDIDATES]
 
@@ -242,7 +245,7 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}]
     for c in candidates:
         label = c.get("title") or "(untitled)"
-        bits = f"*{label}*"
+        bits = f"*{escape(label, quote=False)}*"
         year = _fmt_year(c.get("year"))
         if year:
             bits += f"  ({year})"
@@ -293,6 +296,26 @@ def build_picker_blocks(page_id: str, payload: dict) -> list[dict]:
     return blocks
 
 
+def _conversation_picker_blocks(choice: dict, thread_ts: str) -> list[dict]:
+    """Reuse the enrichment card with conversation-bound controls."""
+    blocks = build_picker_blocks("", choice)
+    binding = {
+        "request_key": choice["request_key"],
+        "token": choice["token"],
+        "thread_ts": thread_ts,
+    }
+    for block in blocks:
+        if block["type"] == "actions":
+            for button in block["elements"]:
+                identity = json.loads(button["value"])["imdb_id"]
+                button["action_id"] = "conversation:" + button["action_id"]
+                button["value"] = json.dumps(binding | {"imdb_id": identity})
+        elif block["type"] == "input":
+            block["block_id"] = json.dumps(binding)
+            block["element"]["action_id"] = _CONVERSATION_MANUAL_ACTION
+    return blocks
+
+
 def _section_blocks(text: str) -> list[dict]:
     """A one-section mrkdwn message (used to replace the picker as it resolves)."""
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
@@ -322,6 +345,12 @@ class SlackTransport:
         self._register()
 
     def _register(self) -> None:
+        @self._app.action(_CONVERSATION_PICK_ACTION)
+        @self._app.action(_CONVERSATION_MANUAL_ACTION)
+        async def handle_conversation_pick(ack, body, action, client) -> None:  # noqa: ANN001
+            await ack()
+            self._schedule(self._handle_conversation_pick(body, action, client))
+
         @self._app.action(_IDENTITY_ACTION)
         async def handle_identity(ack, body, action, client) -> None:  # noqa: ANN001
             await ack()
@@ -516,23 +545,10 @@ class SlackTransport:
             if response is None:
                 ignored = True
                 return
-            if response.startswith("Approve this exact action list"):
-                status = "suspended"
-                await reply(
-                    text=re.sub(
-                        r"^Reply `approve .*?$",
-                        "Use the Approve or Deny buttons below.",
-                        response,
-                        flags=re.MULTILINE,
-                    ),
-                    thread_ts=thread_ts,
-                    blocks=_approval_blocks(response, thread_ts),
-                )
-            else:
-                await reply(text=response, thread_ts=thread_ts)
-                for identity_reply in self._identity_replies(event, team_id):
+            for payload in self._conversation_replies(response, event, team_id):
+                if payload.get("blocks"):
                     status = "suspended"
-                    await reply(**identity_reply)
+                await reply(**payload)
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -553,6 +569,90 @@ class SlackTransport:
                 except Exception:
                     log.exception("Could not finalize conversation progress")
             await self._conversation_status(channel, thread_ts, status)
+
+    def _conversation_replies(
+        self, response: str, event: dict, team_id: str | None
+    ) -> list[dict]:
+        thread_ts = event.get("thread_ts") or event["ts"]
+        conversation = self._runtime.conversation
+        get_choices = getattr(conversation, "disambiguations", None)
+        choices = get_choices(event, team_id) if get_choices else []
+        replies = []
+        if response.startswith("Approve this exact action list"):
+            replies.append(
+                {
+                    "text": re.sub(
+                        r"^Reply `approve .*?$",
+                        "Use the Approve or Deny buttons below.",
+                        response,
+                        flags=re.MULTILINE,
+                    ),
+                    "thread_ts": thread_ts,
+                    "blocks": _approval_blocks(response, thread_ts),
+                }
+            )
+        elif not choices:
+            replies.append({"text": response, "thread_ts": thread_ts})
+        replies.extend(
+            {
+                "text": f"Which {choice['title']} did you mean?",
+                "thread_ts": thread_ts,
+                "blocks": _conversation_picker_blocks(choice, thread_ts),
+            }
+            for choice in choices
+        )
+        replies.extend(self._identity_replies(event, team_id))
+        return replies
+
+    async def _handle_conversation_pick(self, body, action, client) -> None:  # noqa: ANN001
+        manual = action["action_id"] == _CONVERSATION_MANUAL_ACTION
+        data = json.loads(action["block_id"] if manual else action["value"])
+        identity = imdb_identity(action.get("value", "")) if manual else data["imdb_id"]
+        channel = body["channel"]["id"]
+        if identity is None:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=body["user"]["id"],
+                text="Paste an IMDb title link or a bare tt… ID.",
+            )
+            return
+        event = {
+            "channel": channel,
+            "user": body["user"]["id"],
+            "thread_ts": data["thread_ts"],
+            "ts": f"choice:{data['token']}",
+        }
+        team = body.get("team", {}).get("id")
+        status = "active"
+        await self._conversation_status(channel, event["thread_ts"], "processing")
+        try:
+            conversation = self._runtime.conversation
+            assert conversation is not None
+            response = await conversation.choose_candidate(
+                data["request_key"],
+                data["token"],
+                identity,
+                event,
+                team,
+                manual=manual,
+            )
+            if response is not None:
+                for index, reply in enumerate(
+                    self._conversation_replies(response, event, team)
+                ):
+                    if reply.get("blocks"):
+                        status = "suspended"
+                    if index == 0:
+                        await client.chat_update(
+                            channel=channel,
+                            ts=body["message"]["ts"],
+                            text=reply["text"],
+                            blocks=reply.get("blocks", []),
+                        )
+                    else:
+                        await client.chat_postMessage(channel=channel, **reply)
+        finally:
+            await self._conversation_status(channel, event["thread_ts"], status)
 
     def _identity_replies(self, event: dict, team_id: str | None) -> list[dict]:
         get_confirmations = getattr(self._runtime.conversation, "identity_confirmations", None)

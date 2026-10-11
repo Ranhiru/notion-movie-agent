@@ -29,6 +29,10 @@ class Action(BaseModel):
 class Reply(BaseModel):
     text: str
     references: list[str] = Field(default_factory=list)
+    disambiguations: list[str] = Field(
+        default_factory=list,
+        description="Exact resolve_title queries needing the user's choice; no Add staged.",
+    )
 
 
 @dataclass
@@ -43,6 +47,7 @@ class RequestTools:
     max_titles: int = 25
     notices: list[str] = field(default_factory=list)
     progress: Callable[[str], Awaitable[None]] | None = None
+    candidates: dict[str, list[dict]] = field(default_factory=dict)
 
     def stage(self, action: Action) -> str:
         """Propose an action; staging never performs a Watchlist write."""
@@ -73,7 +78,9 @@ class RequestTools:
 
     async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
         await _report_progress(self.progress, f"🔎 Finding an IMDb match for {query[:180]}…")
-        return await self.runtime.resolve_title(query, media_type)
+        candidates = await self.runtime.resolve_title(query, media_type)
+        self.candidates[query] = candidates
+        return candidates
 
     async def reference(self, index: int) -> dict | str:
         if not 1 <= index <= len(self.references):
@@ -204,6 +211,78 @@ class Conversation:
                 confirmation["status"] == "executing" or confirmation["expires"] > time.time()
             )
         ]
+
+    def disambiguations(self, event: dict, team_id: str | None) -> list[dict]:
+        """Return grounded, durable choices for Slack to render as candidate cards."""
+        team = team_id or event.get("team")
+        if not team:
+            return []
+        key = f"request:{team}:{event['channel']}:{event['ts']}"
+        request = self._load(key)
+        return [
+            choice | {"request_key": key}
+            for choice in request.get("disambiguations", [])
+            if not choice.get("selected_imdb_id") and choice["expires"] > time.time()
+        ]
+
+    async def choose_candidate(
+        self,
+        request_key: str,
+        token: str,
+        imdb_id: str,
+        event: dict,
+        team_id: str | None,
+        *,
+        manual: bool = False,
+    ) -> str | None:
+        """Continue the original request; a choice never bypasses planning or approval."""
+        if not team_id:
+            return None
+        async with self.lock:
+            request = self._load(request_key)
+            thread_key = f"thread:{team_id}:{event['channel']}:{event['thread_ts']}"
+            if request.get("thread_key") != thread_key:
+                return "This choice belongs to another thread."
+            choice = next(
+                (c for c in request.get("disambiguations", []) if c["token"] == token), None
+            )
+            if choice is None or choice["expires"] <= time.time():
+                return "This choice expired or is unavailable. Ask for the title again."
+            if not re.fullmatch(r"tt\d{7,12}", imdb_id) or (
+                not manual and imdb_id not in {c["imdb_id"] for c in choice["candidates"]}
+            ):
+                return "Choose one of the displayed candidates or paste a valid IMDb link."
+            selected = choice.get("selected_imdb_id")
+            if selected and selected != imdb_id:
+                return "This choice has already been used. Ask for the title again."
+            if (
+                not selected
+                and self._load(thread_key).get("disambiguation_request") != request_key
+            ):
+                return "This card was superseded by a newer request. Ask for the title again."
+            choice["selected_imdb_id"] = imdb_id
+            self._save(request_key, request)
+            follow_up = event | {
+                "ts": f"choice:{token}",
+                "text": request["text"] + f"\nFor {choice['title']}, I choose IMDb {imdb_id}.",
+            }
+            continuation_key = f"request:{team_id}:{event['channel']}:{follow_up['ts']}"
+            if not self._load(continuation_key):
+                self._save(
+                    continuation_key,
+                    {
+                        "text": follow_up["text"],
+                        "channel": event["channel"],
+                        "user": event.get("user", ""),
+                        "thread_ts": event["thread_ts"],
+                        "key": continuation_key,
+                        "thread_key": thread_key,
+                        "status": "planning",
+                        "carried_actions": request.get("actions", []),
+                        "imported": request.get("imported", False),
+                    },
+                )
+        return await self.handle(follow_up, team_id)
 
     async def decide_identity(
         self,
@@ -430,6 +509,7 @@ class Conversation:
                 max_titles=self.max_titles,
                 persist=lambda: self._save(request_key, request),
                 progress=progress,
+                actions=[Action.model_validate(a) for a in request.get("carried_actions", [])],
             )
             try:
                 reply = await self.planner(messages, context)
@@ -439,6 +519,27 @@ class Conversation:
                 }
                 if any(r not in available for r in reply.references):
                     raise ValueError("Displayed references must match available Entries")
+                if any(query not in context.candidates for query in reply.disambiguations):
+                    raise ValueError("Disambiguation requires grounded OMDb candidates")
+                request["disambiguations"] = [
+                    {
+                        "title": query,
+                        "candidates": context.candidates[query][:5],
+                        "token": secrets.token_hex(8),
+                        "expires": time.time() + 1800,
+                    }
+                    for query in dict.fromkeys(reply.disambiguations)
+                ][: self.max_titles]
+                unresolved = {
+                    c["imdb_id"]
+                    for choice in request["disambiguations"]
+                    for c in choice["candidates"]
+                }
+                context.actions = [
+                    a
+                    for a in context.actions
+                    if a.operation != "add" or a.imdb_id not in unresolved
+                ]
                 actions = await self._prepare(context)
             except Exception:
                 log.exception("Conversation planning failed")
@@ -451,7 +552,12 @@ class Conversation:
                 action.get("imdb_id") or action.get("page_id") or str(index)
                 for index, action in enumerate(actions)
             }
-            if actions and (
+            if request["disambiguations"]:
+                # Keep the complete plan intact until identity choices are resolved, so
+                # clarifying one title cannot split a bulk request below approval limits.
+                request["status"] = "clarifying"
+                response = reply.text
+            elif actions and (
                 re.search(r"https?://", text)
                 or request.get("imported")
                 or len(affected_entries) >= 4
@@ -477,6 +583,7 @@ class Conversation:
                 references = reply.references or state.get("references", [])
             state.update(
                 identity_request=request_key,
+                disambiguation_request=request_key,
                 messages=messages + [{"role": "assistant", "content": response}],
                 references=references,
             )

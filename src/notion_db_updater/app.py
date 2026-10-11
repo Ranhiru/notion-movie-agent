@@ -491,6 +491,7 @@ class Runtime:
                 "year": parse_year(candidate.year),
                 "imdb_id": candidate.imdb_id,
                 "media_type": self._canonical_media_type(candidate.media_type),
+                "poster": candidate.poster,
             }
             for candidate in candidates
         ]
