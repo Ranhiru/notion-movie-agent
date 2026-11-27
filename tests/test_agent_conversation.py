@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +13,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 
 from notion_db_updater.agent import build_planner
-from notion_db_updater.conversation import Conversation
+from notion_db_updater.conversation import Action, Conversation, RequestTools
 from notion_db_updater.evaluation import FixtureResearchClient, FixtureRuntime
 from notion_db_updater.slack import SlackTransport
 
@@ -80,9 +82,12 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         if thread_ts and not mention:
             event["thread_ts"] = thread_ts
         await self.transport.handle_conversation(event, say, "T")
-        if say.await_args is None:
-            raise AssertionError("Slack transport produced no reply")
-        return say.await_args.kwargs["text"]
+        if say.await_args is not None:
+            return say.await_args.kwargs["text"]
+        update = self.transport._app.client.chat_update.await_args
+        if update is not None:
+            return update.kwargs["text"]
+        raise AssertionError("Slack transport produced no reply")
 
     async def test_agent_resolves_and_stages_before_runtime_add(self) -> None:
         result = await self._send("Add Lone Survivor", ts="1")
@@ -146,6 +151,160 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         buttons = next(b for b in blocks if b["type"] == "actions")["elements"]
         self.assertEqual(len(buttons), 2)
         self.assertTrue(all(b["action_id"].startswith("conversation:pick:") for b in buttons))
+        self.assertEqual(self.runtime.writes, [])
+
+    async def test_six_film_resolution_loop_returns_grounded_slack_choices(self) -> None:
+        titles = ["Anora", "Nomandland", "Parasite", "The Shape of Water", "Moonlight", "Argo"]
+        identities = {
+            title: {"title": title, "year": 2024, "imdb_id": f"tt{index:07}"}
+            for index, title in enumerate(titles, 1)
+        }
+        identities["Nomadland"] = identities.pop("Nomandland") | {"title": "Nomadland"}
+
+        async def resolve(query: str, media_type: str | None = None) -> list[dict]:
+            return [identities[query]] if query in identities else []
+
+        self.runtime.resolve_title = AsyncMock(side_effect=resolve)
+        self.conversation.planner = self._planner(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "resolve_title", "args": {"query": title}, "id": f"r-{i}"}
+                    for i, title in enumerate(titles)
+                ],
+            ),
+            tool_call(
+                "resolve_title",
+                {"query": "Nomadland", "requested_title": "Nomandland"},
+                "correct-typo",
+            ),
+            tool_call(
+                "resolve_title",
+                {"query": "Anora movie 2024", "requested_title": "Anora"},
+                "embellished",
+            ),
+            tool_call(
+                "resolve_title",
+                {"query": "Anora Sean Baker", "requested_title": "Anora"},
+                "over-budget",
+            ),
+        )
+        result = await self._send("add " + ", ".join(titles), ts="six", mention=True)
+        event = {"channel": "C", "ts": "six"}
+        choices = self.conversation.disambiguations(event, "T")
+        self.assertEqual(len(choices), 6, result)
+        self.assertEqual(choices[0]["candidates"], [identities["Anora"]])
+        self.assertEqual(choices[1]["candidates"], [identities["Nomadland"]])
+        self.assertEqual(self.runtime.resolve_title.await_count, 8)
+        self.assertEqual(self.runtime.writes, [])
+
+        # Cards and the complete plan survive restart and each subsequent choice.
+        self.conversation = Conversation(
+            self.runtime, self.conversation.db_path, self.conversation.planner
+        )
+        verified = {c["imdb_id"]: c for c in identities.values()}
+        self.runtime.validate_identity = AsyncMock(
+            side_effect=lambda identity: verified[identity]
+        )
+        self.runtime.add_resolved = AsyncMock(return_value={"status": "done"})
+        for i in range(6):
+            choice = self.conversation.disambiguations(event, "T")[0]
+            remaining = list(identities.values())[i + 1 :]
+            self.conversation.planner = self._planner(
+                *[
+                    tool_call("resolve_title", {"query": c["title"]}, f"remaining-{j}")
+                    for j, c in enumerate(remaining)
+                ],
+                tool_call(
+                    "add_entry", {"imdb_id": choice["candidates"][0]["imdb_id"]}, "chosen"
+                ),
+                tool_call(
+                    "Reply",
+                    {
+                        "text": "Choose the remaining titles.",
+                        "disambiguations": [c["title"] for c in remaining],
+                    },
+                    "remaining-choices",
+                ),
+            )
+            result = await self.conversation.choose_candidate(
+                choice["request_key"],
+                choice["token"],
+                choice["candidates"][0]["imdb_id"],
+                event | {"thread_ts": "six"},
+                "T",
+            )
+            event = {"channel": "C", "ts": f"choice:{choice['token']}"}
+            self.runtime.add_resolved.assert_not_awaited()
+        self.assertIn("6. add", result)
+        token = re.search(r"`approve ([0-9a-f]{16})`", result)[1]
+        await self.conversation.handle(
+            event | {"ts": "approve-six", "thread_ts": "six", "text": f"approve {token}"},
+            "T",
+        )
+        self.assertEqual(self.runtime.add_resolved.await_count, 6)
+
+    async def test_repeated_parallel_misses_stop_with_manual_slack_input(self) -> None:
+        self.runtime.resolve_title = AsyncMock(return_value=[])
+        self.transport._app.client.chat_postMessage.return_value = {"ts": "progress"}
+        self.conversation.planner = self._planner(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "resolve_title", "args": {"query": "Missing"}, "id": f"r-{i}"}
+                    for i in range(4)
+                ],
+            )
+        )
+        result = await self._send("Add Missing", ts="missing", mention=True)
+        self.assertIn("Missing", result)
+        saved = self.conversation._load("request:T:C:missing")
+        self.assertIn("unfinished", saved["response"])
+        self.runtime.resolve_title.assert_awaited_once()
+        blocks = self.transport._app.client.chat_update.await_args.kwargs["blocks"]
+        self.assertTrue(any(b["type"] == "input" for b in blocks))
+        self.assertFalse(any(b["type"] == "actions" for b in blocks))
+        self.assertEqual(self.runtime.writes, [])
+
+    async def test_planner_limit_without_unresolved_titles_keeps_staged_actions(self) -> None:
+        self.conversation.planner = self._planner(
+            tool_call("add_entry", {"imdb_id": "tt1091191"}, "staged"),
+            *[tool_call("list_watchlist", {}, f"repeat-{i}") for i in range(60)],
+        )
+        result = await self._send("Add Lone Survivor", ts="unfinished", mention=True)
+        self.assertIn("unfinished", result)
+        saved = self.conversation._load("request:T:C:unfinished")
+        self.assertEqual(saved["status"], "clarifying")
+        self.assertEqual(len(saved["actions"]), 1)
+        self.assertEqual(self.runtime.writes, [])
+
+    async def test_25_entry_plan_fits_with_sequential_resolve_and_stage_calls(self) -> None:
+        identities = {
+            f"Movie {i}": {"title": f"Movie {i}", "imdb_id": f"tt{i:07}", "year": 2024}
+            for i in range(25)
+        }
+        verified = {c["imdb_id"]: c for c in identities.values()}
+        self.runtime.resolve_title = AsyncMock(
+            side_effect=lambda query, kind: [identities[query]]
+        )
+        self.runtime.validate_identity = AsyncMock(
+            side_effect=lambda identity: verified[identity]
+        )
+        self.conversation.planner = self._planner(
+            *[
+                call
+                for title, identity in identities.items()
+                for call in (
+                    tool_call("resolve_title", {"query": title}, f"resolve-{title}"),
+                    tool_call("add_entry", {"imdb_id": identity["imdb_id"]}, f"add-{title}"),
+                )
+            ],
+            reply_call("Ready for approval.", [], "final"),
+        )
+        result = await self._send("Add " + ", ".join(identities), ts="25", mention=True)
+        self.assertIn("25. add", result)
+        self.assertIn("Approve", result)
+        self.assertEqual(self.runtime.resolve_title.await_count, 25)
         self.assertEqual(self.runtime.writes, [])
 
     async def test_unverified_imdb_identity_still_requires_clarification(self) -> None:
@@ -228,6 +387,77 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Lone Survivor", result)
         self.assertTrue(self.runtime.entries["fixture-tt1091191"].watched)
         self.assertEqual(self.runtime.writes, [("watched", "fixture-tt1091191")])
+
+
+class ResolutionBudgetTests(unittest.IsolatedAsyncioTestCase):
+    def context(self, *, max_titles: int = 25) -> RequestTools:
+        return RequestTools(
+            SimpleNamespace(resolve_title=AsyncMock(return_value=[])),
+            {},
+            [],
+            max_titles=max_titles,
+        )
+
+    async def test_parallel_normalized_queries_and_empty_results_are_cached(self) -> None:
+        context = self.context()
+        results = await asyncio.gather(
+            context.resolve_title("Nomandland", "movie"),
+            context.resolve_title("  NOMANDLAND  ", "Movie"),
+        )
+        self.assertEqual(results, [[], []])
+        context.runtime.resolve_title.assert_awaited_once_with("Nomandland", "movie")
+        corrected = {"title": "Nomadland", "imdb_id": "tt9770150"}
+        context.runtime.resolve_title.return_value = [corrected]
+        self.assertEqual(
+            await context.resolve_title("Nomadland", "movie", "Nomandland"), [corrected]
+        )
+        await context.resolve_title("Nomadland Frances McDormand", "movie", "Nomandland")
+        self.assertTrue(context.resolution_limited)
+        self.assertEqual(context.runtime.resolve_title.await_count, 2)
+        self.assertEqual(context.candidates["Nomandland"], [corrected])
+
+    async def test_media_types_have_distinct_cached_results(self) -> None:
+        context = self.context()
+        await context.resolve_title("Dark Matter", "movie")
+        await context.resolve_title("Dark Matter", "tv")
+        await context.resolve_title("Dark Matter", "series")
+        self.assertEqual(context.runtime.resolve_title.await_count, 2)
+        self.assertFalse(context.resolution_limited)
+
+    async def test_new_labels_cannot_bypass_request_search_ceiling(self) -> None:
+        context = self.context(max_titles=2)
+        for title in ("One", "Two"):
+            await context.resolve_title(title)
+            await context.resolve_title(title + " corrected", requested_title=title)
+        await context.resolve_title("Three")
+        self.assertEqual(context.runtime.resolve_title.await_count, 4)
+        self.assertTrue(context.resolution_limited)
+        self.assertIn("unfinished", context.stop_planning().text)
+
+    async def test_model_ceiling_counts_cached_calls_and_resets_for_each_request(self) -> None:
+        model = ScriptedToolModel(
+            responses=[tool_call("resolve_title", {"query": "Missing"}, "repeat")]
+        )
+        planner = build_planner(model)
+        for _ in range(2):
+            context = self.context()
+            reply = await planner([{"role": "user", "content": "Add Missing"}], context)
+            self.assertEqual(context.model_calls, 55)
+            self.assertEqual(reply.disambiguations, ["Missing"])
+            self.assertTrue(context.planning_stopped)
+            context.runtime.resolve_title.assert_awaited_once()
+
+    async def test_fallback_retains_staged_add_and_unresolved_candidates(self) -> None:
+        context = self.context()
+        candidate = {"title": "Anora", "imdb_id": "tt28607951"}
+        context.runtime.resolve_title.return_value = [candidate]
+        await context.resolve_title("Anora")
+        context.stage(Action(operation="add", imdb_id=candidate["imdb_id"]))
+        context.runtime.resolve_title.return_value = []
+        await context.resolve_title("Nomandland")
+        reply = context.stop_planning()
+        self.assertEqual(reply.disambiguations, ["Nomandland"])
+        self.assertEqual(len(context.actions), 1)
 
 
 if __name__ == "__main__":
