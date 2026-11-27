@@ -48,6 +48,13 @@ class RequestTools:
     notices: list[str] = field(default_factory=list)
     progress: Callable[[str], Awaitable[None]] | None = None
     candidates: dict[str, list[dict]] = field(default_factory=dict)
+    model_calls: int = 0
+    resolution_limited: bool = False
+    planning_stopped: bool = False
+    _resolution_titles: dict[str, str] = field(default_factory=dict)
+    _resolution_attempts: dict[str, int] = field(default_factory=dict)
+    _resolution_cache: dict[tuple[str, str | None], list[dict]] = field(default_factory=dict)
+    _resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def stage(self, action: Action) -> str:
         """Propose an action; staging never performs a Watchlist write."""
@@ -76,11 +83,75 @@ class RequestTools:
         await _report_progress(self.progress, "🎬 Enriching pending Watchlist Entries…")
         return str(await self.runtime.reconcile())
 
-    async def resolve_title(self, query: str, media_type: str | None = None) -> list[dict]:
-        await _report_progress(self.progress, f"🔎 Finding an IMDb match for {query[:180]}…")
-        candidates = await self.runtime.resolve_title(query, media_type)
-        self.candidates[query] = candidates
-        return candidates
+    async def resolve_title(
+        self,
+        query: str,
+        media_type: str | None = None,
+        requested_title: str | None = None,
+    ) -> list[dict] | str:
+        # Serialize resolution so parallel retries share the cache and attempt budget.
+        async with self._resolution_lock:
+            title = (requested_title or query).strip()
+            key = " ".join(title.casefold().split())
+            kind = {"Movie": "movie", "TV Show": "tv", "series": "tv"}.get(
+                media_type or "", media_type
+            )
+            cache_key = (" ".join(query.casefold().split()), kind)
+            if self.resolution_limited:
+                return "Resolution limit reached; return the existing identity choices."
+            if (
+                not key
+                or not cache_key[0]
+                or (
+                    key not in self._resolution_titles
+                    and len(self._resolution_titles) >= self.max_titles
+                )
+            ):
+                self.resolution_limited = True
+                return "Requested Entry limit reached; ask for an explicit continuation."
+            title = self._resolution_titles.setdefault(key, title)
+            if cache_key not in self._resolution_cache:
+                # Two searches allow a spelling correction. More requires user input.
+                if self._resolution_attempts.get(key, 0) >= 2:
+                    self.resolution_limited = True
+                    return "Title search limit reached; ask the user to choose an identity."
+                self._resolution_attempts[key] = self._resolution_attempts.get(key, 0) + 1
+                await _report_progress(
+                    self.progress, f"🔎 Finding an IMDb match for {query[:180]}…"
+                )
+                self._resolution_cache[cache_key] = await self.runtime.resolve_title(
+                    query, media_type
+                )
+            candidates = self._resolution_cache[cache_key]
+            # Keep earlier useful Candidates when a corrected or embellished query misses.
+            merged = {c["imdb_id"]: c for c in self.candidates.get(title, [])}
+            merged.update({c["imdb_id"]: c for c in candidates})
+            self.candidates[query] = candidates
+            self.candidates[title] = list(merged.values())
+            return candidates
+
+    def stop_planning(self) -> Reply:
+        """Produce a grounded fallback without trusting another model call to stop."""
+        self.planning_stopped = True
+        staged_ids = {a.imdb_id for a in self.actions if a.operation == "add"}
+        unresolved = [
+            title
+            for title in self._resolution_titles.values()
+            if not any(c["imdb_id"] in staged_ids for c in self.candidates.get(title, []))
+        ]
+        return Reply(
+            text=(
+                "I stopped repeated planning attempts. Nothing was changed. "
+                "The complete request is still unfinished. "
+                + (
+                    "Choose the identities below, or provide IMDb links. "
+                    "If any requested titles are missing, include them in your next reply."
+                    if unresolved
+                    else "Please clarify or explicitly retry the complete request."
+                )
+            ),
+            disambiguations=unresolved,
+        )
 
     async def reference(self, index: int) -> dict | str:
         if not 1 <= index <= len(self.references):
@@ -552,7 +623,7 @@ class Conversation:
                 action.get("imdb_id") or action.get("page_id") or str(index)
                 for index, action in enumerate(actions)
             }
-            if request["disambiguations"]:
+            if request["disambiguations"] or context.planning_stopped:
                 # Keep the complete plan intact until identity choices are resolved, so
                 # clarifying one title cannot split a bulk request below approval limits.
                 request["status"] = "clarifying"

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
 from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
@@ -31,6 +33,11 @@ returned by resolve_title for the requested work. If identity is uncertain,
 ask a concise question and stage nothing for that Entry. Preserve compound names as one title
 unless the user clearly listed separate works. Resolve same-name works with the user instead
 of guessing.
+Search title text only: do not append actors, directors, or words such as "movie" or "film".
+Keep requested_title equal to the original requested name across all searches for that Entry,
+including aliases and spelling corrections. Reuse Candidates already returned. After an empty
+result, you may try one corrected spelling; otherwise ask the user to choose an identity.
+Do not keep searching query variants when Candidates are ambiguous or searches miss.
 When the user must choose an identity, put the exact resolve_title query in
 Reply.disambiguations. Slack renders its returned candidates as an interactive card,
 including manual IMDb input when none match. Do not repeat the candidates as a text list.
@@ -82,9 +89,15 @@ async def resolve_title(
     query: str,
     runtime: ToolRuntime[RequestTools],
     media_type: str | None = None,
+    requested_title: str | None = None,
 ) -> Any:
-    """Resolve a movie or TV title with OMDb and return candidate IMDb identities."""
-    return await runtime.context.resolve_title(query, media_type)
+    """Search title text in OMDb; reuse Candidates or ask the user when uncertain.
+
+    requested_title is the original requested name, unchanged for aliases/corrections.
+    query is title text only, without actors, directors, or descriptive search keywords.
+    At most two distinct searches per requested Entry; identical queries are cached.
+    """
+    return await runtime.context.resolve_title(query, media_type, requested_title)
 
 
 @tool
@@ -154,6 +167,24 @@ _TOOLS = [
 ]
 
 
+class _PlanningLimitReached(Exception):
+    """Stop the graph at the model boundary after all parallel tools have returned."""
+
+
+@wrap_model_call
+async def _bound_planning(
+    request: ModelRequest[RequestTools],
+    handler: Callable[[ModelRequest[RequestTools]], Awaitable[ModelResponse]],
+) -> ModelResponse:
+    context = request.runtime.context
+    # 25 resolves + 25 staged Adds + a Reply fit. Leave room below 120 graph steps.
+    # Raising this ceiling requires revisiting the graph limit and maximum-size test.
+    if context.resolution_limited or context.model_calls >= 55:
+        raise _PlanningLimitReached
+    context.model_calls += 1
+    return await handler(request)
+
+
 def build_planner(model: BaseChatModel) -> Planner:
     """Build a reusable tool-calling planner with no graph checkpointer."""
     graph = create_agent(
@@ -162,15 +193,21 @@ def build_planner(model: BaseChatModel) -> Planner:
         system_prompt=_SYSTEM_PROMPT,
         response_format=ToolStrategy(Reply),
         context_schema=RequestTools,
+        middleware=[_bound_planning],
         checkpointer=None,
     )
 
     async def planner(messages: list[dict], context: RequestTools) -> Reply:
-        result = await graph.ainvoke(
-            cast(Any, {"messages": messages}),
-            {"recursion_limit": 120},
-            context=context,
-        )
+        try:
+            result = await graph.ainvoke(
+                cast(Any, {"messages": messages}),
+                {"recursion_limit": 120},
+                context=context,
+            )
+        except _PlanningLimitReached:
+            return context.stop_planning()
+        if context.resolution_limited:
+            return context.stop_planning()
         reply = result.get("structured_response")
         if not isinstance(reply, Reply):
             raise TypeError("LangChain agent did not return a structured Reply")
