@@ -113,8 +113,11 @@ class RequestTools:
             if cache_key not in self._resolution_cache:
                 # Two searches allow a spelling correction. More requires user input.
                 if self._resolution_attempts.get(key, 0) >= 2:
-                    self.resolution_limited = True
-                    return "Title search limit reached; ask the user to choose an identity."
+                    return (
+                        f"Title search limit reached for {title!r}. Reuse its returned "
+                        "Candidates: stage an Add if confident, otherwise include this title "
+                        "in Reply.disambiguations. Continue planning the other Entries."
+                    )
                 self._resolution_attempts[key] = self._resolution_attempts.get(key, 0) + 1
                 await _report_progress(
                     self.progress, f"🔎 Finding an IMDb match for {query[:180]}…"

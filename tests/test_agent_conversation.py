@@ -244,6 +244,85 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.runtime.add_resolved.await_count, 6)
 
+    async def test_one_title_search_limit_does_not_disambiguate_the_complete_request(
+        self,
+    ) -> None:
+        titles = ["Anora", "Nomandland", "Parasite", "The Shape of Water", "Moonlight", "Argo"]
+        identities = {
+            title: {"title": title, "year": 2024, "imdb_id": f"tt{index:07}"}
+            for index, title in enumerate(titles, 1)
+        }
+
+        async def resolve(query: str, media_type: str | None = None) -> list[dict]:
+            return [identities[query]] if query in identities and query != "Nomandland" else []
+
+        self.runtime.resolve_title = AsyncMock(side_effect=resolve)
+        verified = {c["imdb_id"]: c for c in identities.values()}
+        self.runtime.validate_identity = AsyncMock(
+            side_effect=lambda identity: verified[identity]
+        )
+        self.runtime.add_resolved = AsyncMock(return_value={"status": "done"})
+        self.conversation.planner = self._planner(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "resolve_title", "args": {"query": title}, "id": f"r-{i}"}
+                    for i, title in enumerate(titles)
+                ],
+            ),
+            tool_call(
+                "resolve_title",
+                {"query": "Nomadland", "requested_title": "Nomandland"},
+                "correction",
+            ),
+            tool_call(
+                "resolve_title",
+                {"query": "Nomadland", "media_type": "movie", "requested_title": "Nomandland"},
+                "over-budget",
+            ),
+            *[
+                tool_call("add_entry", {"imdb_id": identities[title]["imdb_id"]}, f"add-{i}")
+                for i, title in enumerate(titles)
+                if title != "Nomandland"
+            ],
+            tool_call(
+                "Reply",
+                {
+                    "text": "Which film did you mean by Nomandland?",
+                    "disambiguations": ["Nomandland"],
+                },
+                "reply",
+            ),
+        )
+        result = await self._send("add " + ", ".join(titles), ts="one-limited", mention=True)
+        choices = self.conversation.disambiguations({"channel": "C", "ts": "one-limited"}, "T")
+        self.assertEqual([choice["title"] for choice in choices], ["Nomandland"], result)
+        self.assertEqual(self.runtime.resolve_title.await_count, 7)
+        self.assertEqual(self.runtime.writes, [])
+        saved = self.conversation._load("request:T:C:one-limited")
+        self.assertEqual(len(saved["actions"]), 5)
+        choice = choices[0]
+        self.conversation.planner = self._planner(
+            tool_call("add_entry", {"imdb_id": identities["Nomandland"]["imdb_id"]}, "chosen"),
+            reply_call("The complete request is ready.", [], "ready"),
+        )
+        event = {"channel": "C", "thread_ts": "one-limited"}
+        result = await self.conversation.choose_candidate(
+            choice["request_key"],
+            choice["token"],
+            identities["Nomandland"]["imdb_id"],
+            event,
+            "T",
+            manual=True,
+        )
+        self.assertIn("6. add", result)
+        self.runtime.add_resolved.assert_not_awaited()
+        token = re.search(r"`approve ([0-9a-f]{16})`", result)[1]
+        await self.conversation.handle(
+            event | {"ts": "approve-six", "text": f"approve {token}"}, "T"
+        )
+        self.assertEqual(self.runtime.add_resolved.await_count, 6)
+
     async def test_repeated_parallel_misses_stop_with_manual_slack_input(self) -> None:
         self.runtime.resolve_title = AsyncMock(return_value=[])
         self.transport._app.client.chat_postMessage.return_value = {"ts": "progress"}
@@ -412,9 +491,14 @@ class ResolutionBudgetTests(unittest.IsolatedAsyncioTestCase):
             await context.resolve_title("Nomadland", "movie", "Nomandland"), [corrected]
         )
         await context.resolve_title("Nomadland Frances McDormand", "movie", "Nomandland")
-        self.assertTrue(context.resolution_limited)
+        self.assertFalse(context.resolution_limited)
         self.assertEqual(context.runtime.resolve_title.await_count, 2)
         self.assertEqual(context.candidates["Nomandland"], [corrected])
+        self.assertEqual(
+            await context.resolve_title("Nomadland", "movie", "Nomandland"), [corrected]
+        )
+        await context.resolve_title("Anora")
+        self.assertEqual(context.runtime.resolve_title.await_count, 3)
 
     async def test_media_types_have_distinct_cached_results(self) -> None:
         context = self.context()
