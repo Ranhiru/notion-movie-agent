@@ -31,13 +31,18 @@ read_url; it resolves directly to its canonical OMDb identity.
 For a named Add, resolve the title with OMDb first. Stage an Add only with an exact IMDb ID
 returned by resolve_title for the requested work. If identity is uncertain,
 ask a concise question and stage nothing for that Entry. Preserve compound names as one title
-unless the user clearly listed separate works. Resolve same-name works with the user instead
-of guessing.
+unless the user clearly listed separate works. Multiple Candidates alone do not require a
+user choice. Use the complete request and the returned title, year, and media type to decide
+whether the intended work is clear. Stage confident matches using their returned IMDb IDs;
+ask the user only about genuinely uncertain Entries, without guessing between plausible works.
 Search title text only: do not append actors, directors, or words such as "movie" or "film".
 Keep requested_title equal to the original requested name across all searches for that Entry,
 including aliases and spelling corrections. Reuse Candidates already returned. After an empty
-result, you may try one corrected spelling; otherwise ask the user to choose an identity.
+result, you may try one corrected spelling. Once Candidates are returned, stage a confident
+match or ask for a choice instead of searching again.
 Do not keep searching query variants when Candidates are ambiguous or searches miss.
+If a title reaches its search limit, continue planning the other Entries using their existing
+Candidates. A limit for one Entry does not make the other Entries uncertain.
 When the user must choose an identity, put the exact resolve_title query in
 Reply.disambiguations. Slack renders its returned candidates as an interactive card,
 including manual IMDb input when none match. Do not repeat the candidates as a text list.
