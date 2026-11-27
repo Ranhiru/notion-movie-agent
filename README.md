@@ -13,11 +13,24 @@ https://github.com/user-attachments/assets/2592c712-a857-41c2-bbc9-78a015647c74
 
 ## The enrichment graph
 
-Uses OMDB AI as the authoritative source to find movies, fetches Rotten Tomatoes scores with best effort using Tavily/Exa/Firecrawl.
+Each Entry runs through parallel OMDb metadata and Rotten Tomatoes resolution lanes.
+OMDb supplies the IMDb identity, rating, plot, and genre; Rotten Tomatoes critic and
+audience scores are best-effort, using a rotated fallback chain of Firecrawl, Tavily, and Exa.
 
-If there are multiple matches, posts a message on Slack (HITL) asking user to confirm.
+Multiple OMDb matches go through an LLM Disambiguation step first. Uncertain matches,
+or searches with no matches after title normalization, pause for a Slack choice or manual
+IMDb link. The lanes rejoin before RT identity correlation, the Judge, the Notion write,
+and an optional Slack completion notification.
 
-Running on OpenRouter with `openai/gpt-5.4-nano` currently in prod, with traces uploaded to LangSmith.
+LLM calls use the OpenAI-compatible endpoint configured by `OPENAI_BASE_URL`, including
+OpenRouter. Models are configured separately with `OPENAI_EXTRACTION_MODEL`,
+`OPENAI_DISAMBIGUATION_MODEL`, `OPENAI_JUDGE_MODEL`, and `OPENAI_AGENT_MODEL` for the
+Slack conversation planner. Traces are uploaded to LangSmith when `LANGSMITH_TRACING`
+is enabled.
+
+The diagram shows Enrichment of one Notion Entry. Slack conversation planning, identity
+choices, and Action Plan approval happen before this graph; a resolved Add enters it with
+the selected IMDb identity and skips the OMDb title search and Disambiguation branches.
 
 
 ![Enrichment graph](flow.png)
