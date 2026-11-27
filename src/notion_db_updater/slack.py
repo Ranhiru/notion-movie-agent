@@ -148,17 +148,17 @@ def _approval_blocks(response: str, thread_ts: str) -> list[dict]:
     )
     blocks.append(
         {
-            "type": "actions",
+            # Use a section accessory for chat.update compatibility.
+            "type": "section",
             "block_id": "watchlist_selection",
-            "elements": [
-                {
-                    "type": "multi_static_select",
-                    "action_id": _SELECTION_ACTION,
-                    "placeholder": {"type": "plain_text", "text": "Select changes"},
-                    "options": options,
-                    "initial_options": options,
-                }
-            ],
+            "text": {"type": "mrkdwn", "text": "*Changes to apply*"},
+            "accessory": {
+                "type": "multi_static_select",
+                "action_id": _SELECTION_ACTION,
+                "placeholder": {"type": "plain_text", "text": "Select changes"},
+                "options": options,
+                "initial_options": options,
+            },
         }
     )
     for notice in response.splitlines()[len(lines) + 2 :]:

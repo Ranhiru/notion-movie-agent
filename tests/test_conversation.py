@@ -112,6 +112,34 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.scripts, [])
 
+    async def test_six_entry_approval_uses_message_supported_multiselect(self):
+        self.stage_adds(1, 2, 3, 4, 5, 6)
+        client = self.transport._app.client
+        client.chat_postMessage.return_value = {"ts": "progress-1"}
+
+        reply = await self.mention(
+            "add Anora, Nomandland, Parasite, The Shape of Water, Moonlight, Argo"
+        )
+
+        reply.assert_not_awaited()
+        payload = client.chat_update.await_args.kwargs
+        self.assertEqual(payload["ts"], "progress-1")
+        self.assertIn("Approve this exact action list", payload["text"])
+        selection = next(
+            block
+            for block in payload["blocks"]
+            if block.get("block_id") == "watchlist_selection"
+        )
+        # chat.update rejects an actions-block multiselect with invalid_blocks.
+        self.assertEqual(selection["type"], "section")
+        self.assertTrue(selection["text"]["text"])
+        menu = selection["accessory"]
+        self.assertEqual(menu["type"], "multi_static_select")
+        self.assertEqual(menu["action_id"], "watchlist:selection")
+        self.assertEqual([o["value"] for o in menu["options"]], list("123456"))
+        self.assertEqual(menu["initial_options"], menu["options"])
+        self.assertEqual(self.runtime.writes, [])
+
     async def test_deny_button_persists_and_cannot_be_approved_after_restart(self):
         body, action = await self.button_plan(decision="deny")
         await self.transport._handle_approval(body, action, self.transport._app.client)
